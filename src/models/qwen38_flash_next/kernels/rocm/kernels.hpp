@@ -526,7 +526,16 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream);
+               hipStream_t stream, const std::uint32_t* sel_list = nullptr,
+               std::uint32_t list_stride = 0);
+
+/// Compacts each query's selected blocks from `mask` into `list` (see
+/// Attention's `sel_list`): list[t * stride] is the count, the ascending block
+/// indices follow. Only for the model's ratio of 4.
+void CompactSelection(const std::uint32_t* mask, std::uint32_t mask_words,
+                      std::uint32_t* list, std::uint32_t stride,
+                      std::uint32_t n_tokens, const std::uint32_t* start_pos,
+                      std::uint32_t ratio, hipStream_t stream);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows

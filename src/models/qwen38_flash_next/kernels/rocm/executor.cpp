@@ -1897,6 +1897,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               index_capacity, stream_);
   }
   const std::uint32_t* mask = nullptr;
+  const std::uint32_t* sel_list = nullptr;
+  std::uint32_t list_stride = 0;
   if (sparse) {
     if (!Dense(l.indexer_q, x, s_.iq, n_tokens, error_msg)) {
       return false;
@@ -1941,6 +1943,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                    mask_words_, max_blocks, stream_, live);
     }
     mask = s_.mask;
+    // Narrow batches attend through a per-query compacted selection list
+    // (written over the scores, which the selector has finished with), so
+    // their many head/split blocks do not each rescan the mask.
+    if (!MatrixRows(n_tokens) && c.compress_ratio == 4 && !last_only) {
+      CompactSelection(s_.mask, mask_words_,
+                       reinterpret_cast<std::uint32_t*>(s_.scores), max_blocks,
+                       n_tokens, pos, c.compress_ratio, stream_);
+      sel_list = reinterpret_cast<const std::uint32_t*>(s_.scores);
+      list_stride = max_blocks;
+    }
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles
@@ -1967,7 +1979,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
-                  c.compress_ratio, stream_);
+                  c.compress_ratio, stream_, sel_list, list_stride);
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
   return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);

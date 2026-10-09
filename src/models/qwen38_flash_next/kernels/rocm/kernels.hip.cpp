@@ -2280,6 +2280,67 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   }
 }
 
+/// grid (queries), block 256. Writes each query's selected block indices,
+/// ascending, to list[t * stride + 1 ...] and their count to list[t * stride],
+/// so the decode attention reads a ready list instead of every one of its
+/// heads and splits rescanning the whole mask.
+__global__ void CompactSelectionKernel(const std::uint32_t* __restrict__ mask,
+                                       std::uint32_t mask_words,
+                                       std::uint32_t* __restrict__ list,
+                                       std::uint32_t stride,
+                                       const std::uint32_t* __restrict__ start_pos,
+                                       std::uint32_t ratio) {
+  constexpr std::uint32_t kWindow = 1024;  // four blocks per thread
+  __shared__ std::uint32_t wave_total[8];
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = threadIdx.x;
+  const std::uint32_t lane = i & 31u;
+  const std::uint32_t wave = i >> 5u;
+  const std::uint32_t n_complete = (*start_pos + t + 1) / ratio;
+  const std::uint32_t* words = mask + static_cast<std::size_t>(t) * mask_words;
+  std::uint32_t* out = list + static_cast<std::size_t>(t) * stride + 1;
+  std::uint32_t running = 0;
+  for (std::uint32_t w0 = 0; w0 < n_complete; w0 += kWindow) {
+    std::uint32_t flags = 0;
+    std::uint32_t count = 0;
+    for (std::uint32_t k = 0; k < 4; ++k) {
+      const std::uint32_t b = w0 + (i * 4) + k;
+      const bool set = b < n_complete && ((words[b / 32] >> (b % 32)) & 1u);
+      flags |= (set ? 1u : 0u) << k;
+      count += set ? 1u : 0u;
+    }
+    std::uint32_t incl = count;
+    for (std::uint32_t off = 1; off < 32; off <<= 1) {
+      const std::uint32_t v = __shfl_up(incl, off);
+      incl += lane >= off ? v : 0u;
+    }
+    if (lane == 31) {
+      wave_total[wave] = incl;
+    }
+    __syncthreads();
+    std::uint32_t base = 0;
+    for (std::uint32_t w = 0; w < wave; ++w) {
+      base += wave_total[w];
+    }
+    std::uint32_t total = 0;
+    for (std::uint32_t w = 0; w < 8; ++w) {
+      total += wave_total[w];
+    }
+    std::uint32_t slot = running + base + incl - count;
+    for (std::uint32_t k = 0; k < 4; ++k) {
+      if (((flags >> k) & 1u) && slot + 1 < stride) {
+        out[slot] = w0 + (i * 4) + k;
+      }
+      slot += (flags >> k) & 1u;
+    }
+    running += total;
+    __syncthreads();
+  }
+  if (i == 0) {
+    list[static_cast<std::size_t>(t) * stride] = min(running, stride - 1);
+  }
+}
+
 /// grid (heads, queries), block 256 = head dim. Keys stream in tiles of 256
 /// positions: lane j scores key j of the tile, then lane d accumulates
 /// value column d with online softmax rescaling. In the sparse window the
@@ -2296,9 +2357,12 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
                                 std::uint32_t mask_words, float* out,
                                 float* partials, const std::uint32_t* start_pos,
                                 std::uint32_t heads, std::uint32_t kv_heads,
-                                std::uint32_t d, std::uint32_t ratio) {
+                                std::uint32_t d, std::uint32_t ratio,
+                                const std::uint32_t* sel_list,
+                                std::uint32_t list_stride) {
   constexpr std::uint32_t kTile = 256;
   constexpr std::uint32_t kWindow = 1024;  // blocks compacted per pass
+  constexpr std::uint32_t kLoadBatch = 8;  // key rows fetched together
   const std::uint32_t split = blockIdx.z;
   const std::uint32_t splits = gridDim.z;
   __shared__ float qs[256];
@@ -2359,21 +2423,42 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
       qv[j] = qs[(lane * 8) + j];
     }
     float s_mine = -INFINITY;
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const std::uint32_t j = keys[slot];
-      float dot = 0.0f;
-      if (j < n_kv) {
-        float kv[8];
-        load8(k_head + (static_cast<std::size_t>(j) * kv_stride), kv);
+    // Each batch issues its key-row loads together, then scores them in key
+    // order: the loads are independent gathers, so batching hides their
+    // latency without changing any arithmetic.
+    for (std::uint32_t kk0 = 0; kk0 < 32; kk0 += kLoadBatch) {
+      uint4 packed[kLoadBatch];
+      std::uint32_t js[kLoadBatch];
 #pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          dot += qv[x] * kv[x];
-        }
+      for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
+        js[u] = keys[(wave * 32) + kk0 + u];
+        packed[u] = js[u] < n_kv
+                        ? *reinterpret_cast<const uint4*>(
+                              k_head + (static_cast<std::size_t>(js[u]) * kv_stride) +
+                              (lane * 8))
+                        : make_uint4(0u, 0u, 0u, 0u);
       }
-      dot = WaveSum(dot);
-      if (lane == kk) {
-        s_mine = j < n_kv ? dot * scale : -INFINITY;
+#pragma unroll
+      for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
+        float dot = 0.0f;
+        if (js[u] < n_kv) {
+          const auto* h2 = reinterpret_cast<const __half2*>(&packed[u]);
+          float kv[8];
+#pragma unroll
+          for (std::uint32_t y = 0; y < 4; ++y) {
+            const float2 f = __half22float2(h2[y]);
+            kv[2 * y] = f.x;
+            kv[2 * y + 1] = f.y;
+          }
+#pragma unroll
+          for (std::uint32_t x = 0; x < 8; ++x) {
+            dot += qv[x] * kv[x];
+          }
+        }
+        dot = WaveSum(dot);
+        if (lane == kk0 + u) {
+          s_mine = js[u] < n_kv ? dot * scale : -INFINITY;
+        }
       }
     }
     const float tile_max = BlockMax(s_mine, shared);
@@ -2389,15 +2474,34 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     }
     m = m_new;
     __syncthreads();
-    for (std::uint32_t kk = 0; kk < 32; ++kk) {
-      const std::uint32_t slot = (wave * 32) + kk;
-      const float w = p[slot];
-      if (w != 0.0f) {
-        float vv[8];
-        load8(v_head + (static_cast<std::size_t>(keys[slot]) * kv_stride), vv);
+    for (std::uint32_t kk0 = 0; kk0 < 32; kk0 += kLoadBatch) {
+      uint4 packed[kLoadBatch];
+      float ws[kLoadBatch];
 #pragma unroll
-        for (std::uint32_t x = 0; x < 8; ++x) {
-          acc[x] += w * vv[x];
+      for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
+        const std::uint32_t slot = (wave * 32) + kk0 + u;
+        ws[u] = p[slot];
+        packed[u] = ws[u] != 0.0f
+                        ? *reinterpret_cast<const uint4*>(
+                              v_head + (static_cast<std::size_t>(keys[slot]) * kv_stride) +
+                              (lane * 8))
+                        : make_uint4(0u, 0u, 0u, 0u);
+      }
+#pragma unroll
+      for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
+        if (ws[u] != 0.0f) {
+          const auto* h2 = reinterpret_cast<const __half2*>(&packed[u]);
+          float vv[8];
+#pragma unroll
+          for (std::uint32_t y = 0; y < 4; ++y) {
+            const float2 f = __half22float2(h2[y]);
+            vv[2 * y] = f.x;
+            vv[2 * y + 1] = f.y;
+          }
+#pragma unroll
+          for (std::uint32_t x = 0; x < 8; ++x) {
+            acc[x] += ws[u] * vv[x];
+          }
         }
       }
     }
@@ -2408,6 +2512,30 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
     for (std::uint32_t tile = split * kTile; tile < n_kv;
          tile += kTile * splits) {
       keys[i] = tile + i < n_kv ? tile + i : n_kv;
+      __syncthreads();
+      tile_step();
+    }
+  } else if (sel_list != nullptr) {
+    // The selection arrives compacted: tile k is entries 64k..64k+63 of the
+    // ascending list, the same cut the window scan below makes, dealt
+    // round-robin over the splits. The last tile may be partial.
+    const std::uint32_t per_tile = kTile / ratio;
+    const std::uint32_t* picked =
+        sel_list + static_cast<std::size_t>(t) * list_stride;
+    const std::uint32_t n_picked = picked[0];
+    const std::uint32_t n_tiles = (n_picked + per_tile - 1) / per_tile;
+    for (std::uint32_t tile = split; tile < n_tiles; tile += splits) {
+      const std::uint32_t first = tile * per_tile;
+      const std::uint32_t len = min(per_tile, n_picked - first);
+      const std::uint32_t entry = i / ratio;
+      keys[i] = entry < len ? (picked[1 + first + entry] * ratio) + (i % ratio)
+                            : n_kv;
+      __syncthreads();
+      tile_step();
+    }
+    // The incomplete tail block is always visible.
+    if (tail_start < n_kv && split == 0) {
+      keys[i] = tail_start + i < n_kv ? tail_start + i : n_kv;
       __syncthreads();
       tile_step();
     }
@@ -7023,18 +7151,28 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
                const std::uint32_t* start_pos, std::uint32_t heads,
                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
-               hipStream_t stream) {
+               hipStream_t stream, const std::uint32_t* sel_list,
+               std::uint32_t list_stride) {
   if (d != 256) {
     return;  // the kernel is written for the model's 256-wide heads
   }
   const std::uint32_t z = partials != nullptr ? std::max(splits, 1u) : 1u;
   hipLaunchKernelGGL(AttentionKernel, dim3(heads, n_tokens, z), dim3(kThreads),
                      0, stream, q, k_cache, v_cache, mask, mask_words, out,
-                     partials, start_pos, heads, kv_heads, d, ratio);
+                     partials, start_pos, heads, kv_heads, d, ratio, sel_list,
+                     list_stride);
   if (z > 1) {
     hipLaunchKernelGGL(AttentionMergeKernel, dim3(heads, n_tokens),
                        dim3(kThreads), 0, stream, partials, out, heads, d, z);
   }
+}
+
+void CompactSelection(const std::uint32_t* mask, std::uint32_t mask_words,
+                      std::uint32_t* list, std::uint32_t stride,
+                      std::uint32_t n_tokens, const std::uint32_t* start_pos,
+                      std::uint32_t ratio, hipStream_t stream) {
+  hipLaunchKernelGGL(CompactSelectionKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, mask, mask_words, list, stride, start_pos, ratio);
 }
 
 bool WmmaCausalAttention(const float* q, const float* gate,
