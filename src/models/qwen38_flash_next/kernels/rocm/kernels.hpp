@@ -295,6 +295,9 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
                          hipStream_t stream, std::size_t ldx = 0);
+/// Re-encodes `blocks` Q8_0 blocks as Q5_1 (24 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
 /// F32 K16 chain per output. Token t's chain starts ((t / 32) % 4) * 128
 /// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).

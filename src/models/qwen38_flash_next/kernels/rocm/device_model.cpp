@@ -533,6 +533,45 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
   }
+  // Decode reads each large dense matrix once per round, so its bytes set the
+  // round's cost: a 5-bit copy cuts them by 29%. GUFO_DECODE_Q5=0 disables it.
+  if (const char* flag = std::getenv("GUFO_DECODE_Q5");
+      flag == nullptr || flag[0] != '0') {
+    constexpr std::size_t kMinElements = std::size_t{2560} * 6144;
+    std::size_t copied = 0;
+    const auto add = [&](DeviceTensor& t) {
+      if (t.type != core::GgmlType::kQ8_0 || t.data == nullptr ||
+          t.cols % 32 != 0 || std::size_t{t.rows} * t.cols < kMinElements) {
+        return;
+      }
+      const std::size_t blocks = std::size_t{t.rows} * t.cols / 32;
+      void* copy = nullptr;
+      if (hipMalloc(&copy, blocks * 24 + kTailMargin) != hipSuccess) {
+        return;  // the tensor keeps its Q8_0 decode path
+      }
+      m->allocations_.push_back(copy);
+      RecordAllocation("decode_q5_1", copy, blocks * 24 + kTailMargin);
+      m->bytes_ += blocks * 24 + kTailMargin;
+      copied += blocks * 24;
+      if (RequantQ8_0ToQ5_1(t.data, copy, blocks, nullptr)) {
+        t.decode_data = copy;
+      }
+    };
+    for (auto& l : m->layers_) {
+      add(l.ssm_in);
+      add(l.ssm_out);
+      add(l.attn_qkv);
+      add(l.attn_out);
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+      if (error_msg != nullptr) {
+        *error_msg = "decode weight conversion failed";
+      }
+      return nullptr;
+    }
+    std::fprintf(stderr, "decode Q5_1 copies: %.2f GiB\n",
+                 static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0));
+  }
   return m;
 }
 
