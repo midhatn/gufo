@@ -1,5 +1,6 @@
 // Times the decode matvec kernels per weight format at the model's real shapes
-// (diagnostic): effective weight bandwidth shows which formats reach DRAM speed.
+// (diagnostic): effective weight bandwidth shows which formats reach DRAM
+// speed.
 //
 // dense_vec_bench [reps]
 #include <hip/hip_runtime.h>
@@ -53,8 +54,10 @@ double TimeMs(int reps, const std::function<void()>& launch) {
 int main(int argc, char** argv) try {
   const int reps = argc > 1 ? std::atoi(argv[1]) : 40;
   qfn_mmq_init(0);
-  const Format formats[] = {{"Q8_0", 8, 32, 34}, {"Q6_K", 14, 256, 210},
-                            {"Q5_K", 13, 256, 176}, {"Q5_1", 7, 32, 24},
+  const Format formats[] = {{"Q8_0", 8, 32, 34},
+                            {"Q6_K", 14, 256, 210},
+                            {"Q5_K", 13, 256, 176},
+                            {"Q5_1", 7, 32, 24},
                             {"Q4_K", 12, 256, 144}};
   struct Shape {
     const char* name;
@@ -75,11 +78,13 @@ int main(int argc, char** argv) try {
       Check(hipMalloc(&xq, qfn_mmq_q8_1_bytes(8, s.k)), "xq");
       std::vector<float> hx(std::size_t{8} * s.k, 0.01F);
       Check(hipMemcpy(x, hx.data(), hx.size() * sizeof(float),
-                      hipMemcpyHostToDevice), "x up");
+                      hipMemcpyHostToDevice),
+            "x up");
       for (const auto& f : formats) {
-        const std::size_t bytes =
-            static_cast<std::size_t>(s.m) * (s.k / f.block_elems) * f.block_bytes;
-        // Cycle through enough distinct copies that every call reads cold weights.
+        const std::size_t bytes = static_cast<std::size_t>(s.m) *
+                                  (s.k / f.block_elems) * f.block_bytes;
+        // Cycle through enough distinct copies that every call reads cold
+        // weights.
         const int copies = static_cast<int>(
             std::clamp<std::size_t>((std::size_t{1} << 29) / bytes + 1, 2, 24));
         std::vector<void*> ws(copies);
@@ -91,7 +96,8 @@ int main(int argc, char** argv) try {
           for (std::size_t off = 0; off < bytes; off += filler.size())
             Check(hipMemcpy(static_cast<char*>(w) + off, filler.data(),
                             std::min(filler.size(), bytes - off),
-                            hipMemcpyHostToDevice), "w up");
+                            hipMemcpyHostToDevice),
+                  "w up");
         }
         int rc = 0;
         int call = 0;

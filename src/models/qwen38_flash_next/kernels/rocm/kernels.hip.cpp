@@ -2284,12 +2284,10 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
 /// ascending, to list[t * stride + 1 ...] and their count to list[t * stride],
 /// so the decode attention reads a ready list instead of every one of its
 /// heads and splits rescanning the whole mask.
-__global__ void CompactSelectionKernel(const std::uint32_t* __restrict__ mask,
-                                       std::uint32_t mask_words,
-                                       std::uint32_t* __restrict__ list,
-                                       std::uint32_t stride,
-                                       const std::uint32_t* __restrict__ start_pos,
-                                       std::uint32_t ratio) {
+__global__ void CompactSelectionKernel(
+    const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
+    std::uint32_t* __restrict__ list, std::uint32_t stride,
+    const std::uint32_t* __restrict__ start_pos, std::uint32_t ratio) {
   constexpr std::uint32_t kWindow = 1024;  // four blocks per thread
   __shared__ std::uint32_t wave_total[8];
   const std::uint32_t t = blockIdx.x;
@@ -2351,15 +2349,12 @@ __global__ void CompactSelectionKernel(const std::uint32_t* __restrict__ mask,
 /// more than one split each block writes (max, sum, unnormalized acc) to
 /// `partials[(t * heads + h) * splits + z]` and AttentionMergeKernel
 /// combines them, otherwise the normalized row goes straight to `out`.
-__global__ void AttentionKernel(const float* q, const __half* k_cache,
-                                const __half* v_cache,
-                                const std::uint32_t* mask,
-                                std::uint32_t mask_words, float* out,
-                                float* partials, const std::uint32_t* start_pos,
-                                std::uint32_t heads, std::uint32_t kv_heads,
-                                std::uint32_t d, std::uint32_t ratio,
-                                const std::uint32_t* sel_list,
-                                std::uint32_t list_stride) {
+__global__ void AttentionKernel(
+    const float* q, const __half* k_cache, const __half* v_cache,
+    const std::uint32_t* mask, std::uint32_t mask_words, float* out,
+    float* partials, const std::uint32_t* start_pos, std::uint32_t heads,
+    std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+    const std::uint32_t* sel_list, std::uint32_t list_stride) {
   constexpr std::uint32_t kTile = 256;
   constexpr std::uint32_t kWindow = 1024;  // blocks compacted per pass
   constexpr std::uint32_t kLoadBatch = 8;  // key rows fetched together
@@ -2432,11 +2427,12 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
 #pragma unroll
       for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
         js[u] = keys[(wave * 32) + kk0 + u];
-        packed[u] = js[u] < n_kv
-                        ? *reinterpret_cast<const uint4*>(
-                              k_head + (static_cast<std::size_t>(js[u]) * kv_stride) +
-                              (lane * 8))
-                        : make_uint4(0u, 0u, 0u, 0u);
+        packed[u] =
+            js[u] < n_kv
+                ? *reinterpret_cast<const uint4*>(
+                      k_head + (static_cast<std::size_t>(js[u]) * kv_stride) +
+                      (lane * 8))
+                : make_uint4(0u, 0u, 0u, 0u);
       }
 #pragma unroll
       for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
@@ -2481,11 +2477,13 @@ __global__ void AttentionKernel(const float* q, const __half* k_cache,
       for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
         const std::uint32_t slot = (wave * 32) + kk0 + u;
         ws[u] = p[slot];
-        packed[u] = ws[u] != 0.0f
-                        ? *reinterpret_cast<const uint4*>(
-                              v_head + (static_cast<std::size_t>(keys[slot]) * kv_stride) +
-                              (lane * 8))
-                        : make_uint4(0u, 0u, 0u, 0u);
+        packed[u] =
+            ws[u] != 0.0f
+                ? *reinterpret_cast<const uint4*>(
+                      v_head +
+                      (static_cast<std::size_t>(keys[slot]) * kv_stride) +
+                      (lane * 8))
+                : make_uint4(0u, 0u, 0u, 0u);
       }
 #pragma unroll
       for (std::uint32_t u = 0; u < kLoadBatch; ++u) {
