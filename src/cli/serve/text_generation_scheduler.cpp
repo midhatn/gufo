@@ -785,6 +785,8 @@ struct TextGenerationScheduler::Impl {
       const auto step = request->runner_request.DecodeStep(remaining);
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      request->result.suffix_draft_tokens += step.suffix_draft_tokens;
+      request->result.suffix_accepted_tokens += step.suffix_accepted_tokens;
 
       CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
@@ -1054,6 +1056,9 @@ struct TextGenerationScheduler::Impl {
       }
       item.request->result.draft_tokens += step.draft_tokens;
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+      item.request->result.suffix_draft_tokens += step.suffix_draft_tokens;
+      item.request->result.suffix_accepted_tokens +=
+          step.suffix_accepted_tokens;
 
       bool published = true;
       try {
