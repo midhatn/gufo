@@ -15,13 +15,12 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-// Threads waiting on n-gram I/O. The gather is NVMe-latency bound, so this
-// wants queue depth rather than cores.
-constexpr std::size_t kIoWorkers = 128;
-constexpr std::size_t kIoOversubscribe = 4;
+// Next-chunk prefetch hides large gathers behind the current transformer
+// pass. More readers increased CPU work without improving served prefill.
+constexpr std::size_t kWorkers = 32;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
-constexpr std::size_t kCacheBytes = 8 * 1024 * 1024;
+constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
 
 }  // namespace
 
@@ -111,14 +110,7 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     }
     return nullptr;
   }
-  // The n-gram gather is NVMe-latency bound, not CPU bound: rows are sorted,
-  // so one read already spans a whole page and amplification is ~1x. What
-  // the read needs is queue depth, so oversubscribe the pool past the core
-  // count instead of waiting on I/O with idle threads.
-  const std::size_t workers = std::min(
-      kIoWorkers, static_cast<std::size_t>(std::thread::hardware_concurrency()) *
-                      kIoOversubscribe);
-  for (std::size_t i = 0; i < std::max<std::size_t>(1, workers); ++i) {
+  for (std::size_t i = 0; i < kWorkers; ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }
   return t;
@@ -280,8 +272,13 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   pending_ = jobs_.size();
   failed_ = false;
   active_ = true;
-  if (pending_ != 0) {
+  // A decode gather has a handful of reads: wake one reader per read, not
+  // the whole pool. Readers keep taking jobs until the queue is empty.
+  if (pending_ >= workers_.size()) {
     wake_.notify_all();
+  } else {
+    for (std::size_t i = 0; i < pending_; ++i)
+      wake_.notify_one();
   }
   return true;
 }

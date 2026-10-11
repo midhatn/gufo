@@ -47,9 +47,7 @@ using gufo::server::TextRunnerSnapshot;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
 
-constexpr std::size_t kDefaultFakePayloadBytes = 16;
-std::size_t g_fake_payload_bytes = kDefaultFakePayloadBytes;
-std::size_t FakePayloadBytes() { return g_fake_payload_bytes; }
+constexpr std::size_t kFakePayloadBytes = 16;
 constexpr std::size_t kDiskHeaderBytes = 96;
 
 void Expect(bool condition, std::string_view message) {
@@ -124,7 +122,7 @@ public:
       : value(snapshot_value), position(snapshot_position) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return FakePayloadBytes();
+    return kFakePayloadBytes;
   }
 
   std::uint64_t value;
@@ -238,7 +236,7 @@ public:
 
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState&) const override {
-    return FakePayloadBytes();
+    return kFakePayloadBytes;
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
@@ -258,20 +256,18 @@ public:
   [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
       const TextRunnerSnapshot& snapshot) const override {
     (void)RequireFakeSnapshot(snapshot);
-    return FakePayloadBytes();
+    return kFakePayloadBytes;
   }
 
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
     const auto& saved = RequireFakeSnapshot(snapshot);
-    if (destination.size() != FakePayloadBytes()) {
+    if (destination.size() != kFakePayloadBytes) {
       throw std::invalid_argument("fake destination size mismatch");
     }
     PutLittleEndian<std::uint64_t>(destination, 0, saved.value);
     PutLittleEndian<std::uint64_t>(destination, 8, saved.position);
-    for (std::size_t i = 16; i < destination.size(); ++i)
-      destination[i] = static_cast<std::uint8_t>(i * 31U + saved.value);
     return destination.size();
   }
 
@@ -280,20 +276,16 @@ public:
                                 const SnapshotSink& sink) const override {
     if (before_stream)
       before_stream();
-    std::vector<std::uint8_t> bytes(FakePayloadBytes());
+    std::array<std::uint8_t, kFakePayloadBytes> bytes{};
     (void)SerializePersistentSnapshot(snapshot, bytes);
     sink(std::span(bytes).first(7));
-    for (std::size_t offset = 7; offset < bytes.size();) {
-      const std::size_t count = std::min<std::size_t>(1000003, bytes.size() - offset);
-      sink(std::span(bytes).subspan(offset, count));
-      offset += count;
-    }
+    sink(std::span(bytes).subspan(7));
   }
 
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
-    if (payload.size() != FakePayloadBytes()) {
+    if (payload.size() != kFakePayloadBytes) {
       throw std::invalid_argument("fake payload size mismatch");
     }
     auto& destination = RequireFakeState(state);
@@ -341,7 +333,7 @@ std::vector<std::filesystem::path> CacheFiles(
 std::size_t ExpectedFileBytes(std::size_t identity_bytes,
                               std::size_t token_count) {
   return kDiskHeaderBytes + identity_bytes +
-         token_count * sizeof(std::uint32_t) + FakePayloadBytes();
+         token_count * sizeof(std::uint32_t) + kFakePayloadBytes;
 }
 
 ContinuationDiskStore::SaveResult SaveTokens(
@@ -393,7 +385,7 @@ void TestRestartRestoreAndCompatibilityIdentity() {
   {
     ContinuationDiskStore store(StoreOptions(directory.path()));
     const auto saved = SaveTokens(store, writer, {1, 2, 3}, *snapshot);
-    Expect(saved.stored && saved.payload_bytes == FakePayloadBytes(),
+    Expect(saved.stored && saved.payload_bytes == kFakePayloadBytes,
            "first process atomically stores a persistent snapshot");
     Expect(
         store.entry_count() == 1 && store.retained_bytes() == saved.file_bytes,
@@ -533,8 +525,8 @@ void TestAutomaticStagingAndAdmissionDiagnostics() {
   ContinuationDiskStore defaults({.directory = default_directory.path()});
   Expect(defaults.capacity_bytes() == std::size_t{8} * 1024U * 1024U * 1024U &&
              defaults.staging_capacity_bytes() > kDiskHeaderBytes &&
-             defaults.staging_capacity_bytes() <= 1024U * 1024U * 1024U,
-         "defaults bound RAM staging to 1 GiB independently of disk retention");
+             defaults.staging_capacity_bytes() <= defaults.capacity_bytes(),
+         "defaults bound RAM staging by available RAM and disk retention");
 
   TemporaryDirectory directory;
   std::vector<ContinuationDiskEvent> events;
@@ -751,9 +743,8 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
       StoreOptions(directory.path()),
       [&](const ContinuationDiskEvent& event) { events.push_back(event); });
   Expect(
-      restarted.entry_count() == 3 && CacheFiles(directory.path()).size() == 3,
-      "startup indexes structurally valid regular entries without hashing "
-      "payloads");
+      restarted.entry_count() == 2 && CacheFiles(directory.path()).size() == 2,
+      "startup indexes only checksum-valid regular entries");
   Expect(
       std::filesystem::exists(target) && !std::filesystem::exists(unsafe_link),
       "unsafe symlink is removed without following its target");
@@ -763,6 +754,12 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
                             return event.reason ==
                                    ContinuationDiskEventReason::kCorrupt;
                           }) &&
+          std::ranges::any_of(
+              events,
+              [](const ContinuationDiskEvent& event) {
+                return event.reason ==
+                       ContinuationDiskEventReason::kChecksumMismatch;
+              }) &&
           std::ranges::any_of(events,
                               [](const ContinuationDiskEvent& event) {
                                 return event.reason ==
@@ -781,14 +778,6 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
   }
   Expect(compatible_hits == 1,
          "the remaining compatible startup entry restores exactly");
-  Expect(std::ranges::any_of(events,
-                             [](const ContinuationDiskEvent& event) {
-                               return event.reason ==
-                                      ContinuationDiskEventReason::
-                                          kChecksumMismatch;
-                             }) &&
-             restarted.entry_count() == 2,
-         "a payload checksum failure is caught and removed on restore");
   auto incompatible_state = incompatible.CreateState();
   Expect(
       RestoreTokens(restarted, incompatible, *incompatible_state, {4, 4, 9})
@@ -878,6 +867,51 @@ void TestConcurrentStoreInstancesPublishSafely() {
       "concurrent publishers expose no partial or confused entry");
 }
 
+void TestStartupPreservesActivePublisher() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("startup-publisher");
+  std::binary_semaphore entered(0), release(0);
+  const auto orphan = directory.path() / ".tmp-orphan";
+  {
+    ContinuationDiskStore writer(StoreOptions(directory.path()));
+    runner->before_stream = [&] {
+      entered.release();
+      release.acquire();
+    };
+    Expect(writer.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 42, 2)) != 0,
+           "writer accepts a checkpoint before another store starts");
+    const bool started = entered.try_acquire_for(std::chrono::seconds(2));
+    if (!started)
+      release.release();
+    Expect(started, "writer reaches the temporary-file serialization barrier");
+    {
+      std::ofstream output(orphan, std::ios::binary);
+      output << "interrupted older write";
+    }
+    auto startup = std::async(std::launch::async, [&] {
+      ContinuationDiskStore reader(StoreOptions(directory.path()));
+    });
+    const bool ready =
+        startup.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    release.release();
+    startup.get();
+    writer.Flush();
+    Expect(ready, "startup does not wait for an active checkpoint writer");
+    Expect(
+        writer.entry_count() == 1 && CacheFiles(directory.path()).size() == 1,
+        "overlapping startup does not discard the active writer's checkpoint");
+  }
+  runner->before_stream = {};
+
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  auto state = runner->CreateState();
+  Expect(RestoreTokens(restarted, *runner, *state, {1, 2, 3}).restored &&
+             RequireFakeState(*state).value == 42,
+         "checkpoint published across startup restores its exact payload");
+  Expect(!std::filesystem::exists(orphan),
+         "startup without a publisher removes abandoned temporary files");
+}
+
 void TestSharedPrefixBoundariesAndExactDedup() {
   TemporaryDirectory directory;
   const FakeRunner runner("shared-prefix-model");
@@ -910,15 +944,6 @@ void TestSharedPrefixBoundariesAndExactDedup() {
   Expect(restored.restored && restored.token_count == 3 &&
              RequireFakeState(*state).value == 77,
          "new conversation restores the shared prefix");
-
-  // The longest stored prefix drives the snapshot stride policy.
-  const auto prefix_tokens = [&](std::vector<TextRunnerToken> tokens) {
-    return store.LongestStoredPrefixTokens(runner, tokens);
-  };
-  Expect(prefix_tokens({7, 7, 7, 9}) == 3 && prefix_tokens({7, 7, 7}) == 3 &&
-             prefix_tokens({7, 7, 7, 1, 2, 6}) == 5 &&
-             prefix_tokens({7, 7}) == 0 && prefix_tokens({8, 7, 7, 7}) == 0,
-         "longest stored prefix counts only complete entries");
 
   // Saving the same tokens again touches instead of rewriting.
   const std::size_t retained_before = store.retained_bytes();
@@ -1123,91 +1148,65 @@ void TestAppendedImagePrefixesSurviveRestart() {
          "moving the first image before the checkpoint invalidates reuse");
 }
 
-
-void TestMultiBlockImageRoundTripAndCorruption() {
-  // Larger than two 8 MiB checksum blocks, ending in a partial block.
-  g_fake_payload_bytes = (std::size_t{20} << 20) + 123;
-  constexpr std::size_t kLimit = std::size_t{64} << 20;
+void TestMinimumCheckpointStep() {
   TemporaryDirectory directory;
-  const FakeRunner runner("multi-block");
-  {
-    ContinuationDiskStore store(StoreOptions(directory.path(), kLimit, kLimit));
-    auto snapshot = MakeSnapshot(runner, 0xABCDEF, 5);
-    Expect(SaveTokens(store, runner, {1, 2, 3}, *snapshot).stored,
-           "multi-block image is stored");
-  }
-  {
-    ContinuationDiskStore restarted(StoreOptions(directory.path(), kLimit, kLimit));
-    auto state = runner.CreateState();
-    const auto restored = RestoreTokens(restarted, runner, *state, {1, 2, 3, 4});
-    Expect(restored.restored && RequireFakeState(*state).value == 0xABCDEF,
-           "multi-block image restores after a restart");
-  }
-  const auto files = CacheFiles(directory.path());
-  Expect(files.size() == 1, "one multi-block file is stored");
-  {
-    // Flip one byte inside the second checksum block.
-    std::fstream stream(files.front(),
-                        std::ios::binary | std::ios::in | std::ios::out);
-    stream.seekg(std::streamoff(12) << 20);
-    char value = 0;
-    stream.read(&value, 1);
-    value ^= static_cast<char>(0x33);
-    stream.seekp(std::streamoff(12) << 20);
-    stream.write(&value, 1);
-  }
-  {
-    ContinuationDiskStore restarted(StoreOptions(directory.path(), kLimit, kLimit));
-    auto state = runner.CreateState();
-    Expect(!RestoreTokens(restarted, runner, *state, {1, 2, 3, 4}).restored,
-           "corruption in a later block is a deterministic miss");
-    Expect(CacheFiles(directory.path()).empty(),
-           "the corrupt multi-block file is removed on restore");
-  }
-  g_fake_payload_bytes = kDefaultFakePayloadBytes;
-}
+  auto runner = std::make_shared<FakeRunner>("min-step-model");
+  std::vector<ContinuationDiskEvent> events;
+  auto options = StoreOptions(directory.path());
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(
+      options, [&](const auto& event) { events.push_back(event); });
 
-void TestLegacyVersionOneFileStillRestores() {
-  TemporaryDirectory directory;
-  const FakeRunner runner("legacy-v1");
-  {
-    ContinuationDiskStore store(StoreOptions(directory.path()));
-    auto snapshot = MakeSnapshot(runner, 0x5151, 2);
-    Expect(SaveTokens(store, runner, {7, 8}, *snapshot).stored,
-           "image is stored before conversion to version 1");
-  }
-  const auto files = CacheFiles(directory.path());
-  Expect(files.size() == 1, "one file to convert");
-  std::vector<std::uint8_t> image;
-  {
-    std::ifstream input(files.front(), std::ios::binary);
-    image.assign(std::istreambuf_iterator<char>(input),
-                 std::istreambuf_iterator<char>());
-  }
-  // Rewrite it the way version 1 did: version field 1, one SHA-256 over the
-  // whole image with the checksum field zeroed.
-  image[8] = 1;
-  std::fill(image.begin() + 32, image.begin() + 96, std::uint8_t{0});
-  const std::string checksum = gufo::crypto::Sha256Hex(image);
-  std::copy(checksum.begin(), checksum.end(), image.begin() + 32);
-  {
-    std::ofstream output(files.front(), std::ios::binary | std::ios::trunc);
-    output.write(reinterpret_cast<const char*>(image.data()),
-                 static_cast<std::streamsize>(image.size()));
-  }
-  ContinuationDiskStore restarted(StoreOptions(directory.path()));
-  auto state = runner.CreateState();
-  const auto restored = RestoreTokens(restarted, runner, *state, {7, 8, 9});
-  Expect(restored.restored && RequireFakeState(*state).value == 0x5151,
-         "a version 1 file still restores with its legacy checksum");
+  Expect(
+      SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2)).stored,
+      "the first checkpoint has no covering prefix and is stored");
+  Expect(store.WithinCheckpointStep(*runner,
+                                    std::vector<TextRunnerToken>{1, 2, 3, 4}) &&
+             !store.WithinCheckpointStep(
+                 *runner, std::vector<TextRunnerToken>{1, 2, 3, 4, 5}) &&
+             !store.WithinCheckpointStep(*runner,
+                                         std::vector<TextRunnerToken>{8, 8}),
+         "callers can skip a capture the step would discard");
+  Expect(!SaveTokens(store, *runner, {1, 2, 3, 4}, *MakeSnapshot(*runner, 2, 4))
+                 .stored &&
+             events.back().reason == ContinuationDiskEventReason::kMinStep,
+         "a checkpoint less than one step past a stored prefix is skipped");
+  Expect(
+      SaveTokens(store, *runner, {9, 9}, *MakeSnapshot(*runner, 3, 2)).stored,
+      "an unrelated checkpoint is not covered by another prompt");
+  Expect(
+      SaveTokens(store, *runner, {1, 2, 3, 4, 5}, *MakeSnapshot(*runner, 4, 5))
+          .stored,
+      "a checkpoint one full step past the prefix is stored");
+
+  Expect(store.SaveAsync(runner, {1, 2, 3, 4, 5, 6},
+                         MakeSnapshot(*runner, 5, 6), {}, {},
+                         /*shared_prefix=*/true) != 0,
+         "a shared prefix is queued");
+  store.Flush();
+  auto state = runner->CreateState();
+  Expect(
+      RestoreTokens(store, *runner, *state, {1, 2, 3, 4, 5, 6, 7}).restored &&
+          RequireFakeState(*state).value == 5,
+      "shared prefixes are exempt from the step");
+
+  options.min_checkpoint_step_tokens = 0;
+  TemporaryDirectory ungated_directory;
+  options.directory = ungated_directory.path();
+  ContinuationDiskStore ungated(options);
+  Expect(
+      SaveTokens(ungated, *runner, {1, 2}, *MakeSnapshot(*runner, 1, 2))
+              .stored &&
+          SaveTokens(ungated, *runner, {1, 2, 3}, *MakeSnapshot(*runner, 2, 3))
+              .stored,
+      "zero disables the step");
 }
 
 int main() {
-  TestMultiBlockImageRoundTripAndCorruption();
-  TestLegacyVersionOneFileStillRestores();
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();
+  TestMinimumCheckpointStep();
   TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
@@ -1223,6 +1222,7 @@ int main() {
   TestRootSymlinkIsRejected();
   TestConcurrentCallersRemainBoundedAndExact();
   TestConcurrentStoreInstancesPublishSafely();
+  TestStartupPreservesActivePublisher();
   std::cout << "continuation disk store tests passed\n";
   return 0;
 }

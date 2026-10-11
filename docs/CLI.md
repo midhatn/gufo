@@ -67,11 +67,12 @@ The supported modalities are LLM, image, video, and audio (TTS, ASR).
 
 - `think` (`"on"` / `"off"` / `"auto"`) — whether the model produces its
   visible thinking before answering. In practice: off for quick chats, on
-  for hard problems, auto lets the model decide per request.
+  for hard problems. Auto uses the model default: enabled for Qwen3.8 and
+  DeepSeek V4 Flash.
 - `reasoningEffort` (`"auto"`, `"minimal"`, `"low"`, `"medium"`, `"high"`,
-  `"xhigh"`, `"max"`) — how long the model is allowed to reason before
-  answering. More effort usually means better answers on hard tasks, at the
-  cost of slower responses and more generated tokens.
+  `"xhigh"`, `"max"`) — model instructions controlling reasoning depth,
+  not a token limit. Auto selects Qwen `xhigh` or DeepSeek `high`; more effort
+  can increase response time and generated tokens.
 - `preserveThinking` (`"on"` / `"off"` / `"auto"`) — whether earlier turns'
   thinking is kept in the conversation history. In practice: keeping it can
   help follow-up questions that build on the previous reasoning, at the cost
@@ -110,14 +111,22 @@ seed. Speed depends on acceptance and verification cost.
 
 - `maxPending` — maximum requests waiting in the queue. Over the limit,
   clients wait or are refused rather than exhausting memory.
-- `maxPendingPerClient` — the same cap but per client, so one client cannot
-  hog the whole queue.
+- `maxPendingPerClient` — the same cap but per client IP. It defaults to
+  `maxPending`; set it lower so one client cannot hog the whole queue.
 - `requestTimeoutMs` — requests are killed after this many milliseconds. In
   practice: prevents stuck requests from holding GPU sessions forever.
 - `maxOutputBytes` — maximum response size per request.
 - `maxBufferedOutputBytes` — maximum generated-but-not-yet-delivered output
   buffered for one request; protects against slow clients.
 - `maxBufferedOutputTotal` — the same buffer budget across all requests.
+
+**Diagnostics**
+
+- `trace` — a file that receives every text request body, the prompt as the
+  model reads it, the raw generated text and the reply sent back, as JSON
+  Lines. In practice: turn it on to see why a client received broken output,
+  then delete the file, because it holds whole conversations. See
+  [content trace](SERVER.md#content-trace).
 
 **Hardware**
 
@@ -180,7 +189,17 @@ These apply to every modality, before or after the subcommand:
   32 MiB).
 - `apiKey` — if set, requests require `Authorization: Bearer <key>`, including
   health checks. Browser CORS preflight (`OPTIONS`) remains unauthenticated.
-- `verbose` — chattier logs.
+- `logLevel` (`--log-level <error|warn|info|debug>`, default `info`) — how much
+  the server logs. In practice: `debug` is the level that explains a stalled
+  client, because it also shows health polls, admission refusals with the limit
+  that rejected them, and cache candidate decisions. `verbose` (`-v`) is
+  shorthand for `--log-level=debug`; passing both is a usage error. The tier is
+  a threshold all the way down, and the `event=listening` startup confirmation
+  is INFO-tier, so `warn` and `error` boot and stop silently. Prompt text,
+  message bodies and the API key are never logged at any level; only the
+  separate, opt-in `trace` file records content. Debug admission lines do name
+  the client by the peer IP address of its connection. See
+  [server logs](SERVER.md#troubleshooting-logs).
 
 ## Commands
 

@@ -7,6 +7,7 @@
 #include <span>
 #include <string_view>
 
+#include "src/cli/banner.hpp"
 #include "src/cli/bench/bench.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
@@ -123,6 +124,8 @@ int run(std::span<const char* const> args) {
     print_help(program_name);
     return 2;
   }
+
+  gufo::cli::PrintStartupBanner(kGufoReleaseVersion, options);
 
   if (first_arg == "probe") {
     return gufo::cli::RunProbe(options.subspan(1));

@@ -22,6 +22,7 @@ namespace gufo::sampling {
 // verification.
 class JsonConstraint {
 public:
+  enum class ToolFormat { kJson, kQwen, kDeepSeek };
   struct Stack {
     std::vector<std::uint32_t> symbols;
     std::string lexeme;
@@ -34,12 +35,26 @@ public:
   static std::shared_ptr<const JsonConstraint> Compile(
       const json::Value& schema, bool strict);
   static std::shared_ptr<const JsonConstraint> Object();
+  // Resolve a local JSON pointer using the same rules as schema compilation.
+  // Throws invalid_argument for malformed or missing references.
+  static const json::Value* ResolveReference(const json::Value& root,
+                                             const json::Value& reference);
+  // Native models always retain native parameter tags. Unsupported tool
+  // schemas use best-effort arguments without relaxing response-format schemas.
+  // Tool choice changes the call envelope, not this cached argument grammar.
+  static std::shared_ptr<const JsonConstraint> ToolParameters(
+      const json::Value& schema, bool strict, ToolFormat format);
+  // Best-effort native framing for non-strict tools with no declared argument
+  // types. It preserves the model's native string/DSML typed-value semantics.
+  static std::shared_ptr<const JsonConstraint> OpenToolParameters(
+      ToolFormat format);
   static std::shared_ptr<const JsonConstraint> WithReasoning(
       std::shared_ptr<const JsonConstraint> answer);
   using Tool = std::pair<std::string, std::shared_ptr<const JsonConstraint>>;
   static std::shared_ptr<const JsonConstraint> WithTools(
       std::shared_ptr<const JsonConstraint> answer, std::vector<Tool> tools,
-      bool required, bool parallel = false);
+      bool required, bool parallel = false,
+      ToolFormat format = ToolFormat::kJson);
 
   [[nodiscard]] State Start() const;
   [[nodiscard]] State Advance(const State& state, unsigned char byte) const;
@@ -50,6 +65,7 @@ private:
   JsonConstraint() = default;
   friend class JsonConstraintCompiler;
   friend class ConstraintVocabulary;
+  friend class SamplerState;
   friend struct TokenConstraint;
   State CanonicalMaskState(const State& state, std::size_t token_bytes) const;
   State Expand(State state) const;
@@ -59,6 +75,9 @@ private:
   std::uint32_t root_{0};
   std::string prompt_;
   bool stop_only_when_complete_{true};
+  bool automatic_tools_{false};
+  std::string reasoning_tool_prefix_;
+  std::uint32_t reasoning_tool_root_{0};
 };
 
 class ConstraintVocabulary {
@@ -75,20 +94,23 @@ public:
   [[nodiscard]] JsonConstraint::State Accept(const JsonConstraint& grammar,
                                              const JsonConstraint::State& state,
                                              std::uint32_t token) const;
+  [[nodiscard]] bool Allows(const JsonConstraint& grammar,
+                            const JsonConstraint::State& state,
+                            std::uint32_t token) const;
   [[nodiscard]] std::size_t size() const { return pieces_.size(); }
 
 private:
   friend struct TokenConstraint;
-  struct Edge {
-    std::uint32_t child;
-    unsigned char byte;
-  };
   struct Node {
-    std::vector<Edge> edges;
-    std::vector<std::uint32_t> tokens;
+    std::uint32_t child{UINT32_MAX};
+    std::uint32_t sibling{UINT32_MAX};
+    std::uint32_t token{UINT32_MAX};
+    unsigned char byte{0};
   };
   std::vector<Node> trie_{1};
   std::vector<Piece> pieces_;
+  std::vector<std::uint32_t> next_token_;
+  std::vector<std::uint32_t> reasoning_boundary_tokens_;
   std::size_t max_token_bytes_{0};
 };
 
@@ -100,6 +122,7 @@ struct TokenConstraint {
 
 private:
   mutable std::mutex mutex_;
+  mutable JsonConstraint::State initial_state_;
   mutable std::map<JsonConstraint::State,
                    std::shared_ptr<const std::vector<std::uint8_t>>>
       masks_;
