@@ -85,7 +85,7 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
-constexpr std::uint32_t kNpuSlicesMax = 6;  ///< C buffers per NPU group
+constexpr std::uint32_t kNpuSlicesMax = 12;  ///< C buffers per NPU group
 // The widest dense trunk matrix: the linear-attention input stack.
 constexpr std::size_t kDequantHalfMaxElems = std::size_t{16384} * 2560;
 
@@ -2556,6 +2556,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
           }
         }
+        if (gpu_rows < channels) {
+          SsmConvTail(s_.qkvz, l.ssm_conv1d.f32(), s.conv_state,
+                      s_.conv_scratch, n_tokens, channels, l.ssm_in.rows,
+                      gpu_rows, stream_);
+        }
       } else {
         convolved = DenseF16SsmGemm(
             l.ssm_in.data, static_cast<const __half*>(s_.x_half),
@@ -3024,14 +3029,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
     const std::size_t base = static_cast<std::size_t>(g) * group_tokens * ff;
     const std::size_t c0 = static_cast<std::size_t>(g) * kNpuSlicesMax;
-    NpuDecodeOutput(npu->Staged(stream_, npu_c_[c0]), s_.shexp_up + base,
-                    group_tokens, npu->n(), ff, 0, false, stream_, ff);
-    NpuDecodeOutput(npu->Staged(stream_, npu_c_[c0 + 1]),
-                    s_.shexp_gate + base, group_tokens, npu->n(), ff, 0, false,
-                    stream_, ff);
+    NpuSwiglu(npu->Staged(stream_, npu_c_[c0]),
+              npu->Staged(stream_, npu_c_[c0 + 1]), s_.shexp_half + base,
+              group_tokens, npu->n(), ff, stream_);
   }
-  SwigluHalf(s_.shexp_up, s_.shexp_gate, s_.shexp_half,
-             static_cast<std::size_t>(n_tokens) * ff, stream_);
   if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
                     l.shexp_down.rows, l.shexp_down.cols, stream_)) {
     AssignError(error_msg, "shared expert F16 GEMM failed");

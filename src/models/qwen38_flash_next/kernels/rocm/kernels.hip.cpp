@@ -6286,6 +6286,41 @@ __global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
       SsmConv4Value(taps, v[0], v[1], v[2], v[3]);
 }
 
+// Convolution of the channels [c_begin, channels) whose projection rows came
+// from elsewhere (the NPU): every token, from the raw rows and the history.
+__global__ void SsmConvRangeKernel(const float* qkv, const float* w,
+                                   const float* history, float* out,
+                                   std::uint32_t n_tokens,
+                                   std::uint32_t channels, std::uint32_t stride,
+                                   std::uint32_t c_begin) {
+  const std::uint32_t c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+  const std::uint32_t t0 = blockIdx.y * kSsmConvTokensPerThread;
+  const float4 taps = *reinterpret_cast<const float4*>(w + c * 4);
+  float window[3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const int src = static_cast<int>(t0) - 3 + i;
+    window[i] = src < 0 ? history[static_cast<std::size_t>(src + 3) * channels + c]
+                        : qkv[static_cast<std::size_t>(src) * stride + c];
+  }
+#pragma unroll
+  for (std::uint32_t i = 0; i < kSsmConvTokensPerThread; ++i) {
+    const std::uint32_t t = t0 + i;
+    if (t >= n_tokens) {
+      break;
+    }
+    const float v = qkv[static_cast<std::size_t>(t) * stride + c];
+    out[static_cast<std::size_t>(t) * channels + c] =
+        SsmConv4Value(taps, window[0], window[1], window[2], v);
+    window[0] = window[1];
+    window[1] = window[2];
+    window[2] = v;
+  }
+}
+
 // Optional output layout for the stacked QKV projection. The projection's
 // 256-row tile covers one query, gate, key or value head.
 struct AttentionProjectionOutput {
@@ -7487,6 +7522,61 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   *reinterpret_cast<float4*>(dst + 4) = r[1];
 }
 
+/// silu(gate) * up straight from two C tile streams, F16 rows of valid_cols
+/// (tokens x valid_cols): the shared expert's activation without the F32 rows
+/// in between.
+__global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
+                                const std::uint8_t* __restrict__ up_in,
+                                __half* __restrict__ out, std::uint32_t tokens,
+                                std::uint32_t cols, std::uint32_t valid_cols) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (g >= std::size_t{tokens} * cols / 8) {
+    return;
+  }
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_n = cols / kNpuTileN;
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile / tiles_n);
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile % tiles_n);
+  const std::uint32_t rib = gi & 7;
+  const std::uint32_t bc = (gi >> 3) & 1;
+  const std::uint32_t br = (gi >> 4) & 1;
+  const std::uint32_t sc = (gi >> 5) & 7;
+  const std::uint32_t sr = gi >> 8;
+  const std::size_t row =
+      std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
+  const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
+  if (col >= valid_cols) {
+    return;
+  }
+  const std::uint8_t* pg = gate_in + g * 9;
+  const std::uint8_t* pu = up_in + g * 9;
+  const float mg = ldexpf(1.0F, static_cast<int>(pg[0]) - 127) / 64.0F;
+  const float mu = ldexpf(1.0F, static_cast<int>(pu[0]) - 127) / 64.0F;
+  __half2 packed[4];
+#pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    const float g0 = static_cast<float>(static_cast<std::int8_t>(pg[1 + i])) * mg;
+    const float g1 = static_cast<float>(static_cast<std::int8_t>(pg[2 + i])) * mg;
+    const float u0 = static_cast<float>(static_cast<std::int8_t>(pu[1 + i])) * mu;
+    const float u1 = static_cast<float>(static_cast<std::int8_t>(pu[2 + i])) * mu;
+    packed[i / 2] = __floats2half2_rn(SiluF(g0) * u0, SiluF(g1) * u1);
+  }
+  *reinterpret_cast<uint4*>(out + row * valid_cols + col) =
+      *reinterpret_cast<const uint4*>(packed);
+}
+
+void NpuSwiglu(const void* gate, const void* up, __half* out,
+               std::uint32_t tokens, std::uint32_t cols,
+               std::uint32_t valid_cols, hipStream_t stream) {
+  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  hipLaunchKernelGGL(NpuSwigluKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
+                     stream, static_cast<const std::uint8_t*>(gate),
+                     static_cast<const std::uint8_t*>(up), out, tokens, cols,
+                     valid_cols);
+}
+
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
                           std::uint32_t tokens, std::uint32_t k_slice,
                           std::uint32_t k_offset, std::uint32_t k_valid,
@@ -7597,9 +7687,11 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
   }
   if (n_tokens < 1024 || (m != 16384 && m != channels) || k != 2560 ||
       channels != 10240 || kernel != kSsmConvTaps || gpu_rows > m ||
-      gpu_rows < channels || gpu_rows % 256 != 0) {
+      gpu_rows == 0 || gpu_rows % 256 != 0) {
     return false;
   }
+  // Channels past gpu_rows come from the NPU; SsmConvTail convolves them.
+  const std::uint32_t conv_channels = std::min(gpu_rows, channels);
   // Row-tile pairs per token tile in launch order (-0.9 %).
   if (half_weights) {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true,
@@ -7617,12 +7709,24 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
   }
   hipLaunchKernelGGL(
       SsmConvBoundaryKernel,
-      dim3(Blocks(channels),
+      dim3(Blocks(conv_channels),
            (n_tokens + kSsmProjectionTileTokens - 1) / kSsmProjectionTileTokens,
            3),
       dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
       channels, m);
   return true;
+}
+
+void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
+                 float* convolved, std::uint32_t n_tokens,
+                 std::uint32_t channels, std::uint32_t stride,
+                 std::uint32_t c_begin, hipStream_t stream) {
+  hipLaunchKernelGGL(
+      SsmConvRangeKernel,
+      dim3(Blocks(channels - c_begin),
+           (n_tokens + kSsmConvTokensPerThread - 1) / kSsmConvTokensPerThread),
+      dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
+      channels, stride, c_begin);
 }
 
 /// F16 rows read as 16-byte chunks (eight weights per lane and step); each

@@ -600,7 +600,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       // last rows of ssm_in); the GPU does the rest.
       std::uint32_t kSlices = 5;
       if (const char* sl = std::getenv("GUFO_NPU_SLICES"); sl != nullptr) {
-        kSlices = std::clamp(static_cast<std::uint32_t>(std::atoi(sl)), 1U, 6U);
+        kSlices =
+            std::clamp(static_cast<std::uint32_t>(std::atoi(sl)), 1U, 12U);
       }
       const std::uint32_t kZRow0 = kRows - kSlices * npu->n();
       std::size_t staged = 0;

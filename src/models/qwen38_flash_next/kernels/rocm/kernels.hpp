@@ -320,6 +320,10 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
                          hipStream_t stream, std::size_t ldx = 0);
+void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
+                 float* convolved, std::uint32_t n_tokens,
+                 std::uint32_t channels, std::uint32_t stride,
+                 std::uint32_t c_begin, hipStream_t stream);
 /// Re-encodes `blocks` Q8_0 blocks as Q5_1 (24 bytes each) for the decode GEMV.
 /// NPU staging for the block-float GEMM kernel (see kernels.hip.cpp). Buffers
 /// hold 9 bytes per 8 values. Activations: tokens (a multiple of 128) rows of
@@ -337,6 +341,9 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
                       hipStream_t stream, bool gate_rows = false);
+void NpuSwiglu(const void* gate, const void* up, __half* out,
+               std::uint32_t tokens, std::uint32_t cols,
+               std::uint32_t valid_cols, hipStream_t stream);
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,
@@ -359,8 +366,9 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
 /// this result and update history. Speculative snapshots need all raw QKV
 /// rows and must use DenseF16Gemm instead. Unsupported shapes launch nothing.
 /// half_weights reads F16 weight rows (a dequantized copy) instead of Q8_0.
-/// gpu_rows (a multiple of 256, at least channels) computes only the first
-/// rows, leaving the rest of each pitch-m row to another device.
+/// gpu_rows (a multiple of 256) computes only the first rows, leaving the rest
+/// of each pitch-m row to another device; when that cuts into the conv
+/// channels, SsmConvTail convolves the remaining channels from their raw rows.
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
