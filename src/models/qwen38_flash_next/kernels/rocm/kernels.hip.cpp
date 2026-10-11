@@ -7291,6 +7291,192 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
   return LaunchDenseF16Gemm<false>(w, x, out, batch, m, k, stream, ldx);
 }
 
+// ---- NPU staging: block-float (v8bfp16ebs8) tiles for the XDNA2 GEMM -------
+// The NPU kernel (M = 4096 tokens, K = 2560, N = 1024) reads A and B as streams
+// of 9-byte groups: one shared exponent byte then eight signed 8-bit mantissas,
+// value = q * 2^(e - 127) / 64. Group order follows the kernel's L1 tiles
+// (128 x 64): A tiles row-major over (M, K) with 2x1 super blocks of 8x8
+// row-major blocks, B tiles column-major over (K, N) with 1x2 super blocks of
+// 8x8 column-major blocks, C tiles (512 x 128) row-major with 2x2 super blocks.
+constexpr int kNpuTileM = 128;
+constexpr int kNpuTileK = 64;
+constexpr int kNpuTileN = 128;
+constexpr int kNpuTileRowsC = 4 * kNpuTileM;
+
+__device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
+  unsigned max_exp = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    max_exp = max(max_exp, (__float_as_uint(v[i]) >> 23) & 0xFFu);
+  }
+  // 2^(133 - max_exp), the exact reciprocal of the group's mantissa unit.
+  const float inv = __uint_as_float(max_exp >= 7 ? (260u - max_exp) << 23 : 0u);
+  out[0] = static_cast<std::uint8_t>(max_exp);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float q = fminf(127.0F, fmaxf(-128.0F, rintf(v[i] * inv)));
+    out[1 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+  }
+}
+
+/// One block per A tile: coalesced 16-byte loads into LDS, then four groups
+/// per thread. Columns at or past k_valid encode as zero (K padding).
+__global__ void __launch_bounds__(256)
+    NpuEncodeActivationsKernel(const __half* __restrict__ x,
+                               std::uint8_t* __restrict__ out,
+                               std::uint32_t k_slice, std::uint32_t k_offset,
+                               std::uint32_t k_valid, std::size_t ldx) {
+  __shared__ __align__(16) __half tile[kNpuTileM * kNpuTileK];
+  __shared__ __align__(16) std::uint8_t staged[kNpuTileM * kNpuTileK / 8 * 9];
+  const std::uint32_t tiles_k = k_slice / kNpuTileK;
+  const std::uint32_t tile_row = blockIdx.x / tiles_k;
+  const std::uint32_t tile_col = blockIdx.x % tiles_k;
+  const std::uint32_t t = threadIdx.x;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t row = (t >> 3) + 32 * j;
+    const std::uint32_t vec = t & 7;
+    const std::uint32_t col = tile_col * kNpuTileK + vec * 8;
+    uint4 raw = make_uint4(0, 0, 0, 0);
+    if (k_offset + col + 8 <= k_valid) {
+      raw = *reinterpret_cast<const uint4*>(
+          &x[(static_cast<std::size_t>(tile_row) * kNpuTileM + row) * ldx +
+             k_offset + col]);
+    }
+    *reinterpret_cast<uint4*>(&tile[row * kNpuTileK + vec * 8]) = raw;
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const std::uint32_t gi = t + 256 * j;
+    const std::uint32_t rib = gi & 7;
+    const std::uint32_t block = (gi >> 3) & 1;
+    const std::uint32_t sc = (gi >> 4) & 7;
+    const std::uint32_t sr = gi >> 7;
+    const std::uint32_t row = sr * 16 + block * 8 + rib;
+    const uint4 raw =
+        *reinterpret_cast<const uint4*>(&tile[row * kNpuTileK + sc * 8]);
+    const __half* h = reinterpret_cast<const __half*>(&raw);
+    float v[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      v[i] = __half2float(h[i]);
+    }
+    NpuEncodeGroup(v, staged + gi * 9);
+  }
+  __syncthreads();
+  const uint4* src = reinterpret_cast<const uint4*>(staged);
+  uint4* dst =
+      reinterpret_cast<uint4*>(out + static_cast<std::size_t>(blockIdx.x) *
+                                         (kNpuTileM * kNpuTileK / 8 * 9));
+  for (std::uint32_t i = t; i < kNpuTileM * kNpuTileK / 8 * 9 / 16; i += 256) {
+    dst[i] = src[i];
+  }
+}
+
+/// B groups from Q8_0 weight rows: row n of the slice is output column n,
+/// eight consecutive K values of a Q8_0 block form one group.
+__global__ void NpuEncodeWeightsQ8Kernel(
+    const Q8_0Block* __restrict__ w, std::uint8_t* __restrict__ out,
+    std::uint32_t row0, std::uint32_t cols, std::uint32_t k_slice,
+    std::uint32_t k_offset, std::uint32_t k_valid, std::uint32_t k_total) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const std::size_t total = std::size_t{k_slice} * cols / 8;
+  if (g >= total) {
+    return;
+  }
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileK * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_k = k_slice / kNpuTileK;
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile / tiles_k);
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile % tiles_k);
+  const std::uint32_t cib = gi & 7;
+  const std::uint32_t block = (gi >> 3) & 1;
+  const std::uint32_t sr = (gi >> 4) & 7;
+  const std::uint32_t sc2 = gi >> 7;
+  const std::uint32_t kk = k_offset + tile_row * kNpuTileK + sr * 8;
+  const std::uint32_t nn = tile_col * kNpuTileN + (sc2 * 2 + block) * 8 + cib;
+  float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (kk + 8 <= k_valid) {
+    const Q8_0Block& b =
+        w[static_cast<std::size_t>(row0 + nn) * (k_total / 32) + kk / 32];
+    const float scale = __half2float(b.d);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      v[i] = scale * static_cast<float>(b.qs[(kk % 32) + i]);
+    }
+  }
+  NpuEncodeGroup(v, out + g * 9);
+}
+
+/// Decodes a C tile stream into rows of `out` (pitch out_pitch, first column
+/// col0). With accumulate the values add to what is there.
+__global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
+                                      float* __restrict__ out,
+                                      std::uint32_t tokens, std::uint32_t cols,
+                                      std::size_t out_pitch, std::uint32_t col0,
+                                      bool accumulate) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (g >= std::size_t{tokens} * cols / 8) {
+    return;
+  }
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_n = cols / kNpuTileN;
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile / tiles_n);
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile % tiles_n);
+  const std::uint32_t rib = gi & 7;
+  const std::uint32_t bc = (gi >> 3) & 1;
+  const std::uint32_t br = (gi >> 4) & 1;
+  const std::uint32_t sc = (gi >> 5) & 7;
+  const std::uint32_t sr = gi >> 8;
+  const std::size_t row =
+      std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
+  const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
+  const std::uint8_t* p = in + g * 9;
+  const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
+  float* dst = out + row * out_pitch + col0 + col;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float v =
+        static_cast<float>(static_cast<std::int8_t>(p[1 + i])) * mult;
+    dst[i] = accumulate ? dst[i] + v : v;
+  }
+}
+
+void NpuEncodeActivations(const __half* x, std::size_t ldx,
+                          std::uint32_t tokens, std::uint32_t k_slice,
+                          std::uint32_t k_offset, std::uint32_t k_valid,
+                          void* dst, hipStream_t stream) {
+  hipLaunchKernelGGL(NpuEncodeActivationsKernel,
+                     dim3((tokens / kNpuTileM) * (k_slice / kNpuTileK)),
+                     dim3(256), 0, stream, x, static_cast<std::uint8_t*>(dst),
+                     k_slice, k_offset, k_valid, ldx);
+}
+
+void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
+                      std::uint32_t cols, std::uint32_t k_slice,
+                      std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
+                      hipStream_t stream) {
+  const std::size_t groups = std::size_t{k_slice} * cols / 8;
+  hipLaunchKernelGGL(
+      NpuEncodeWeightsQ8Kernel, dim3(Blocks(groups)), dim3(kThreads), 0, stream,
+      static_cast<const Q8_0Block*>(q8), static_cast<std::uint8_t*>(dst), row0,
+      cols, k_slice, k_offset, k_valid, k_total);
+}
+
+void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
+                     std::uint32_t cols, std::size_t out_pitch,
+                     std::uint32_t col0, bool accumulate, hipStream_t stream) {
+  const std::size_t groups = std::size_t{tokens} * cols / 8;
+  hipLaunchKernelGGL(NpuDecodeOutputKernel, dim3(Blocks(groups)),
+                     dim3(kThreads), 0, stream,
+                     static_cast<const std::uint8_t*>(src), out, tokens, cols,
+                     out_pitch, col0, accumulate);
+}
+
 /// One thread re-encodes one Q8_0 block as Q5_1 with ggml's reference
 /// quantizer: 32 levels over the block's own [min, max].
 __global__ void RequantQ8ToQ5_1Kernel(const Q8_0Block* __restrict__ src,
@@ -7363,25 +7549,29 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream, std::uint32_t checkpoint_tokens,
-                     bool half_weights) {
-  if (n_tokens < 1024 || m != 16384 || k != 2560 || channels != 10240 ||
-      kernel != kSsmConvTaps) {
+                     bool half_weights, std::uint32_t gpu_rows) {
+  if (gpu_rows == 0) {
+    gpu_rows = m;
+  }
+  if (n_tokens < 1024 || (m != 16384 && m != channels) || k != 2560 ||
+      channels != 10240 || kernel != kSsmConvTaps || gpu_rows > m ||
+      gpu_rows < channels || gpu_rows % 256 != 0) {
     return false;
   }
   // Row-tile pairs per token tile in launch order (-0.9 %).
   if (half_weights) {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true,
                                            false, true, false>),
-                       dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
-                       stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
-                       nullptr, conv_w, convolved, AttentionProjectionOutput{},
-                       checkpoint_tokens);
+                       dim3((n_tokens + 127) / 128, gpu_rows / 256),
+                       dim3(kThreads), 0, stream, w, x, qkvz, n_tokens, m, k,
+                       nullptr, nullptr, nullptr, conv_w, convolved,
+                       AttentionProjectionOutput{}, checkpoint_tokens);
   } else {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true>),
-                       dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
-                       stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
-                       nullptr, conv_w, convolved, AttentionProjectionOutput{},
-                       checkpoint_tokens);
+                       dim3((n_tokens + 127) / 128, gpu_rows / 256),
+                       dim3(kThreads), 0, stream, w, x, qkvz, n_tokens, m, k,
+                       nullptr, nullptr, nullptr, conv_w, convolved,
+                       AttentionProjectionOutput{}, checkpoint_tokens);
   }
   hipLaunchKernelGGL(
       SsmConvBoundaryKernel,

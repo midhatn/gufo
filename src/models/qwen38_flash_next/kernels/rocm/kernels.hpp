@@ -320,6 +320,23 @@ bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
                          std::size_t batch, std::size_t m, std::size_t k,
                          hipStream_t stream, std::size_t ldx = 0);
 /// Re-encodes `blocks` Q8_0 blocks as Q5_1 (24 bytes each) for the decode GEMV.
+/// NPU staging for the block-float GEMM kernel (see kernels.hip.cpp). Buffers
+/// hold 9 bytes per 8 values. Activations: tokens (a multiple of 128) rows of
+/// F16 at pitch ldx, K columns [k_offset, k_offset + k_slice), zero past
+/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix.
+/// Output: tokens x cols decoded into out (pitch out_pitch) from column col0.
+void NpuEncodeActivations(const __half* x, std::size_t ldx,
+                          std::uint32_t tokens, std::uint32_t k_slice,
+                          std::uint32_t k_offset, std::uint32_t k_valid,
+                          void* dst, hipStream_t stream);
+void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
+                      std::uint32_t cols, std::uint32_t k_slice,
+                      std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
+                      hipStream_t stream);
+void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
+                     std::uint32_t cols, std::size_t out_pitch,
+                     std::uint32_t col0, bool accumulate, hipStream_t stream);
+
 bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
                        hipStream_t stream);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
@@ -337,12 +354,14 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
 /// this result and update history. Speculative snapshots need all raw QKV
 /// rows and must use DenseF16Gemm instead. Unsupported shapes launch nothing.
 /// half_weights reads F16 weight rows (a dequantized copy) instead of Q8_0.
+/// gpu_rows (a multiple of 256, at least channels) computes only the first
+/// rows, leaving the rest of each pitch-m row to another device.
 bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      const float* history, float* qkvz, float* convolved,
                      std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                      std::uint32_t channels, std::uint32_t kernel,
                      hipStream_t stream, std::uint32_t checkpoint_tokens = 0,
-                     bool half_weights = false);
+                     bool half_weights = false, std::uint32_t gpu_rows = 0);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,

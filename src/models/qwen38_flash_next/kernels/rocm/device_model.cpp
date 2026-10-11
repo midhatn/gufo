@@ -471,6 +471,22 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
+#ifdef GUFO_NPU
+  // Wake the NPU before any heavy GPU work starts: resuming it re-initializes
+  // the SMU and PSP, which the GPU shares. A heartbeat then keeps it awake.
+  std::unique_ptr<NpuGemm> early_npu;
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
+      dir != nullptr && dir[0] != '\0') {
+    NpuGemm::Config cfg;
+    cfg.xclbin = std::string(dir) + "/final_4096x2560x1024_128x64x128.xclbin";
+    cfg.insts = std::string(dir) + "/insts_4096x2560x1024_128x64x128.txt";
+    std::string npu_error;
+    early_npu = NpuGemm::Create(cfg, &npu_error);
+    if (early_npu == nullptr) {
+      std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+    }
+  }
+#endif
   const auto regions = reader.GetMappedRegions();
   std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
   const auto shard_count = static_cast<std::uint32_t>(shards.size());
@@ -572,6 +588,77 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::fprintf(stderr, "decode Q5_1 copies: %.2f GiB\n",
                  static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0));
   }
+#ifdef GUFO_NPU
+  // GUFO_NPU_DIR names a directory holding the NPU kernel pair
+  // (final_4096x2560x1024_128x64x128.xclbin and the matching insts file).
+  if (early_npu != nullptr) {
+    std::string npu_error;
+    auto npu = std::move(early_npu);
+    {
+      constexpr std::uint32_t kRows = 16384;
+      // GUFO_NPU_SLICES sets how many 1024-row slices the NPU computes (the
+      // last rows of ssm_in); the GPU does the rest.
+      std::uint32_t kSlices = 5;
+      if (const char* sl = std::getenv("GUFO_NPU_SLICES"); sl != nullptr) {
+        kSlices = std::clamp(static_cast<std::uint32_t>(std::atoi(sl)), 1U, 6U);
+      }
+      const std::uint32_t kZRow0 = kRows - kSlices * npu->n();
+      std::size_t staged = 0;
+      std::uint32_t layers_on = 0;
+      // GUFO_NPU_LAYERS limits how many linear-attention layers use the NPU.
+      std::uint32_t layer_limit = 0xFFFFFFFFu;
+      if (const char* limit = std::getenv("GUFO_NPU_LAYERS");
+          limit != nullptr) {
+        layer_limit = static_cast<std::uint32_t>(std::atoi(limit));
+      }
+      for (auto& l : m->layers_) {
+        if (layers_on >= layer_limit) {
+          break;
+        }
+        if (l.ssm_in.data == nullptr ||
+            l.ssm_in.type != core::GgmlType::kQ8_0 ||
+            l.ssm_in.rows != kZRow0 + kSlices * npu->n() ||
+            l.ssm_in.cols != npu->k()) {
+          continue;
+        }
+        std::vector<int> ids;
+        for (std::uint32_t i = 0; i < kSlices; ++i) {
+          const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+          if (id < 0) {
+            break;
+          }
+          NpuEncodeWeights(l.ssm_in.data, l.ssm_in.cols, kZRow0 + i * npu->n(),
+                           npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
+                           nullptr);
+          ids.push_back(id);
+          staged += npu->BBytes();
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+          ids.clear();
+        }
+        for (int id : ids) {
+          npu->FinalizeWeights(id);
+        }
+        if (ids.size() == kSlices) {
+          l.npu_z = std::move(ids);
+          ++layers_on;
+        }
+      }
+      if (hipDeviceSynchronize() != hipSuccess) {
+        if (error_msg != nullptr) {
+          *error_msg = "NPU weight staging failed";
+        }
+        return nullptr;
+      }
+      std::fprintf(stderr, "NPU: z projection of %u layers, %.2f GiB staged\n",
+                   layers_on,
+                   static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
+      if (layers_on != 0) {
+        m->npu_ = std::move(npu);
+      }
+    }
+  }
+#endif
   return m;
 }
 
