@@ -2507,6 +2507,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = c.SsmValueDim();
   bool convolved = false;
+  // Finishes the z rows coming from the NPU; the gated norm is their first
+  // reader, so it runs between the GDN scan and that epilogue.
+  std::function<void()> npu_finish;
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
@@ -2543,20 +2546,26 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
             l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
             n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
             stream_, checkpoint.tokens, false, gpu_rows);
-        npu->Wait(stream_);
-        for (std::uint32_t g = 0; g < groups; ++g) {
-          for (std::size_t i = 0; i < l.npu_z.size(); ++i) {
-            NpuDecodeOutput(
-                npu->Staged(
-                    stream_,
-                    npu_c_[static_cast<std::size_t>(g) * kNpuSlicesMax + i]),
-                s_.qkvz + gpu_rows +
-                    static_cast<std::size_t>(g) * group_tokens * l.ssm_in.rows,
-                group_tokens, npu->n(), l.ssm_in.rows,
-                static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
+        npu_finish = [this, &l, npu, groups, group_tokens, gpu_rows]() {
+          npu->Wait(stream_);
+          for (std::uint32_t g = 0; g < groups; ++g) {
+            for (std::size_t i = 0; i < l.npu_z.size(); ++i) {
+              NpuDecodeOutput(
+                  npu->Staged(
+                      stream_,
+                      npu_c_[static_cast<std::size_t>(g) * kNpuSlicesMax + i]),
+                  s_.qkvz + gpu_rows +
+                      static_cast<std::size_t>(g) * group_tokens *
+                          l.ssm_in.rows,
+                  group_tokens, npu->n(), l.ssm_in.rows,
+                  static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
+            }
           }
-        }
+        };
         if (gpu_rows < channels) {
+          // Convolution channels came from the NPU: they are needed now.
+          npu_finish();
+          npu_finish = nullptr;
           SsmConvTail(s_.qkvz, l.ssm_conv1d.f32(), s.conv_state,
                       s_.conv_scratch, n_tokens, channels, l.ssm_in.rows,
                       gpu_rows, stream_);
@@ -2633,7 +2642,17 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                 c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                 convolved, c.rms_eps, stream_, out_half, checkpoint,
-                half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr);
+                half_stride, out_q8_1 ? s_.gdn_q8_1 : nullptr,
+                npu_finish ? +[](void* p) {
+                  auto& finish = *static_cast<std::function<void()>*>(p);
+                  finish();
+                  finish = nullptr;
+                } : nullptr,
+                &npu_finish);
+  if (npu_finish) {
+    npu_finish();
+    npu_finish = nullptr;
+  }
   if (!project_output) {
     return true;
   }

@@ -7939,7 +7939,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t d, std::uint32_t kernel, bool row_split,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
-                   std::uint32_t out_half_stride, void* out_q8_1) {
+                   std::uint32_t out_half_stride, void* out_q8_1,
+                   void (*before_epilogue)(void*), void* before_epilogue_arg) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
@@ -8008,6 +8009,11 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
         dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, conv_scratch, qn, kn,
         alpha_beta, a, dt, state, raw, state_snapshots, n_tokens, k_heads,
         v_heads, nullptr, 0, checkpoint);
+  }
+  // The caller finishes the z rows (still arriving from the NPU) here: the
+  // epilogue is the first reader.
+  if (before_epilogue != nullptr) {
+    before_epilogue(before_epilogue_arg);
   }
   hipLaunchKernelGGL(
       GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),

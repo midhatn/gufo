@@ -598,7 +598,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       constexpr std::uint32_t kRows = 16384;
       // GUFO_NPU_SLICES sets how many 1024-row slices the NPU computes (the
       // last rows of ssm_in); the GPU does the rest.
-      std::uint32_t kSlices = 5;
+      std::uint32_t kSlices = 6;
       if (const char* sl = std::getenv("GUFO_NPU_SLICES"); sl != nullptr) {
         kSlices =
             std::clamp(static_cast<std::uint32_t>(std::atoi(sl)), 1U, 12U);
