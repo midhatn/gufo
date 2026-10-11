@@ -209,6 +209,11 @@ struct NpuGemm::Impl {
   // GUFO_NPU_STATS=1: wall-clock accounting printed every 36 waits.
   const bool stats{std::getenv("GUFO_NPU_STATS") != nullptr};
   double submit_us{0};
+  // Phase totals of the worker (GUFO_NPU_STATS): where the NPU path spends time.
+  double copy_a_us{0};     // A host->private copy + sync
+  double launch_us{0};     // kernel(...) submissions
+  double run_wait_us{0};   // waiting for the NPU itself
+  double copy_c_us{0};     // C sync + private->host copy
   double wait_us{0};
   std::uint64_t waits{0};
 
@@ -258,20 +263,30 @@ struct NpuGemm::Impl {
     return isolate ? b.private_bo : b.shared_bo;
   }
 
+  static double Since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t)
+        .count();
+  }
+
   void CopyToNpu(int id) {
+    const auto t0 = std::chrono::steady_clock::now();
     Buffer& b = buffers[id];
     if (isolate) {
       copy_pool.Copy(b.private_host, b.host, b.bytes);
     }
     NpuBo(id).sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    copy_a_us += Since(t0);
   }
 
   void CopyFromNpu(int id) {
+    const auto t0 = std::chrono::steady_clock::now();
     Buffer& b = buffers[id];
     NpuBo(id).sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     if (isolate) {
       copy_pool.Copy(b.host, b.private_host, b.bytes);
     }
+    copy_c_us += Since(t0);
   }
 
   void Fail(const std::exception& e) {
@@ -299,7 +314,9 @@ struct NpuGemm::Impl {
   void ReapOldest() {
     auto& [run, c] = pending.front();
     Trace("reap_begin", c);
+    const auto t0 = std::chrono::steady_clock::now();
     const bool ok = WaitRun(run);
+    run_wait_us += Since(t0);
     if (!ok) {
       abandoned.push_back(std::move(run));
     }
@@ -402,10 +419,12 @@ struct NpuGemm::Impl {
         while (pending.size() >= kMaxInFlight) {
           ReapOldest();
         }
+        const auto t_launch = std::chrono::steady_clock::now();
         pending.emplace_back(
             kernel(kOpcode, instructions, instruction_words, NpuBo(call.a_id),
                    NpuBo(call.b_ids[i]), NpuBo(call.c_ids[i])),
             call.c_ids[i]);
+        launch_us += Since(t_launch);
       }
       while (!pending.empty()) {
         ReapOldest();
@@ -433,10 +452,12 @@ struct NpuGemm::Impl {
     Trace("wait_end");
     if (stats && ++waits % 36 == 0) {
       std::fprintf(stderr,
-                   "npu stats: %llu groups | worker %.0f us, stream blocked in "
-                   "wait %.0f us (per group averages)\n",
+                   "npu stats: %llu layers | worker %.0f us (A copy %.0f, "
+                   "launch %.0f, NPU wait %.0f, C copy %.0f), stream blocked "
+                   "in wait %.0f us (per layer averages)\n",
                    static_cast<unsigned long long>(waits), submit_us / waits,
-                   wait_us / waits);
+                   copy_a_us / waits, launch_us / waits, run_wait_us / waits,
+                   copy_c_us / waits, wait_us / waits);
     }
   }
 };

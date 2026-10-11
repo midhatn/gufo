@@ -7438,12 +7438,32 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   const std::uint8_t* p = in + g * 9;
   const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
   float* dst = out + row * out_pitch + col0 + col;
+  if (((out_pitch | col0) & 3) != 0) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float v =
+          static_cast<float>(static_cast<std::int8_t>(p[1 + i])) * mult;
+      dst[i] = accumulate ? dst[i] + v : v;
+    }
+    return;
+  }
+  float4 r[2];
+  if (accumulate) {
+    r[0] = *reinterpret_cast<const float4*>(dst);
+    r[1] = *reinterpret_cast<const float4*>(dst + 4);
+  } else {
+    r[0] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+    r[1] = r[0];
+  }
+  float* rf = reinterpret_cast<float*>(r);
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     const float v =
         static_cast<float>(static_cast<std::int8_t>(p[1 + i])) * mult;
-    dst[i] = accumulate ? dst[i] + v : v;
+    rf[i] = accumulate ? rf[i] + v : v;
   }
+  *reinterpret_cast<float4*>(dst) = r[0];
+  *reinterpret_cast<float4*>(dst + 4) = r[1];
 }
 
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
