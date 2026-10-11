@@ -2952,11 +2952,36 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
   shexp_half_ready_ = false;
-  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                  &l.shexp_down, error_msg)) {
+  // The gate and up projections can run on the NPU: queued here, finished
+  // after the routed experts, which are the first to need the GPU's time.
+  NpuGemm* npu = model_->npu();
+  std::uint32_t npu_shexp_groups = 0;
+  if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
+      l.npu_shexp.size() == 2 && !last_only && n_tokens >= 1024 &&
+      n_tokens <= options_.max_batch && n_tokens % npu->tokens() == 0 &&
+      n_tokens / npu->tokens() <= npu_a_.size() &&
+      l.shexp_up.cols == npu->k() && l.shexp_up.rows <= npu->n() &&
+      DenseF16Route(l.shexp_down, n_tokens) && NpuWarm()) {
+    PrepareHalfInput(x, n_tokens, l.shexp_up.cols);
+    const std::uint32_t group_tokens = npu->tokens();
+    npu_shexp_groups = n_tokens / group_tokens;
+    for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
+      NpuEncodeActivations(
+          static_cast<const __half*>(s_.x_half) +
+              static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
+          l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
+          npu->Device(npu_a_[g]), stream_);
+      npu->Submit(stream_, npu_a_[g], l.npu_shexp.data(),
+                  npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax,
+                  2);
+    }
+  } else if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                         &l.shexp_down, error_msg)) {
     return false;
   }
-  if (shexp_half_ready_) {
+  if (npu_shexp_groups != 0) {
+    // Finished below, after the routed experts.
+  } else if (shexp_half_ready_) {
     shexp_half_ready_ = false;
     if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
                       l.shexp_down.rows, l.shexp_down.cols, stream_)) {
@@ -2987,7 +3012,32 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       throw;
     }
   }
-  return MoeExperts(l, x, out, n_tokens, error_msg);
+  if (npu_shexp_groups == 0) {
+    return MoeExperts(l, x, out, n_tokens, error_msg);
+  }
+  if (!MoeExperts(l, x, out, n_tokens, error_msg)) {
+    return false;
+  }
+  npu->Wait(stream_);
+  const std::uint32_t group_tokens = npu->tokens();
+  const std::uint32_t ff = l.shexp_up.rows;
+  for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
+    const std::size_t base = static_cast<std::size_t>(g) * group_tokens * ff;
+    const std::size_t c0 = static_cast<std::size_t>(g) * kNpuSlicesMax;
+    NpuDecodeOutput(npu->Staged(stream_, npu_c_[c0]), s_.shexp_up + base,
+                    group_tokens, npu->n(), ff, 0, false, stream_, ff);
+    NpuDecodeOutput(npu->Staged(stream_, npu_c_[c0 + 1]),
+                    s_.shexp_gate + base, group_tokens, npu->n(), ff, 0, false,
+                    stream_, ff);
+  }
+  SwigluHalf(s_.shexp_up, s_.shexp_gate, s_.shexp_half,
+             static_cast<std::size_t>(n_tokens) * ff, stream_);
+  if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
+                    l.shexp_down.rows, l.shexp_down.cols, stream_)) {
+    AssignError(error_msg, "shared expert F16 GEMM failed");
+    return false;
+  }
+  return true;
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,

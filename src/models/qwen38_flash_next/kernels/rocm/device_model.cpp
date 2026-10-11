@@ -684,6 +684,45 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (gate_layers != 0) {
         std::fprintf(stderr, "NPU: attention gate of %u layers\n", gate_layers);
       }
+      // GUFO_NPU_SHEXP=0 keeps the shared expert gate and up projections on
+      // the GPU.
+      const char* shexp_env = std::getenv("GUFO_NPU_SHEXP");
+      std::uint32_t shexp_layers = 0;
+      for (auto& l : m->layers_) {
+        if ((shexp_env != nullptr && shexp_env[0] == '0') ||
+            l.shexp_gate.data == nullptr || l.shexp_up.data == nullptr ||
+            l.shexp_gate.type != core::GgmlType::kQ8_0 ||
+            l.shexp_up.type != core::GgmlType::kQ8_0 ||
+            l.shexp_gate.cols != npu->k() || l.shexp_up.cols != npu->k() ||
+            l.shexp_gate.rows != l.shexp_up.rows ||
+            l.shexp_gate.rows > npu->n()) {
+          continue;
+        }
+        std::vector<int> ids;
+        for (const DeviceTensor* w : {&l.shexp_gate, &l.shexp_up}) {
+          const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+          if (id < 0) {
+            break;
+          }
+          NpuEncodeWeights(w->data, w->cols, 0, w->rows, npu->k(), 0, npu->k(),
+                           npu->Device(id), nullptr);
+          ids.push_back(id);
+          staged += npu->BBytes();
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+          ids.clear();
+        }
+        for (int id : ids) {
+          npu->FinalizeWeights(id);
+        }
+        if (ids.size() == 2) {
+          l.npu_shexp = std::move(ids);
+          ++shexp_layers;
+        }
+      }
+      if (shexp_layers != 0) {
+        std::fprintf(stderr, "NPU: shared expert of %u layers\n", shexp_layers);
+      }
       if (hipDeviceSynchronize() != hipSuccess) {
         if (error_msg != nullptr) {
           *error_msg = "NPU weight staging failed";

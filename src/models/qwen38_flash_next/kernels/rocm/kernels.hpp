@@ -327,7 +327,8 @@ bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
 /// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix;
 /// with gate_rows the rows are those of the gate heads in a stacked
 /// [q|gate ; k ; v] projection (256 per head).
-/// Output: tokens x cols decoded into out (pitch out_pitch) from column col0.
+/// Output: tokens x cols decoded into out (pitch out_pitch) from column col0;
+/// with valid_cols only the first valid_cols columns of the slice are written.
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
                           std::uint32_t tokens, std::uint32_t k_slice,
                           std::uint32_t k_offset, std::uint32_t k_valid,
@@ -338,7 +339,8 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       hipStream_t stream, bool gate_rows = false);
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
-                     std::uint32_t col0, bool accumulate, hipStream_t stream);
+                     std::uint32_t col0, bool accumulate, hipStream_t stream,
+                     std::uint32_t valid_cols = 0);
 
 bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
                        hipStream_t stream);

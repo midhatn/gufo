@@ -7433,7 +7433,8 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
                                       float* __restrict__ out,
                                       std::uint32_t tokens, std::uint32_t cols,
                                       std::size_t out_pitch, std::uint32_t col0,
-                                      bool accumulate) {
+                                      bool accumulate,
+                                      std::uint32_t valid_cols) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
   if (g >= std::size_t{tokens} * cols / 8) {
     return;
@@ -7452,6 +7453,9 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
   const std::size_t row =
       std::size_t{tile_row} * kNpuTileRowsC + (sr * 2 + br) * 8 + rib;
   const std::uint32_t col = tile_col * kNpuTileN + (sc * 2 + bc) * 8;
+  if (valid_cols != 0 && col >= valid_cols) {
+    return;
+  }
   const std::uint8_t* p = in + g * 9;
   const float mult = ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F;
   float* dst = out + row * out_pitch + col0 + col;
@@ -7506,12 +7510,13 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
 
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
-                     std::uint32_t col0, bool accumulate, hipStream_t stream) {
+                     std::uint32_t col0, bool accumulate, hipStream_t stream,
+                     std::uint32_t valid_cols) {
   const std::size_t groups = std::size_t{tokens} * cols / 8;
   hipLaunchKernelGGL(NpuDecodeOutputKernel, dim3(Blocks(groups)),
                      dim3(kThreads), 0, stream,
                      static_cast<const std::uint8_t*>(src), out, tokens, cols,
-                     out_pitch, col0, accumulate);
+                     out_pitch, col0, accumulate, valid_cols);
 }
 
 /// One thread re-encodes one Q8_0 block as Q5_1 with ggml's reference
