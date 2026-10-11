@@ -2749,8 +2749,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     if (fused_projection && (expand || HalfGemmable(l.attn_qkv.type))) {
       const void* weights = expand ? ExpandHalf(l.attn_qkv) : l.attn_qkv.data;
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
-      // The gate rows of the first heads run on the NPU while the GPU does
-      // the rest; the gate is first read by the attention kernel.
+      // The query and gate rows of the first heads run on the NPU while the
+      // GPU does the rest; the attention kernel is their first reader.
       NpuGemm* npu = model_->npu();
       std::uint32_t skip_gate_heads = 0;
       if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
@@ -2770,7 +2770,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax,
               static_cast<int>(l.npu_gate.size()));
         }
-        skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 4;
+        skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
       }
       prepared = AttentionF16Gemm(
           weights, static_cast<const __half*>(s_.x_half), l.attn_q_norm.f32(),
@@ -2895,17 +2895,23 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     NpuGemm* npu = model_->npu();
     npu->Wait(stream_);
     const std::uint32_t group_tokens = npu->tokens();
+    const std::uint32_t packed_stride =
+        2 * c.AttentionQDim() + 2 * c.AttentionKvDim();
     for (std::uint32_t g = 0; g < npu_gate_groups; ++g) {
       for (std::size_t i = 0; i < l.npu_gate.size(); ++i) {
         NpuDecodeOutput(
             npu->Staged(stream_,
                         npu_c_[static_cast<std::size_t>(g) * kNpuSlicesMax + i]),
-            s_.attn_gate + static_cast<std::size_t>(g) * group_tokens *
-                               c.AttentionQDim(),
-            group_tokens, npu->n(), c.AttentionQDim(),
+            s_.qg + static_cast<std::size_t>(g) * group_tokens * packed_stride,
+            group_tokens, npu->n(), packed_stride,
             static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
       }
     }
+    PrepareQueryHeads(s_.qg, packed_stride, l.attn_q_norm.f32(), s_.q,
+                      s_.attn_gate, n_tokens, c.num_heads, c.num_kv_heads,
+                      c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
+                      stream_, s.rope,
+                      static_cast<std::uint32_t>(l.npu_gate.size()) * 2);
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles

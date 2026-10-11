@@ -328,9 +328,7 @@ void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
 /// NPU staging for the block-float GEMM kernel (see kernels.hip.cpp). Buffers
 /// hold 9 bytes per 8 values. Activations: tokens (a multiple of 128) rows of
 /// F16 at pitch ldx, K columns [k_offset, k_offset + k_slice), zero past
-/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix;
-/// with gate_rows the rows are those of the gate heads in a stacked
-/// [q|gate ; k ; v] projection (256 per head).
+/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix.
 /// Output: tokens x cols decoded into out (pitch out_pitch) from column col0;
 /// with valid_cols only the first valid_cols columns of the slice are written.
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
@@ -340,7 +338,7 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
-                      hipStream_t stream, bool gate_rows = false);
+                      hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, __half* out,
                std::uint32_t tokens, std::uint32_t cols,
                std::uint32_t valid_cols, hipStream_t stream);
@@ -536,6 +534,16 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
 /// and writes the F16 caches. Returns false for heads wider than 256.
 /// With zero query heads, packed contains only K/V and q/gate may be null.
+/// PrepareAttention for the first q_heads query heads (and their gate rows)
+/// only; k and v are left to the projection.
+void PrepareQueryHeads(const float* packed, std::uint32_t stride,
+                       const float* q_gamma, float* q, float* gate,
+                       std::uint32_t n_tokens, std::uint32_t heads,
+                       std::uint32_t kv_heads, std::uint32_t d,
+                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                       float theta, float eps, hipStream_t stream,
+                       const qwen::vision::DeviceRope* rope,
+                       std::uint32_t q_heads);
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, __half* k_cache, __half* v_cache,

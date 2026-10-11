@@ -645,11 +645,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           ++layers_on;
         }
       }
-      // GUFO_NPU_GATE_SLICES sets how many 1024-row slices (four heads each) of
-      // the attention gate the NPU computes in the attention layers.
-      std::uint32_t gate_slices = 4;
+      // GUFO_NPU_GATE_SLICES sets how many 1024-row slices of attn_qkv (two
+      // heads' query and gate rows each) the NPU computes in the attention
+      // layers.
+      std::uint32_t gate_slices = 8;
       if (const char* gs = std::getenv("GUFO_NPU_GATE_SLICES"); gs != nullptr) {
-        gate_slices = std::min(static_cast<std::uint32_t>(std::atoi(gs)), 6U);
+        gate_slices = std::min(static_cast<std::uint32_t>(std::atoi(gs)), 12U);
       }
       std::uint32_t gate_layers = 0;
       for (auto& l : m->layers_) {
@@ -667,7 +668,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           }
           NpuEncodeWeights(l.attn_qkv.data, l.attn_qkv.cols, i * npu->n(),
                            npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
-                           nullptr, true);
+                           nullptr);
           ids.push_back(id);
           staged += npu->BBytes();
         }
@@ -683,7 +684,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         }
       }
       if (gate_layers != 0) {
-        std::fprintf(stderr, "NPU: attention gate of %u layers\n", gate_layers);
+        std::fprintf(stderr, "NPU: attention query/gate of %u layers\n", gate_layers);
       }
       // GUFO_NPU_SHEXP=0 keeps the shared expert gate and up projections on
       // the GPU.
