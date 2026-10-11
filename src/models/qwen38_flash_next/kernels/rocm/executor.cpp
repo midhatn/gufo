@@ -2032,7 +2032,10 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
        a.type == GgmlType::kQ8_0 || a.type == GgmlType::kIQ3_S ||
        a.type == GgmlType::kIQ4_XS || a.type == GgmlType::kIQ4_NL)) {
     // The shared expert quantized the same rows (or their producer did).
-    const void* ready = ReadyQ8(x, n_tokens, a.cols);
+    // IQ3_S reads F16 activations (one arithmetic at every width), so it never
+    // takes the pre-quantized rows.
+    const void* ready =
+        a.type == GgmlType::kIQ3_S ? nullptr : ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
              ? qfn_mmq_moe_gated_vec_preq(
                    static_cast<int>(a.type), a.data, b.data, ready, ids, out,
@@ -2507,9 +2510,11 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // multiple of 4 KiB, so the 128 token rows of a tile all fetch from one
   // memory channel. Padding the pitch by 256 B cuts that projection by a third.
   constexpr std::uint32_t kGdnOutPadHalves = 128;
+  // The strided GEMM takes padded rows only for batches of 1024 tokens or more.
   const std::uint32_t half_stride =
-      half_output ? static_cast<std::uint32_t>(l.ssm_out.cols) + kGdnOutPadHalves
-                  : 0;
+      half_output && n_tokens >= 1024
+          ? static_cast<std::uint32_t>(l.ssm_out.cols) + kGdnOutPadHalves
+          : 0;
   // A decode batch's output projection reads the epilogue's Q8_1 rows.
   const std::uint32_t value_dim = c.SsmValueDim();
   const bool out_q8_1 = project_output && !tiled && !MatrixRows(n_tokens) &&

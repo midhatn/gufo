@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -17,7 +18,9 @@ namespace {
 constexpr std::size_t kPage = 4096;
 // Next-chunk prefetch hides large gathers behind the current transformer
 // pass. More readers increased CPU work without improving served prefill.
-constexpr std::size_t kWorkers = 32;
+// The gather is NVMe-latency bound, so the pool wants queue depth rather than
+// cores. GUFO_NGRAM_WORKERS overrides it for measurement.
+constexpr std::size_t kWorkers = 128;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
@@ -110,7 +113,12 @@ std::unique_ptr<NgramTable> NgramTable::Open(
     }
     return nullptr;
   }
-  for (std::size_t i = 0; i < kWorkers; ++i) {
+  std::size_t workers = kWorkers;
+  if (const char* env = std::getenv("GUFO_NGRAM_WORKERS");
+      env != nullptr && env[0] != '\0') {
+    workers = std::clamp<std::size_t>(std::strtoul(env, nullptr, 10), 1, 512);
+  }
+  for (std::size_t i = 0; i < workers; ++i) {
     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
   }
   return t;

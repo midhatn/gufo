@@ -408,6 +408,10 @@ static int moe_vector_projection(int weight_type, const void* W,
   // IQ3_S gate/up for 1-8 tokens reads F16 activations directly: no Q8_1
   // pass, the grid codebook in LDS and one arithmetic for every width.
   if (gated && type == GGML_TYPE_IQ3_S && n_tokens <= MMVQ_MAX_BATCH_SIZE) {
+    if (!X_f32) {
+      fprintf(stderr, "%s: IQ3_S gated vector needs float activations\n", tag);
+      return -1;
+    }
     const size_t x_bytes = size_t(n_tokens) * K * sizeof(half);
     const size_t g_bytes =
         size_t(n_tokens) * n_expert_used * (n_tokens + 1) * sizeof(int32_t);
