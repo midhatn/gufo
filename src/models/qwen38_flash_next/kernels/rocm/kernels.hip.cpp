@@ -2212,7 +2212,7 @@ __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
 
 // Keep each head's original eight-wave reduction. Heads in a block share
 // rotary angles; normalization statistics remain independent.
-template<std::uint32_t kHeadsPerBlock>
+template<std::uint32_t kHeadsPerBlock, bool kStreams = false>
 __global__ void PrepareAttentionKernel(
     const float* __restrict__ packed, std::uint32_t stride,
     const float* __restrict__ q_gamma, const float* __restrict__ k_gamma,
@@ -2221,7 +2221,9 @@ __global__ void PrepareAttentionKernel(
     std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
     std::uint32_t rotary, const std::uint32_t* start_pos, float theta,
     float eps, const qwen::vision::DeviceRope* rope,
-    std::uint32_t q_only_heads = 0) {
+    std::uint32_t q_only_heads = 0,
+    const std::uint8_t* const* streams = nullptr,
+    std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
@@ -2234,6 +2236,17 @@ __global__ void PrepareAttentionKernel(
   const std::size_t width = std::size_t(heads) * d,
                     kv_width = std::size_t(kv_heads) * d;
   const float* row = packed + std::size_t(t) * stride;
+  // kStreams: the packed query/gate rows are still in the NPU's C streams
+  // (1024 columns per stream, one stream set per stream_tokens tokens).
+  const auto packed_at = [&](std::uint32_t col) -> float {
+    if constexpr (kStreams) {
+      return NpuStreamValue(
+          streams[(t / stream_tokens) * stream_stride + col / 1024],
+          t % stream_tokens, col % 1024);
+    } else {
+      return row[col];
+    }
+  };
   float values[kHeadsPerBlock];
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -2241,7 +2254,10 @@ __global__ void PrepareAttentionKernel(
     const bool query = h < heads;
     const std::uint32_t head = query ? h : h - heads;
     values[j] = j < live && tid < d
-                    ? row[(query ? head * 2 * d : 2 * width + head * d) + tid]
+                    ? (kStreams
+                           ? packed_at(head * 2 * d + tid)
+                           : row[(query ? head * 2 * d : 2 * width + head * d) +
+                                 tid])
                     : 0.0f;
     float ss = values[j] * values[j];
     // Match the separate RMS kernel's rounded square before its reduction.
@@ -2268,7 +2284,8 @@ __global__ void PrepareAttentionKernel(
       norm[j][tid] = values[j] * scale * (gamma != nullptr ? gamma[tid] : 1.0f);
       if (query)
         gate[std::size_t(t) * width + head * d + tid] =
-            row[head * 2 * d + d + tid];
+            kStreams ? packed_at(head * 2 * d + d + tid)
+                     : row[head * 2 * d + d + tid];
       else
         v_cache[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
             __float2half(row[2 * width + kv_width + head * d + tid]);
@@ -8137,6 +8154,24 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                        rotary_dim, start_pos, theta, eps, rope);
   }
   return true;
+}
+
+void PrepareQueryHeadsStreams(const std::uint8_t* const* streams,
+                              std::uint32_t stream_stride,
+                              std::uint32_t stream_tokens,
+                              const float* q_gamma, float* q, float* gate,
+                              std::uint32_t n_tokens, std::uint32_t heads,
+                              std::uint32_t kv_heads, std::uint32_t d,
+                              std::uint32_t rotary_dim,
+                              const std::uint32_t* start_pos, float theta,
+                              float eps, hipStream_t stream,
+                              const qwen::vision::DeviceRope* rope,
+                              std::uint32_t q_heads) {
+  hipLaunchKernelGGL((PrepareAttentionKernel<4, true>),
+                     dim3(n_tokens, (q_heads + 3) / 4), dim3(kThreads), 0,
+                     stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
+                     nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta,
+                     eps, rope, q_heads, streams, stream_stride, stream_tokens);
 }
 
 void PrepareQueryHeads(const float* packed, std::uint32_t stride,
