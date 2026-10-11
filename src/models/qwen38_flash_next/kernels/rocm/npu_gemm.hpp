@@ -62,8 +62,8 @@ public:
   /// is readable by the GPU.
   bool Wait(hipStream_t stream);
 
-  /// Copies buffer `id` into device memory on `stream` and returns that copy;
-  /// the GPU reads it far faster than the pinned host pages.
+  /// The GPU's view of C buffer `id`, to read once Wait has returned. A single
+  /// pass over the pinned pages is cheaper than copying them first.
   void* Staged(hipStream_t stream, int id);
 
   /// False once a run timed out or failed: results since then are invalid.

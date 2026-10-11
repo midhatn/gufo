@@ -180,7 +180,6 @@ struct NpuGemm::Impl {
     xrt::bo shared_bo;   // userptr import of `host` (normal mode)
     xrt::bo private_bo;  // NPU-only pages (isolate mode)
     void* private_host{nullptr};
-    void* stage{nullptr};  // device-memory copy for GPU reads
   };
   std::vector<Buffer> buffers;
   const bool isolate{std::getenv("GUFO_NPU_ISOLATE") != nullptr};
@@ -249,9 +248,6 @@ struct NpuGemm::Impl {
     for (auto& b : buffers) {
       b.shared_bo = xrt::bo();
       b.private_bo = xrt::bo();
-      if (b.stage != nullptr) {
-        (void)hipFree(b.stage);
-      }
       if (b.host != nullptr) {
         (void)hipHostFree(b.host);
       }
@@ -632,17 +628,8 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
   return true;
 }
 
-void* NpuGemm::Staged(hipStream_t stream, int id) {
-  Impl::Buffer& b = impl_->buffers.at(id);
-  if (b.stage == nullptr && hipMalloc(&b.stage, b.bytes) != hipSuccess) {
-    b.stage = nullptr;
-    return b.device;
-  }
-  if (hipMemcpyAsync(b.stage, b.host, b.bytes, hipMemcpyHostToDevice, stream) !=
-      hipSuccess) {
-    return b.device;
-  }
-  return b.stage;
+void* NpuGemm::Staged(hipStream_t /*stream*/, int id) {
+  return impl_->buffers.at(id).device;
 }
 
 bool NpuGemm::Wait(hipStream_t stream) {
