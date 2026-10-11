@@ -492,7 +492,10 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half = nullptr, GdnCheckpoint checkpoint = {},
                    std::uint32_t out_half_stride = 0, void* out_q8_1 = nullptr,
                    void (*before_epilogue)(void*) = nullptr,
-                   void* before_epilogue_arg = nullptr);
+                   void* before_epilogue_arg = nullptr,
+                   const std::uint8_t* const* z_streams = nullptr,
+                   std::uint32_t z_stream_stride = 0,
+                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

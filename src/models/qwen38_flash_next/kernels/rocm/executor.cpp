@@ -982,6 +982,7 @@ Executor::~Executor() {
   if (ple_pending_ || prefetch_.pending) {
     (void)ngram_->WaitRead();
   }
+  (void)hipFree(npu_c_dev_);
   ForgetAllocation(batch_logits_);
   (void)hipFree(batch_logits_);
   ForgetAllocation(batch_gdn_host_);
@@ -1281,6 +1282,22 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       }
       e->npu_a_.push_back(a);
       e->npu_c_.insert(e->npu_c_.end(), cs.begin(), cs.end());
+    }
+    if (!e->npu_c_.empty()) {
+      std::vector<const std::uint8_t*> table;
+      for (const int id : e->npu_c_) {
+        table.push_back(
+            static_cast<const std::uint8_t*>(npu->Staged(nullptr, id)));
+      }
+      const std::size_t bytes = table.size() * sizeof(table[0]);
+      void* dev = nullptr;
+      if (hipMalloc(&dev, bytes) == hipSuccess &&
+          hipMemcpy(dev, table.data(), bytes, hipMemcpyHostToDevice) ==
+              hipSuccess) {
+        e->npu_c_dev_ = static_cast<const std::uint8_t**>(dev);
+      } else if (dev != nullptr) {
+        (void)hipFree(dev);
+      }
     }
   }
   const char* mtp_vocab = std::getenv("GUFO_MTP_VOCAB");
@@ -2510,6 +2527,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // Finishes the z rows coming from the NPU; the gated norm is their first
   // reader, so it runs between the GDN scan and that epilogue.
   std::function<void()> npu_finish;
+  const std::uint8_t* const* z_streams = nullptr;
+  std::uint32_t z_gpu_cols = 0;
+  std::uint32_t z_group_tokens = 0;
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
@@ -2546,8 +2566,18 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
             l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch,
             n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
             stream_, checkpoint.tokens, false, gpu_rows);
-        npu_finish = [this, &l, npu, groups, group_tokens, gpu_rows]() {
+        // Past the convolution channels the epilogue reads z from the NPU
+        // streams itself; the decode pass is only for the other layouts.
+        const bool z_direct = npu_c_dev_ != nullptr && gpu_rows >= channels;
+        z_streams = z_direct ? npu_c_dev_ : nullptr;
+        z_gpu_cols = gpu_rows - channels;
+        z_group_tokens = group_tokens;
+        npu_finish = [this, &l, npu, groups, group_tokens, gpu_rows,
+                      z_direct]() {
           npu->Wait(stream_);
+          if (z_direct) {
+            return;
+          }
           for (std::uint32_t g = 0; g < groups; ++g) {
             for (std::size_t i = 0; i < l.npu_z.size(); ++i) {
               NpuDecodeOutput(
@@ -2648,7 +2678,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                   finish();
                   finish = nullptr;
                 } : nullptr,
-                &npu_finish);
+                &npu_finish, z_streams, kNpuSlicesMax, z_group_tokens,
+                z_gpu_cols);
   if (npu_finish) {
     npu_finish();
     npu_finish = nullptr;

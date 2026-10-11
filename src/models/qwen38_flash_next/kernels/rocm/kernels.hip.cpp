@@ -1938,6 +1938,34 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
 /// of the ssm_out projection (K = v_heads * d) in place of the F32 row:
 /// each wave-wide slice of 32 lanes is one K block. Otherwise a non-null
 /// `out_q8_1` also receives the F32 rows' unpadded Q8_1 rows.
+// The NPU kernel's C tiles (512 x 128, row-major, 2x2 super blocks of 8x8
+// blocks): the layout of the block-float output streams NpuDecodeOutput reads.
+constexpr int kNpuTileM = 128;
+constexpr int kNpuTileK = 64;
+constexpr int kNpuTileN = 128;
+constexpr int kNpuTileRowsC = 4 * kNpuTileM;
+
+/// One value of a 1024-column C stream: token `tl` of its group, column `cc`.
+__device__ inline float NpuStreamValue(const std::uint8_t* stream,
+                                       std::uint32_t tl, std::uint32_t cc) {
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  constexpr std::uint32_t kTilesN = 1024 / kNpuTileN;
+  const std::uint32_t tile_row = tl / kNpuTileRowsC;
+  const std::uint32_t r = tl % kNpuTileRowsC;
+  const std::uint32_t tile_col = cc / kNpuTileN;
+  const std::uint32_t c = cc % kNpuTileN;
+  const std::uint32_t rib = r & 7;
+  const std::uint32_t br = (r >> 3) & 1;
+  const std::uint32_t sr = r >> 4;
+  const std::uint32_t bc = (c >> 3) & 1;
+  const std::uint32_t sc = c >> 4;
+  const std::uint32_t gi = rib | (bc << 3) | (br << 4) | (sc << 5) | (sr << 8);
+  const std::uint8_t* p =
+      stream + (std::size_t{tile_row * kTilesN + tile_col} * kGroupsPerTile + gi) * 9;
+  return static_cast<float>(static_cast<std::int8_t>(p[1 + (c & 7)])) *
+         (ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F);
+}
+
 template<bool kBatch>
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
@@ -1945,7 +1973,11 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t n_rows, std::uint32_t v_heads,
                                   float eps, const GdnBatchItem* batch,
                                   std::uint32_t active, void* out_q8_1,
-                                  std::uint32_t out_half_stride = 0) {
+                                  std::uint32_t out_half_stride = 0,
+                                  const std::uint8_t* const* z_streams = nullptr,
+                                  std::uint32_t z_stream_stride = 0,
+                                  std::uint32_t z_tokens = 0,
+                                  std::uint32_t z_gpu_cols = 0) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
       return;
@@ -1964,6 +1996,21 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
   }
   // z rows are [t][v_heads*d] with a caller-side row stride.
   const float* zrow = z + (row / v_heads) * z_stride + (row % v_heads) * d;
+  // Columns from z_gpu_cols on are read from the NPU's C tile streams (one
+  // per z_tokens tokens and 1024 columns) instead of F32 rows.
+  const auto z_at = [&](std::uint32_t i) -> float {
+    if (z_streams == nullptr) {
+      return zrow[i];
+    }
+    const std::uint32_t col = (row % v_heads) * d + i;
+    if (col < z_gpu_cols) {
+      return zrow[i];
+    }
+    const std::size_t t = row / v_heads;
+    const std::uint32_t ncol = col - z_gpu_cols;
+    return NpuStreamValue(z_streams[(t / z_tokens) * z_stream_stride + ncol / 1024],
+                          static_cast<std::uint32_t>(t % z_tokens), ncol % 1024);
+  };
   const std::uint32_t per_lane = d / warpSize;
   const float* src = raw + row * d;
   float v[d / 32];
@@ -1978,7 +2025,7 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
 #pragma unroll
     for (std::uint32_t r = 0; r < per_lane; ++r) {
       const std::uint32_t i = r * warpSize + lane;
-      const float value = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+      const float value = v[r] * scale * norm_w[i] * SigmoidF(z_at(i));
       if (out_half != nullptr) {
         const auto offset =
             out_half_stride != 0
@@ -2000,7 +2047,7 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
 #pragma unroll
   for (std::uint32_t r = 0; r < per_lane; ++r) {
     const std::uint32_t i = r * warpSize + lane;
-    const float n = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+    const float n = v[r] * scale * norm_w[i] * SigmoidF(z_at(i));
     float max_abs = fabsf(n);
     for (int off = 16; off > 0; off >>= 1) {
       max_abs = fmaxf(max_abs, XorLane(max_abs, off));
@@ -7344,10 +7391,6 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 // (128 x 64): A tiles row-major over (M, K) with 2x1 super blocks of 8x8
 // row-major blocks, B tiles column-major over (K, N) with 1x2 super blocks of
 // 8x8 column-major blocks, C tiles (512 x 128) row-major with 2x2 super blocks.
-constexpr int kNpuTileM = 128;
-constexpr int kNpuTileK = 64;
-constexpr int kNpuTileN = 128;
-constexpr int kNpuTileRowsC = 4 * kNpuTileM;
 
 __device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
   unsigned max_exp = 0;
@@ -7940,7 +7983,10 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half, GdnCheckpoint checkpoint,
                    std::uint32_t out_half_stride, void* out_q8_1,
-                   void (*before_epilogue)(void*), void* before_epilogue_arg) {
+                   void (*before_epilogue)(void*), void* before_epilogue_arg,
+                   const std::uint8_t* const* z_streams,
+                   std::uint32_t z_stream_stride, std::uint32_t z_tokens,
+                   std::uint32_t z_gpu_cols) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
@@ -8021,7 +8067,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
       out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0,
       out_q8 == nullptr && out_half == nullptr && d == kGdnDim ? out_q8_1
                                                                : nullptr,
-      out_half_stride);
+      out_half_stride, z_streams, z_stream_stride, z_tokens, z_gpu_cols);
 }
 
 bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
