@@ -644,6 +644,46 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           ++layers_on;
         }
       }
+      // GUFO_NPU_GATE_SLICES sets how many 1024-row slices (four heads each) of
+      // the attention gate the NPU computes in the attention layers.
+      std::uint32_t gate_slices = 4;
+      if (const char* gs = std::getenv("GUFO_NPU_GATE_SLICES"); gs != nullptr) {
+        gate_slices = std::min(static_cast<std::uint32_t>(std::atoi(gs)), 6U);
+      }
+      std::uint32_t gate_layers = 0;
+      for (auto& l : m->layers_) {
+        if (gate_slices == 0 || l.attn_qkv.empty() ||
+            l.attn_qkv.data == nullptr ||
+            l.attn_qkv.type != core::GgmlType::kQ8_0 ||
+            l.attn_qkv.rows != 13312 || l.attn_qkv.cols != npu->k()) {
+          continue;
+        }
+        std::vector<int> ids;
+        for (std::uint32_t i = 0; i < gate_slices; ++i) {
+          const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+          if (id < 0) {
+            break;
+          }
+          NpuEncodeWeights(l.attn_qkv.data, l.attn_qkv.cols, i * npu->n(),
+                           npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
+                           nullptr, true);
+          ids.push_back(id);
+          staged += npu->BBytes();
+        }
+        if (hipDeviceSynchronize() != hipSuccess) {
+          ids.clear();
+        }
+        for (int id : ids) {
+          npu->FinalizeWeights(id);
+        }
+        if (ids.size() == gate_slices) {
+          l.npu_gate = std::move(ids);
+          ++gate_layers;
+        }
+      }
+      if (gate_layers != 0) {
+        std::fprintf(stderr, "NPU: attention gate of %u layers\n", gate_layers);
+      }
       if (hipDeviceSynchronize() != hipSuccess) {
         if (error_msg != nullptr) {
           *error_msg = "NPU weight staging failed";

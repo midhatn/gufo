@@ -49,6 +49,9 @@ struct DeviceLayer {
   /// NPU buffer ids of the six 1024-row slices of the z half of ssm_in (rows
   /// 10240..16383) in block-float tile layout; empty when the NPU is off.
   std::vector<int> npu_z;
+  /// NPU buffer ids of the 1024-row slices of the attention gate rows (four
+  /// heads each) of attn_qkv; empty when unused.
+  std::vector<int> npu_gate;
   /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,

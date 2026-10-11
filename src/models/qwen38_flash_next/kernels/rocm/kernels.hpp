@@ -285,7 +285,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool half_weights = false);
+                      bool half_weights = false,
+                      std::uint32_t skip_gate_heads = 0);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -323,7 +324,9 @@ bool DenseHalfWeightGemm(const __half* w, const __half* x, float* out,
 /// NPU staging for the block-float GEMM kernel (see kernels.hip.cpp). Buffers
 /// hold 9 bytes per 8 values. Activations: tokens (a multiple of 128) rows of
 /// F16 at pitch ldx, K columns [k_offset, k_offset + k_slice), zero past
-/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix.
+/// k_valid. Weights: Q8_0 rows [row0, row0 + cols) of a K = k_total matrix;
+/// with gate_rows the rows are those of the gate heads in a stacked
+/// [q|gate ; k ; v] projection (256 per head).
 /// Output: tokens x cols decoded into out (pitch out_pitch) from column col0.
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
                           std::uint32_t tokens, std::uint32_t k_slice,
@@ -332,7 +335,7 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
-                      hipStream_t stream);
+                      hipStream_t stream, bool gate_rows = false);
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream);

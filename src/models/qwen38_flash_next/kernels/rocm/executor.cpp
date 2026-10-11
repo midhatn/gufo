@@ -2681,6 +2681,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
+  std::uint32_t npu_gate_groups = 0;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && n_tokens >= 1024 &&
@@ -2693,10 +2694,34 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     if (fused_projection && (expand || HalfGemmable(l.attn_qkv.type))) {
       const void* weights = expand ? ExpandHalf(l.attn_qkv) : l.attn_qkv.data;
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
+      // The gate rows of the first heads run on the NPU while the GPU does
+      // the rest; the gate is first read by the attention kernel.
+      NpuGemm* npu = model_->npu();
+      std::uint32_t skip_gate_heads = 0;
+      if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
+          !l.npu_gate.empty() && n_tokens % npu->tokens() == 0 &&
+          n_tokens / npu->tokens() <= npu_a_.size() &&
+          l.attn_qkv.cols == npu->k() && NpuWarm()) {
+        const std::uint32_t group_tokens = npu->tokens();
+        npu_gate_groups = n_tokens / group_tokens;
+        for (std::uint32_t g = 0; g < npu_gate_groups; ++g) {
+          NpuEncodeActivations(
+              static_cast<const __half*>(s_.x_half) +
+                  static_cast<std::size_t>(g) * group_tokens * l.attn_qkv.cols,
+              l.attn_qkv.cols, group_tokens, npu->k(), 0, npu->k(),
+              npu->Device(npu_a_[g]), stream_);
+          npu->Submit(
+              stream_, npu_a_[g], l.npu_gate.data(),
+              npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax,
+              static_cast<int>(l.npu_gate.size()));
+        }
+        skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 4;
+      }
       prepared = AttentionF16Gemm(
           weights, static_cast<const __half*>(s_.x_half), l.attn_q_norm.f32(),
           l.attn_k_norm.f32(), s_.q, s_.attn_gate, s.k_cache, s.v_cache,
-          n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope, expand);
+          n_tokens, pos, c.rope_theta, c.rms_eps, stream_, s.rope, expand,
+          skip_gate_heads);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -2809,6 +2834,22 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                        n_tokens, pos, c.compress_ratio, stream_);
       sel_list = reinterpret_cast<const std::uint32_t*>(s_.scores);
       list_stride = max_blocks;
+    }
+  }
+  if (npu_gate_groups != 0) {
+    NpuGemm* npu = model_->npu();
+    npu->Wait(stream_);
+    const std::uint32_t group_tokens = npu->tokens();
+    for (std::uint32_t g = 0; g < npu_gate_groups; ++g) {
+      for (std::size_t i = 0; i < l.npu_gate.size(); ++i) {
+        NpuDecodeOutput(
+            npu->Staged(stream_,
+                        npu_c_[static_cast<std::size_t>(g) * kNpuSlicesMax + i]),
+            s_.attn_gate + static_cast<std::size_t>(g) * group_tokens *
+                               c.AttentionQDim(),
+            group_tokens, npu->n(), c.AttentionQDim(),
+            static_cast<std::uint32_t>(i) * npu->n(), false, stream_);
+      }
     }
   }
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv

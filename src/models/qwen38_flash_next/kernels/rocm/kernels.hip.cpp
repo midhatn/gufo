@@ -6299,6 +6299,8 @@ struct AttentionProjectionOutput {
   float theta;
   float eps;
   const qwen::vision::DeviceRope* rope;
+  /// Gate tiles of the first heads are computed elsewhere (the NPU).
+  std::uint32_t skip_gate_heads;
 };
 
 /// Dense F16 WMMA GEMM over Q8_0 or F16 weights: block = BM rows x BN tokens,
@@ -6365,6 +6367,13 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   const unsigned row_group = blockIdx.y / kRowGroup;
   const unsigned within = (blockIdx.y % kRowGroup) * gridDim.x + blockIdx.x;
   const int r_block = (row_group * kRowGroup + within % kRowGroup) * BM;
+  if constexpr (kAttention) {
+    const unsigned head_tile = static_cast<unsigned>(r_block) / 256;
+    if (head_tile < 48 && (head_tile % 2) == 1 &&
+        head_tile / 2 < attention.skip_gate_heads) {
+      return;
+    }
+  }
   const int t_block = (within / kRowGroup) * BN;
   // BF16 replaces a library GEMM whose 32-token tile g starts its K loop
   // (g % 4) * 4 blocks in and wraps. A block takes the four tiles of one
@@ -6900,14 +6909,16 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope, bool half_weights) {
+                      const qwen::vision::DeviceRope* rope, bool half_weights,
+                      std::uint32_t skip_gate_heads) {
   if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
     return false;
   const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
-                                         values,  position, theta, eps,  rope};
+                                         values,  position, theta, eps,  rope,
+                                         skip_gate_heads};
   if (half_weights) {
     hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false,
                                            true, true, false>),
@@ -7379,7 +7390,8 @@ __global__ void __launch_bounds__(256)
 __global__ void NpuEncodeWeightsQ8Kernel(
     const Q8_0Block* __restrict__ w, std::uint8_t* __restrict__ out,
     std::uint32_t row0, std::uint32_t cols, std::uint32_t k_slice,
-    std::uint32_t k_offset, std::uint32_t k_valid, std::uint32_t k_total) {
+    std::uint32_t k_offset, std::uint32_t k_valid, std::uint32_t k_total,
+    bool gate_rows) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
   const std::size_t total = std::size_t{k_slice} * cols / 8;
   if (g >= total) {
@@ -7399,8 +7411,13 @@ __global__ void NpuEncodeWeightsQ8Kernel(
   const std::uint32_t nn = tile_col * kNpuTileN + (sc2 * 2 + block) * 8 + cib;
   float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (kk + 8 <= k_valid) {
+    // gate_rows: row0 + nn indexes the gate rows of the stacked [q|gate]
+    // heads, 256 rows per head after each head's 256 query rows.
+    const std::uint32_t src_row =
+        gate_rows ? ((row0 + nn) / 256) * 512 + 256 + (row0 + nn) % 256
+                  : row0 + nn;
     const Q8_0Block& b =
-        w[static_cast<std::size_t>(row0 + nn) * (k_total / 32) + kk / 32];
+        w[static_cast<std::size_t>(src_row) * (k_total / 32) + kk / 32];
     const float scale = __half2float(b.d);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
@@ -7479,12 +7496,12 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
-                      hipStream_t stream) {
+                      hipStream_t stream, bool gate_rows) {
   const std::size_t groups = std::size_t{k_slice} * cols / 8;
   hipLaunchKernelGGL(
       NpuEncodeWeightsQ8Kernel, dim3(Blocks(groups)), dim3(kThreads), 0, stream,
       static_cast<const Q8_0Block*>(q8), static_cast<std::uint8_t*>(dst), row0,
-      cols, k_slice, k_offset, k_valid, k_total);
+      cols, k_slice, k_offset, k_valid, k_total, gate_rows);
 }
 
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
