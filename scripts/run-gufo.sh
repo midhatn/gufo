@@ -3,7 +3,10 @@
 #
 # Required: GUFO_MODEL = first shard of UD-IQ4_XS (...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (shared Q8_0 sidecar), GUFO_BIN, PORT, JOBS, GUFO_CONTEXT, GUFO_EFFORT,
-#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG
+#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 8192)
+# NPU build: GUFO_NPU=0 forces GPU-only; XRT_DIR (default /opt/xilinx/xrt) holds the XRT libraries.
+#            The NPU is used only while `tools/npu/fabric-clock.sh status` reports held
+#            (sudo tools/npu/fabric-clock.sh hold) and the NPU is not in turbo mode.
 set -euo pipefail
 
 GUFO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -25,6 +28,21 @@ MTP=${GUFO_MTP:-}
 
 export LD_LIBRARY_PATH="${ROCM_PATH:-/opt/rocm}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+export GUFO_PREFILL_TILE=${GUFO_PREFILL_TILE:-8192}
+
+NPU_ENV=()
+if [ "${GUFO_NPU:-1}" != 0 ] && [ -e /dev/accel/accel0 ] && [ -d "$GUFO_DIR/tools/npu" ]; then
+  XRT_DIR=${XRT_DIR:-/opt/xilinx/xrt}
+  if ! "$GUFO_DIR/tools/npu/fabric-clock.sh" status > /dev/null 2>&1; then
+    echo "WARNING: GPU fabric clock not held (sudo $GUFO_DIR/tools/npu/fabric-clock.sh hold): running without the NPU." >&2
+  elif "$XRT_DIR/bin/xrt-smi" examine -r platform 2>&1 | grep -qi "power mode *: turbo"; then
+    echo "WARNING: NPU is in turbo mode: running without the NPU (use balanced or performance)." >&2
+  else
+    NPU_ENV=(GUFO_NPU_DIR="$GUFO_DIR/tools/npu")
+    export LD_LIBRARY_PATH="$XRT_DIR/lib:$LD_LIBRARY_PATH"
+  fi
+fi
+
 if pgrep -f "^$GUFO_BIN serve" > /dev/null; then
   echo "gufo is already running" >&2
   exit 1
@@ -43,7 +61,7 @@ else
   SPEC=()
 fi
 
-"$GUFO_BIN" serve llm \
+env "${NPU_ENV[@]}" "$GUFO_BIN" serve llm \
   -m "$GUFO_MODEL" \
   --served-model-name "Qwen3.8 Flash Next" \
   --port "$PORT" \
