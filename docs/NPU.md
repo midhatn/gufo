@@ -57,7 +57,7 @@ prefill runs before decoding gets a turn); `scripts/run-gufo.sh` keeps it at 409
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GUFO_NPU_TIMEOUT_MS` | built in | Time a single NPU run may take before it is treated as failed. |
+| `GUFO_NPU_TIMEOUT_MS` | `8000` | Time a single NPU run may take before it is treated as failed. |
 | `GUFO_NPU_KEEPALIVE` | on | `0` stops the 1 s heartbeat that keeps the NPU awake. |
 | `GUFO_NPU_WARMUP_MS` | `0` | Keep the NPU out of the first N ms of each prefill burst so the GPU's idle-to-full step happens alone. |
 | `GUFO_NPU_ISOLATE` | unset | `1` gives the NPU private buffers and copies through the CPU. Slower; for debugging. |
