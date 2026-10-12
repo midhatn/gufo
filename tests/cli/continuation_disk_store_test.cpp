@@ -743,8 +743,8 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
       StoreOptions(directory.path()),
       [&](const ContinuationDiskEvent& event) { events.push_back(event); });
   Expect(
-      restarted.entry_count() == 2 && CacheFiles(directory.path()).size() == 2,
-      "startup indexes only checksum-valid regular entries");
+      restarted.entry_count() == 3 && CacheFiles(directory.path()).size() == 3,
+      "startup indexes well-formed regular entries without reading payloads");
   Expect(
       std::filesystem::exists(target) && !std::filesystem::exists(unsafe_link),
       "unsafe symlink is removed without following its target");
@@ -754,18 +754,19 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
                             return event.reason ==
                                    ContinuationDiskEventReason::kCorrupt;
                           }) &&
-          std::ranges::any_of(
-              events,
-              [](const ContinuationDiskEvent& event) {
-                return event.reason ==
-                       ContinuationDiskEventReason::kChecksumMismatch;
-              }) &&
           std::ranges::any_of(events,
                               [](const ContinuationDiskEvent& event) {
                                 return event.reason ==
                                        ContinuationDiskEventReason::kUnsafeFile;
                               }),
       "startup reports sanitized invalid-file reasons");
+  Expect(!std::ranges::any_of(
+             events,
+             [](const ContinuationDiskEvent& event) {
+               return event.reason ==
+                      ContinuationDiskEventReason::kChecksumMismatch;
+             }),
+         "startup does not verify payload checksums");
 
   std::size_t compatible_hits = 0;
   for (const std::array<TextRunnerToken, 3> prompt :
@@ -778,6 +779,16 @@ void TestStartupRejectsUnsafeAndInvalidFiles() {
   }
   Expect(compatible_hits == 1,
          "the remaining compatible startup entry restores exactly");
+  Expect(std::ranges::any_of(
+             events,
+             [](const ContinuationDiskEvent& event) {
+               return event.reason ==
+                      ContinuationDiskEventReason::kChecksumMismatch;
+             }),
+         "restore reports the checksum mismatch of the corrupted payload");
+  Expect(
+      restarted.entry_count() == 2 && CacheFiles(directory.path()).size() == 2,
+      "the checksum-invalid entry is removed when restore finds it");
   auto incompatible_state = incompatible.CreateState();
   Expect(
       RestoreTokens(restarted, incompatible, *incompatible_state, {4, 4, 9})
