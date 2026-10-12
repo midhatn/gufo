@@ -62,7 +62,7 @@ the GPU first needs it.
    turbo mode (`GUFO_NPU=0` forces GPU-only), uses an 8192-token prefill tile
    (`GUFO_PREFILL_TILE`) and reads the options listed at the top of the script.
 
-`GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 8) and
+Every option is described in [docs/NPU.md](docs/NPU.md). `GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 8) and
 `GUFO_NPU_SHEXP=0` tune or switch off parts of the offload. Without
 `GUFO_NPU_DIR` the build runs GPU-only.
 
