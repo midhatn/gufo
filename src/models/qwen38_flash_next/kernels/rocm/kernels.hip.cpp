@@ -4280,7 +4280,8 @@ __device__ __forceinline__ float HcScaledSilu(float value) {
 /// 32-element K blocks per LDS stage, waves = WM row groups x WN token groups.
 /// Out-of-range rows and K blocks are clamped and their scale zeroed, so
 /// they contribute exactly zero without divergence. y is [batch][m].
-template<int BM, int BN, int BK, int WM, int WN, bool kHcDown = false>
+template<int BM, int BN, int BK, int WM, int WN, bool kHcDown = false,
+         int kRowGroup = 1>
 __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
     const void* __restrict__ w, const void* __restrict__ x_blocks,
     std::conditional_t<kHcDown, __half, float>* __restrict__ y,
@@ -4322,8 +4323,14 @@ __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
   const int wave_row = wave_id / WN;
   const int wave_tok = wave_id % WN;
 
-  const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
-  const std::size_t t_block = static_cast<std::size_t>(blockIdx.x) * BN;
+  // kRowGroup row tiles of one token tile run back to back in launch order,
+  // so they share its activation tile; every dot product keeps its K order.
+  const unsigned row_group = blockIdx.y / kRowGroup;
+  const unsigned within =
+      (blockIdx.y % kRowGroup) * gridDim.x + blockIdx.x;
+  const std::size_t r_block =
+      static_cast<std::size_t>(row_group * kRowGroup + within % kRowGroup) * BM;
+  const std::size_t t_block = static_cast<std::size_t>(within / kRowGroup) * BN;
   const std::size_t tt_block = t_block / kQ8ActTileTokens;
 
   float acc[kWaveRowTiles][kWaveTokTiles][8];
@@ -6080,7 +6087,7 @@ bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
                    std::uint32_t n_tokens, hipStream_t stream) {
   if (n_tokens < 96 || w == nullptr || x_tiled == nullptr || out == nullptr)
     return false;
-  hipLaunchKernelGGL((W8A8BlockedWmmaGEMMKernel<64, 128, 4, 2, 4, true>),
+  hipLaunchKernelGGL((W8A8BlockedWmmaGEMMKernel<64, 128, 4, 2, 4, true, 5>),
                      dim3((n_tokens + 127) / 128, 5), dim3(kThreads), 0, stream,
                      w, x_tiled, out, n_tokens, 320, 10240);
   return true;
@@ -7078,10 +7085,18 @@ bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
                         hipStream_t stream) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
+  const dim3 grid((batch + 63) / 64, (m + 63) / 64);
+  if (grid.y == 9) {
+    // The router's nine row tiles run back to back per token tile and share
+    // its activations; every dot product keeps its K order.
+    hipLaunchKernelGGL(
+        (DenseF16GEMMKernel<64, 64, 2, 2, 4, 9, false, false, false, true>),
+        grid, dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    return true;
+  }
   hipLaunchKernelGGL(
-      (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
-      dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
-      out, batch, m, k);
+      (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>), grid,
+      dim3(kThreads), 0, stream, w, x, out, batch, m, k);
   return true;
 }
 
@@ -7751,14 +7766,14 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
   const std::uint32_t conv_channels = std::min(gpu_rows, channels);
   // Row-tile pairs per token tile in launch order (-0.9 %).
   if (half_weights) {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true,
+    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 4, false, true,
                                            false, true, false>),
                        dim3((n_tokens + 127) / 128, gpu_rows / 256),
                        dim3(kThreads), 0, stream, w, x, qkvz, n_tokens, m, k,
                        nullptr, nullptr, nullptr, conv_w, convolved,
                        AttentionProjectionOutput{}, checkpoint_tokens);
   } else {
-    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 2, false, true>),
+    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 4, false, true>),
                        dim3((n_tokens + 127) / 128, gpu_rows / 256),
                        dim3(kThreads), 0, stream, w, x, qkvz, n_tokens, m, k,
                        nullptr, nullptr, nullptr, conv_w, convolved,
