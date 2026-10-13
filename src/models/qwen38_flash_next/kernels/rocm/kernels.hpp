@@ -119,7 +119,9 @@ bool HcCombineQ8_1(float* res, const float* block_out, const float* inject,
 void HcCombineF16(void* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
-                  std::uint32_t streams, float eps, hipStream_t stream, bool res_half = false);
+                  std::uint32_t streams, float eps, hipStream_t stream,
+                  bool res_half = false, const float* inject_w = nullptr,
+                  float* inject_out = nullptr);
 /// Residual rows between F32 and F16 storage (count = elements, a multiple of
 /// four). The F16 form is used by large wide-prefill chunks; stores saturate.
 void ResidualToHalf(const float* src, __half* dst, std::size_t count,
@@ -132,14 +134,21 @@ void ResidualToFloat(const __half* src, float* dst, std::size_t count,
 /// registers and never written. Returns false (launching nothing) for a
 /// geometry the fused kernel does not cover (four 2,560-wide streams).
 /// A null gamma updates only the residual; otherwise xn_q8 is required.
-/// res is F16 when res_half is set, otherwise F32.
+/// res is F16 when res_half is set, otherwise F32. A non-null `inject_w` (the
+/// next mixer's F32 inject weights, 2,560-wide streams, `inject_parts` equal
+/// to the F16 epilogue's part count) also writes that mixer's inject logits
+/// to `inject_out` exactly as HcMixEpilogueF16Kernel would, from the norm it
+/// just formed; `inject_out` may alias `inject`. The same holds for
+/// HcCombineF16.
 bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
                      const float* shared_out, const float* gate,
                      std::uint32_t gate_stride, std::uint32_t used,
                      const float* inject, std::uint32_t inject_parts,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
-                     std::uint32_t streams, float eps, hipStream_t stream, bool res_half = false);
+                     std::uint32_t streams, float eps, hipStream_t stream,
+                     bool res_half = false, const float* inject_w = nullptr,
+                     float* inject_out = nullptr);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);

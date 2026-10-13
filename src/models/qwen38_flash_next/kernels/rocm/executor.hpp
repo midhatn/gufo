@@ -470,8 +470,13 @@ private:
   void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
+  /// A non-null `next` (the mixer that reads the norm) also gets its inject
+  /// logits formed by the combine when the F16 route's mixer would otherwise
+  /// run the separate inject kernel; HcMix then skips that kernel.
   void Combine(void* res, const float* gamma, std::uint32_t n_tokens,
-               bool res_half = false) const;
+               bool res_half = false, const DeviceMixer* next = nullptr) const;
+  [[nodiscard]] bool InjectFusable(const DeviceMixer& m,
+                                   std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
@@ -760,6 +765,8 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
+  mutable bool inject_fused_{false};  ///< the last combine formed the inject logits
+  mutable const float* inject_fused_w_{nullptr};  ///< for the mixer with these weights
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   mutable unsigned q8_slot_{0};

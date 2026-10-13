@@ -805,10 +805,15 @@ __global__ void HcCombineVec4Kernel(ResT* res, const float* block_out,
                                     const float* inject,
                                     std::uint32_t inject_parts,
                                     const float* gamma, XnT* xn, void* xn_q8,
-                                    std::uint32_t hidden, float eps) {
+                                    std::uint32_t hidden, float eps,
+                                    const float* inject_w = nullptr,
+                                    float* inject_out = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 10;  // 4 x 2560 / 4 / kThreads
+  constexpr bool kStage = std::is_same_v<XnT, __half>;
   __shared__ float shared[kStreams][kThreads / 32];
+  // The F16 norm of the row, for the fused inject logits of the next mixer.
+  __shared__ __half s_norm[kStage ? kMaxChunks * kThreads * 4 : 1];
   const std::uint32_t t = blockIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
   float w[kStreams];
@@ -887,8 +892,14 @@ __global__ void HcCombineVec4Kernel(ResT* res, const float* block_out,
       if constexpr (std::is_same_v<XnT, float>) {
         *reinterpret_cast<float4*>(out) = n;
       } else {
-        *reinterpret_cast<__half2*>(out) = __floats2half2_rn(n.x, n.y);
-        *reinterpret_cast<__half2*>(out + 2) = __floats2half2_rn(n.z, n.w);
+        const __half2 h01 = __floats2half2_rn(n.x, n.y);
+        const __half2 h23 = __floats2half2_rn(n.z, n.w);
+        *reinterpret_cast<__half2*>(out) = h01;
+        *reinterpret_cast<__half2*>(out + 2) = h23;
+        if (inject_w != nullptr) {
+          *reinterpret_cast<__half2*>(&s_norm[e]) = h01;
+          *reinterpret_cast<__half2*>(&s_norm[e + 2]) = h23;
+        }
       }
     }
     if (xn_q8 == nullptr) {
@@ -926,6 +937,67 @@ __global__ void HcCombineVec4Kernel(ResT* res, const float* block_out,
       }
     }
   }
+  if constexpr (kStage) {
+    if (inject_w == nullptr) {
+      return;
+    }
+    // The next mixer's inject logits from the staged F16 norm: each lane,
+    // product, wave sum and wave-order total is HcMixEpilogueF16Kernel's.
+    // inject_out may alias the injection read above: this block read its
+    // token's row before any write.
+    __syncthreads();
+    __shared__ float partial_inject[kStreams][kThreads / 32];
+    const std::uint32_t lane = threadIdx.x & 31u;
+    const std::uint32_t wave = threadIdx.x >> 5u;
+    for (std::uint32_t part = 0; part < inject_parts; ++part) {
+      const std::uint32_t i = (part * kThreads + threadIdx.x) * 4;
+      const bool live = i < hidden;
+      float4 v4[kStreams];
+#pragma unroll
+      for (std::uint32_t s2 = 0; s2 < kStreams; ++s2) {
+        v4[s2] = float4{0.0F, 0.0F, 0.0F, 0.0F};
+        if (live) {
+          const std::size_t idx2 = static_cast<std::size_t>(s2) * hidden + i;
+          const float2 f01 =
+              __half22float2(*reinterpret_cast<const __half2*>(&s_norm[idx2]));
+          const float2 f23 = __half22float2(
+              *reinterpret_cast<const __half2*>(&s_norm[idx2 + 2]));
+          v4[s2] = float4{f01.x, f01.y, f23.x, f23.y};
+        }
+      }
+#pragma unroll
+      for (std::uint32_t o = 0; o < kStreams; ++o) {
+        float dot = 0.0F;
+#pragma unroll
+        for (std::uint32_t s2 = 0; s2 < kStreams; ++s2) {
+          const float4 wq =
+              live ? *reinterpret_cast<const float4*>(
+                         inject_w + (static_cast<std::size_t>(o) * hc_dim) +
+                         (static_cast<std::size_t>(s2) * hidden) + i)
+                   : float4{0.0F, 0.0F, 0.0F, 0.0F};
+          dot += wq.x * v4[s2].x;
+          dot += wq.y * v4[s2].y;
+          dot += wq.z * v4[s2].z;
+          dot += wq.w * v4[s2].w;
+        }
+        dot = WaveSum(dot);
+        if (lane == 0) {
+          partial_inject[o][wave] = dot;
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x < kStreams) {
+        float total = 0.0F;
+        for (std::uint32_t w2 = 0; w2 < kThreads / 32; ++w2) {
+          total += partial_inject[threadIdx.x][w2];
+        }
+        inject_out[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) *
+                       inject_parts +
+                   part] = total;
+      }
+      __syncthreads();
+    }
+  }
 }
 
 /// HcCombineVec4Kernel<__half> with the MoE epilogue fused in: the block
@@ -939,7 +1011,7 @@ __global__ void HcCombineMoeF16Kernel(
     const float* shared_out, const float* gate, std::uint32_t gate_stride,
     std::uint32_t used, const float* inject, std::uint32_t inject_parts,
     const float* gamma, __half* xn, void* xn_q8, std::uint32_t hidden,
-    float eps) {
+    float eps, const float* inject_w = nullptr, float* inject_out = nullptr) {
   constexpr std::uint32_t kStreams = 4;
   constexpr std::uint32_t kMaxChunks = 3;  // 2560 / 4 / kThreads, rounded up
   __shared__ float shared[kStreams][kThreads / 32];
@@ -1020,6 +1092,8 @@ __global__ void HcCombineMoeF16Kernel(
   }
   const std::size_t num_blocks = hc_dim / 32;
   const std::size_t tl = t % kQ8ActTileTokens;
+  // The F16 norm as the next mixer reads it, for the fused inject logits.
+  float4 hn[kStreams][kMaxChunks];
 #pragma unroll
   for (std::uint32_t s = 0; s < kStreams; ++s) {
 #pragma unroll
@@ -1029,13 +1103,19 @@ __global__ void HcCombineMoeF16Kernel(
       // Every lane of the wave takes part in the block reductions below,
       // so lanes past the row carry zeros instead of leaving.
       float4 n{0.0F, 0.0F, 0.0F, 0.0F};
+      hn[s][c] = float4{0.0F, 0.0F, 0.0F, 0.0F};
       if (i < hidden) {
         const float4 gm = *reinterpret_cast<const float4*>(gamma + e);
         n = float4{v[s][c].x * scale[s] * gm.x, v[s][c].y * scale[s] * gm.y,
                    v[s][c].z * scale[s] * gm.z, v[s][c].w * scale[s] * gm.w};
         __half* out = xn + (static_cast<std::size_t>(t) * hc_dim) + e;
-        *reinterpret_cast<__half2*>(out) = __floats2half2_rn(n.x, n.y);
-        *reinterpret_cast<__half2*>(out + 2) = __floats2half2_rn(n.z, n.w);
+        const __half2 h01 = __floats2half2_rn(n.x, n.y);
+        const __half2 h23 = __floats2half2_rn(n.z, n.w);
+        *reinterpret_cast<__half2*>(out) = h01;
+        *reinterpret_cast<__half2*>(out + 2) = h23;
+        const float2 f01 = __half22float2(h01);
+        const float2 f23 = __half22float2(h23);
+        hn[s][c] = float4{f01.x, f01.y, f23.x, f23.y};
       }
       // Eight lanes hold one 32-wide block: absmax over them, then each
       // lane stores its four codes as one word.
@@ -1068,6 +1148,53 @@ __global__ void HcCombineMoeF16Kernel(
         }
       }
     }
+  }
+  if (inject_w == nullptr) {
+    return;
+  }
+  // The next mixer's inject logits from the F16 norm held in registers: the
+  // thread's lanes, products, wave sums and wave-order total are exactly
+  // HcMixEpilogueF16Kernel's, one part per chunk. inject_out may alias the
+  // injection read above: this block read its token's row before any write.
+  __shared__ float partial_inject[kStreams][kThreads / 32];
+#pragma unroll
+  for (std::uint32_t c = 0; c < kMaxChunks; ++c) {
+    if (c >= inject_parts) {
+      break;
+    }
+    const std::uint32_t i = (c * kThreads + threadIdx.x) * 4;
+    const bool live = i < hidden;
+#pragma unroll
+    for (std::uint32_t o = 0; o < kStreams; ++o) {
+      float dot = 0.0F;
+#pragma unroll
+      for (std::uint32_t s = 0; s < kStreams; ++s) {
+        const float4 wq =
+            live ? *reinterpret_cast<const float4*>(
+                       inject_w + (static_cast<std::size_t>(o) * hc_dim) +
+                       (static_cast<std::size_t>(s) * hidden) + i)
+                 : float4{0.0F, 0.0F, 0.0F, 0.0F};
+        dot += wq.x * hn[s][c].x;
+        dot += wq.y * hn[s][c].y;
+        dot += wq.z * hn[s][c].z;
+        dot += wq.w * hn[s][c].w;
+      }
+      dot = WaveSum(dot);
+      if (lane == 0) {
+        partial_inject[o][wave] = dot;
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x < kStreams) {
+      float total = 0.0F;
+      for (std::uint32_t w2 = 0; w2 < kThreads / 32; ++w2) {
+        total += partial_inject[threadIdx.x][w2];
+      }
+      inject_out[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) *
+                     inject_parts +
+                 c] = total;
+    }
+    __syncthreads();
   }
 }
 
@@ -5565,7 +5692,7 @@ bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
                      const float* gamma, __half* xn, void* xn_q8,
                      std::uint32_t n_tokens, std::uint32_t hidden,
                      std::uint32_t streams, float eps, hipStream_t stream,
-                     bool res_half) {
+                     bool res_half, const float* inject_w, float* inject_out) {
   if (streams != 4 || hidden % 128 != 0 || hidden > 3 * 4 * kThreads ||
       (gamma != nullptr && xn_q8 == nullptr)) {
     return false;
@@ -5576,7 +5703,8 @@ bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
     hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream,
                        static_cast<__half*>(res), expert_out, weights,
                        shared_out, gate, gate_stride, used, inject,
-                       inject_parts, gamma, xn, xn_q8, hidden, eps);
+                       inject_parts, gamma, xn, xn_q8, hidden, eps, inject_w,
+                       inject_out);
     return true;
   }
   const auto combine = gamma ? HcCombineMoeF16Kernel<float, true>
@@ -5584,7 +5712,8 @@ bool HcCombineMoeF16(void* res, const __half* expert_out, const float* weights,
   hipLaunchKernelGGL(combine, dim3(n_tokens), dim3(kThreads), 0, stream,
                      static_cast<float*>(res),
                      expert_out, weights, shared_out, gate, gate_stride, used,
-                     inject, inject_parts, gamma, xn, xn_q8, hidden, eps);
+                     inject, inject_parts, gamma, xn, xn_q8, hidden, eps,
+                     inject_w, inject_out);
   return true;
 }
 
@@ -5625,20 +5754,21 @@ void HcCombineF16(void* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream,
-                  bool res_half) {
+                  bool res_half, const float* inject_w, float* inject_out) {
   // F16 prefill keeps the same reduction even for a one-token tail.
   if (streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
     if (res_half) {
       hipLaunchKernelGGL((HcCombineVec4Kernel<__half, __half>), dim3(n_tokens),
                          dim3(kThreads), 0, stream,
                          static_cast<__half*>(res), block_out, inject,
-                         inject_parts, gamma, xn, xn_q8, hidden, eps);
+                         inject_parts, gamma, xn, xn_q8, hidden, eps, inject_w,
+                         inject_out);
       return;
     }
     hipLaunchKernelGGL((HcCombineVec4Kernel<__half, float>), dim3(n_tokens),
                        dim3(kThreads), 0, stream, static_cast<float*>(res),
                        block_out, inject, inject_parts, gamma, xn, xn_q8, hidden,
-                       eps);
+                       eps, inject_w, inject_out);
     return;
   }
   hipLaunchKernelGGL(HcCombineKernel<__half>, dim3(n_tokens, streams),

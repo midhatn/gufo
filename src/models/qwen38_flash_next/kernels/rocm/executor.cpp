@@ -2126,8 +2126,21 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   return true;
 }
 
+bool Executor::InjectFusable(const DeviceMixer& m,
+                             std::uint32_t n_tokens) const {
+  const Config& c = config();
+  const bool extras = n_tokens <= options_.max_batch &&
+                      c.hidden_size <= model_->max_half_cols();
+  const bool half_mixer =
+      m.up.type != GgmlType::kQ8_0 && Expandable(m.up) && Expandable(m.down);
+  return n_tokens >= 96 && extras && c.hc_count == 4 && c.hidden_size == 2560 &&
+         c.hc_low_rank == 320 && (m.up.type == GgmlType::kQ8_0 || half_mixer) &&
+         m.up.rows == c.HcDim() && m.up.cols == c.hc_low_rank &&
+         !m.inject.empty() && m.inject.type == GgmlType::kF32;
+}
+
 void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
-                       bool res_half) const {
+                       bool res_half, const DeviceMixer* next) const {
   const Config& c = config();
   // Wide batches hand the next mixer an F16 norm for its epilogue and the
   // same norm quantized into the tiled Q8 layout for its W8A8 down
@@ -2135,6 +2148,19 @@ void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
   // separate activation pass for the projection.
   xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
   xn_q8_ready_ = {};  // s_.xn is rewritten (or left stale) below
+  // The next mixer's inject logits ride the combine that forms its norm. They
+  // replace the injection rows this combine reads in place, so both must use
+  // the same part stride.
+  inject_fused_ = false;
+  const float* inject_w = nullptr;
+  if (next != nullptr && xn_half_ &&
+      inject_parts_ == HcInjectPartsVec4(c.hidden_size) &&
+      InjectFusable(*next, n_tokens)) {
+    inject_w = next->inject.f32();
+    inject_fused_ = true;
+    inject_fused_w_ = inject_w;
+  }
+  float* const inject_out = inject_w != nullptr ? s_.inject : nullptr;
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe).
     moe_pending_ = false;
@@ -2144,7 +2170,8 @@ void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
                         s_.router + c.num_experts, c.num_experts + 1,
                         c.num_experts_used, s_.inject, inject_parts_, gamma,
                         s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                        c.hc_count, c.rms_eps, stream_, res_half)) {
+                        c.hc_count, c.rms_eps, stream_, res_half, inject_w,
+                        inject_out)) {
       return;
     }
     MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
@@ -2155,7 +2182,7 @@ void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
   if (xn_half_) {
     HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
                  s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
-                 stream_, res_half);
+                 stream_, res_half, inject_w, inject_out);
     return;
   }
   // A decode batch's next mixer quantizes xn for its down projection: the
@@ -2272,9 +2299,14 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   if (xn_half_) {
     if (fused_projection) {
       const void* up = half_mixer ? ExpandHalf(m.up) : m.up.data;
+      // The combine that formed this norm already wrote the inject logits.
+      const bool inject_ready = normed && inject_fused_ && fused_inject &&
+                                inject_fused_w_ == m.inject.f32();
       if (up == nullptr ||
           !HcMixF16Gemm(up, reinterpret_cast<const __half*>(s_.hc_gate),
-                        s_.xn_half, fused_inject ? m.inject.f32() : nullptr,
+                        s_.xn_half,
+                        fused_inject && !inject_ready ? m.inject.f32()
+                                                      : nullptr,
                         half_only ? nullptr : mixed,
                         static_cast<__half*>(s_.x_half),
                         half_only ? nullptr : s_.x_q8t, inject, n_tokens,
@@ -2315,6 +2347,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       mixed_q8_ready_ = {mixed, s_.mixed_q8_1, n_tokens, c.hidden_size};
     }
   }
+  inject_fused_ = false;
   inject_parts_ = fused_inject ? (vectorized ? HcInjectPartsVec4(c.hidden_size)
                                              : HcInjectParts(c.hidden_size))
                                : 1;
@@ -3665,10 +3698,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     ResidualToFloat(s_.res_h, s_.res, res_count, stream_);
     res_is_half = false;
   };
-  const auto combine_rows = [&](const float* gamma, std::uint32_t rows) {
+  const auto combine_rows = [&](const float* gamma, std::uint32_t rows,
+                                const DeviceMixer* next) {
     Combine(res_is_half ? static_cast<void*>(s_.res_h)
                         : static_cast<void*>(s_.res),
-            gamma, rows, res_is_half);
+            gamma, rows, res_is_half, next);
   };
   if (res_half_mode) {
     residual_to_half();
@@ -3741,7 +3775,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       if (res_half_mode && !res_is_half) {
         residual_to_half();
       }
-      combine_rows(l.hc_ffn.norm.f32(), rows);
+      combine_rows(l.hc_ffn.norm.f32(), rows, &l.hc_ffn);
       if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows,
                  error_msg) ||
           !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
@@ -3749,7 +3783,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
       if (next_norm == nullptr && res_is_half) {
         residual_to_float();  // PLE rewrites the residual in F32 next
       }
-      combine_rows(next_norm, rows);
+      combine_rows(next_norm, rows,
+                   next_norm != nullptr ? &layers[il + 1].hc_attn : nullptr);
       return true;
     };
     if (skipped != 0) {
