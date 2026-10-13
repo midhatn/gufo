@@ -28,9 +28,10 @@ namespace {
 // UD-IQ4_XS 40k cold prompt, served (-j 1, no MTP or cache), 2 rounds, warm:
 // 4096 gives 1533 tok/s, 8192 1582 (+3.2%) and 16384 1606 (+4.8%): routed
 // experts fill their tiles better over more tokens. 8192 costs about 3 GiB of
-// shared scratch, 16384 about 9 GiB, so 8192 is the default. Final-position
-// logits at 8192 vs 4096 over 30 long prompts: top-1 100%, KL 2e-5.
-// GUFO_PREFILL_TILE overrides it.
+// shared scratch, 16384 about 9 GiB. Final-position logits at 8192 vs 4096 over
+// 30 long prompts: top-1 100%, KL 2e-5. NPU on, bare bench, 16384 against
+// 8192: +0.5% at p=16384, +1.6% at 32768, +1.2% at 36706; 24576 and 32768
+// are slower than 8192. 16384 is the default; GUFO_PREFILL_TILE overrides it.
 std::uint32_t PrefillChunkTokens() {
   if (const char* const raw = std::getenv("GUFO_PREFILL_TILE");
       raw != nullptr && raw[0] != '\0') {
@@ -40,7 +41,7 @@ std::uint32_t PrefillChunkTokens() {
       return static_cast<std::uint32_t>(value);
     }
   }
-  return 8192;
+  return 16384;
 }
 // A prompt ending this close past a chunk finishes in that chunk: a separate
 // tail pass costs about as much as this many more chunk rows.

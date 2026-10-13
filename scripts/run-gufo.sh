@@ -3,7 +3,7 @@
 #
 # Required: GUFO_MODEL = first shard of UD-IQ4_XS (...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (shared Q8_0 sidecar), GUFO_BIN, PORT, JOBS, GUFO_CONTEXT, GUFO_EFFORT,
-#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 8192)
+#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 16384)
 # NPU build: GUFO_NPU=0 forces GPU-only; XRT_DIR (default /opt/xilinx/xrt) holds the XRT libraries.
 #            The NPU is used only while `tools/npu/fabric-clock.sh status` reports held
 #            (sudo tools/npu/fabric-clock.sh hold) and the NPU is not in turbo mode.
@@ -28,7 +28,7 @@ MTP=${GUFO_MTP:-}
 
 export LD_LIBRARY_PATH="${ROCM_PATH:-/opt/rocm}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-export GUFO_PREFILL_TILE=${GUFO_PREFILL_TILE:-8192}
+export GUFO_PREFILL_TILE=${GUFO_PREFILL_TILE:-16384}
 
 NPU_ENV=()
 if [ "${GUFO_NPU:-1}" != 0 ] && [ -e /dev/accel/accel0 ] && [ -d "$GUFO_DIR/tools/npu" ]; then
