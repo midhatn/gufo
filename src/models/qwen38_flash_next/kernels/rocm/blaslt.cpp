@@ -118,13 +118,12 @@ std::unique_ptr<BlasLt::Plan> BlasLt::MakePlan(hipDataType type, int m, int n,
         p->algorithm = candidates[i].algo;
         // The indexer projections' MT32x32x64 kernel runs at ~5 TFLOPS;
         // DenseBf16Gemm reproduces its K order (including the StaggerU
-        // rotation) at about 4x the speed. Only the shapes, token counts (up
-        // to one 4096-token prefill chunk) and library kernel checked bitwise
-        // by dense_gemm_bench take it.
+        // rotation) at about 1.7 to 2.2x the speed. Only the shapes, token
+        // counts (up to one prefill chunk and its tail) and library kernel
+        // checked bitwise by dense_gemm_bench take it.
         p->own_bf16 =
             type == HIP_R_16BF && k == 2560 &&
-            (m == 512 || m == 256 || m == 128 || m == 64) && n <= 4096 &&
-            hipblaslt_ext::getIndexFromAlgo(p->algorithm) == 4438 &&
+            (m == 512 || m == 256 || m == 128 || m == 64) && n <= 16640 &&
             hipblaslt_ext::getKernelNameFromAlgo(handle_, p->algorithm)
                     .find("_MT32x32x64_MI16x16x1_") != std::string::npos;
         return p;
