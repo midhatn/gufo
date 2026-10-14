@@ -4940,7 +4940,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   int f_i3_ib32[kWaveRowTiles];            ///< IQ3_S: sub-block in its super-block
   std::uint32_t f_dm[kWaveRowTiles];  ///< Q5_1: d | m; Q8_0: d
   int f_sb32[kWaveRowTiles];          ///< Q4_K: the K block in its superblock
-  constexpr int kActFetch = BN <= 64 ? 2 : BN <= 128 ? 4 : 8;
+  constexpr int kActFetch = BN <= 64 ? 2 : BN <= 128 ? 4 : (BN * 8 + 255) / 256;
   uint4 a_data[kActFetch];
 
   // Activation fetch: BN tokens x (BK * 64) bytes per stage in 16-byte
@@ -6388,6 +6388,10 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       return LaunchRoutedF16<64>(w, type, x, tiles, n_tiles, pad_bounds,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
+    case 192:
+      return LaunchRoutedF16<192>(w, type, x, tiles, n_tiles, pad_bounds,
+                                  rows_in, rows_out, swiglu_gate, out, out_half,
+                                  m, k, stream);
     case 128:
       return LaunchRoutedF16<128>(w, type, x, tiles, n_tiles, pad_bounds,
                                   rows_in, rows_out, swiglu_gate, out, out_half,

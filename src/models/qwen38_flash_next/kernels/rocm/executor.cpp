@@ -85,8 +85,12 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
-constexpr std::uint32_t kRoutedWideGateTokens =
-    8192;  ///< 256-token gate/up tiles from here
+constexpr std::uint32_t kRoutedWideTokens =
+    3072;  ///< per-expert wide gate/up and down tiles from here
+constexpr std::uint32_t kRoutedGateWideMin =
+    96;  ///< bucket for 256-token tiles
+constexpr std::uint32_t kRoutedDownWideMin =
+    129;                                     ///< bucket for 192-token tiles
 constexpr std::uint32_t kNpuSlicesMax = 12;  ///< C buffers per NPU group
 // The widest dense trunk matrix: the linear-attention input stack.
 constexpr std::size_t kDequantHalfMaxElems = std::size_t{16384} * 2560;
@@ -1206,7 +1210,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, 4 * RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a, 6 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
   cursor = stage;
@@ -1244,7 +1248,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* tiles = nullptr;
     if (!Check(GuardedHostMalloc(
                    GUFO_SITE, &tiles,
-                   4 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+                   6 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1950,7 +1954,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   routed_pair_tiles_ = 0;
   routed_pair_offset_ = 0;
   routed_pair_rows_ = 64;
-  routed_gate_tiles_ = 0;
+  routed_gate_tiles_[0] = routed_gate_tiles_[1] = 0;
+  routed_down_tiles_[0] = routed_down_tiles_[1] = 0;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -1999,16 +2004,33 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
           tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
         }
       }
-      // Wide chunks give the experts' buckets enough tokens for 256-token
-      // gate/up tiles, which halve the per-tile weight decode and fetch.
-      if (n_tokens >= kRoutedWideGateTokens) {
-        routed_gate_offset_ = n_tiles;
-        for (std::uint32_t e = 0; e < c.num_experts; ++e) {
-          for (std::uint32_t j = 0; j < (counts_host_[e] + 255u) / 256u; ++j) {
-            tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+      // Wide chunks give the big expert buckets enough tokens for larger
+      // tiles, which cut the per-tile weight decode and fetch; the small
+      // buckets keep 128-token tiles.
+      if (n_tokens >= kRoutedWideTokens) {
+        const auto add = [&](std::uint32_t lo, std::uint32_t hi,
+                             std::uint32_t rows, std::uint32_t& offset,
+                             std::uint32_t& count) {
+          offset = n_tiles;
+          for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+            if (counts_host_[e] < lo || counts_host_[e] >= hi)
+              continue;
+            for (std::uint32_t j = 0; j < (counts_host_[e] + rows - 1) / rows;
+                 ++j) {
+              tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+            }
           }
-        }
-        routed_gate_tiles_ = n_tiles - routed_gate_offset_;
+          count = n_tiles - offset;
+        };
+        constexpr std::uint32_t kAll = ~0u;
+        add(kRoutedGateWideMin, kAll, 256, routed_gate_offset_[0],
+            routed_gate_tiles_[0]);
+        add(0, kRoutedGateWideMin, 128, routed_gate_offset_[1],
+            routed_gate_tiles_[1]);
+        add(kRoutedDownWideMin, kAll, 192, routed_down_offset_[0],
+            routed_down_tiles_[0]);
+        add(0, kRoutedDownWideMin, 128, routed_down_offset_[1],
+            routed_down_tiles_[1]);
       }
     }
   }
@@ -3242,17 +3264,24 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const std::uint32_t gate_up_n_tiles =
         wide_gate_up ? routed_pair_tiles_ : routed_n_tiles_;
     const std::uint32_t gate_up_rows = wide_gate_up ? 128 : routed_tile_rows_;
+    const auto gate_pair = [&](std::uint32_t offset, std::uint32_t count,
+                               std::uint32_t rows) {
+      return count == 0 ||
+             RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                gate_type, x_half, s_.routed_tiles + offset,
+                                count, rows, s_.routed_bounds, s_.rows_token,
+                                s_.rows_slot, up_half, c.expert_ff,
+                                c.hidden_size, stream_);
+    };
     const bool gated_ok =
         n_tokens >= 1024 && routed_tile_rows_ == 48 &&
                 gate_type != WeightType::kIQ4_XS &&
                 (gate_type != WeightType::kIQ3_S || wide_gate_up)
-            ? (routed_gate_tiles_ != 0
-                   ? RoutedGatedF16Gemm(
-                         l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type,
-                         x_half, s_.routed_tiles + routed_gate_offset_,
-                         routed_gate_tiles_, 256, s_.routed_bounds,
-                         s_.rows_token, s_.rows_slot, up_half, c.expert_ff,
-                         c.hidden_size, stream_)
+            ? ((routed_gate_tiles_[0] + routed_gate_tiles_[1] != 0)
+                   ? (gate_pair(routed_gate_offset_[0], routed_gate_tiles_[0],
+                                256) &&
+                      gate_pair(routed_gate_offset_[1], routed_gate_tiles_[1],
+                                128))
                    : RoutedGatedF16Gemm(
                          l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type,
                          x_half, s_.routed_tiles + routed_pair_offset_,
@@ -3298,11 +3327,22 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                                                    : routed_n_tiles_;
     const std::uint32_t down_rows =
         down_128 ? 128 : (wide_down ? 64 : routed_tile_rows_);
-    if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half, down_tiles,
-                       down_n_tiles, down_rows, s_.routed_bounds, s_.rows_slot,
-                       s_.rows_slot, nullptr, nullptr,
-                       reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
-                       c.expert_ff, stream_)) {
+    const bool down_split =
+        down_128 && routed_down_tiles_[0] + routed_down_tiles_[1] != 0;
+    const auto down_gemm = [&](const std::int32_t* tiles, std::uint32_t count,
+                               std::uint32_t rows) {
+      return count == 0 ||
+             RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half, tiles,
+                           count, rows, s_.routed_bounds, s_.rows_slot,
+                           s_.rows_slot, nullptr, nullptr,
+                           reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
+                           c.expert_ff, stream_);
+    };
+    if (!(down_split ? down_gemm(s_.routed_tiles + routed_down_offset_[0],
+                                 routed_down_tiles_[0], 192) &&
+                           down_gemm(s_.routed_tiles + routed_down_offset_[1],
+                                     routed_down_tiles_[1], 128)
+                     : down_gemm(down_tiles, down_n_tiles, down_rows))) {
       AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }

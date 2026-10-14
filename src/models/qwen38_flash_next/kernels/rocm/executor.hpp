@@ -722,8 +722,12 @@ private:
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
   mutable std::uint32_t routed_pair_rows_{64};
-  mutable std::uint32_t routed_gate_offset_{0};  ///< 256-token gate/up map
-  mutable std::uint32_t routed_gate_tiles_{0};
+  /// Per-expert tile maps of wide chunks, in routed_tiles: [0] big buckets,
+  /// [1] the rest, for the gate/up (256 / 128 tokens) and down (192 / 128).
+  mutable std::uint32_t routed_gate_offset_[2]{0, 0};
+  mutable std::uint32_t routed_gate_tiles_[2]{0, 0};
+  mutable std::uint32_t routed_down_offset_[2]{0, 0};
+  mutable std::uint32_t routed_down_tiles_[2]{0, 0};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
