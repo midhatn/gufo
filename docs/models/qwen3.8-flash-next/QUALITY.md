@@ -126,3 +126,10 @@ Memory: C1/AR/capacity 133121,
 peak global HIP allocation including idle memory. Full commands, counts and
 identities remain in [artifacts](artifacts/bench.json) and the
 [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+Per-bucket expert tile sizes (256/192 versus 128 tokens) keep every output byte: the
+microbench hashes match and 30/30 greedy prompts are identical. Running the NPU on a
+final partial group changes 7 of 30 completions against the previous build; all seven
+begin with a first-token flip between an empty reply and text, and the same flip appears
+on the previous build alone when only the one-character tag at the start of the prompt
+changes (prompts 4, 6, 18, 25, 26 and 1).
