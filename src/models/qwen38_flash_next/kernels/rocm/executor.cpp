@@ -85,6 +85,8 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+constexpr std::uint32_t kRoutedWideGateTokens =
+    8192;  ///< 256-token gate/up tiles from here
 constexpr std::uint32_t kNpuSlicesMax = 12;  ///< C buffers per NPU group
 // The widest dense trunk matrix: the linear-attention input stack.
 constexpr std::size_t kDequantHalfMaxElems = std::size_t{16384} * 2560;
@@ -1204,7 +1206,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a, 4 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
   cursor = stage;
@@ -1242,7 +1244,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     void* tiles = nullptr;
     if (!Check(GuardedHostMalloc(
                    GUFO_SITE, &tiles,
-                   3 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+                   4 * RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -1948,6 +1950,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   routed_pair_tiles_ = 0;
   routed_pair_offset_ = 0;
   routed_pair_rows_ = 64;
+  routed_gate_tiles_ = 0;
   if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
@@ -1995,6 +1998,17 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
         for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
           tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
         }
+      }
+      // Wide chunks give the experts' buckets enough tokens for 256-token
+      // gate/up tiles, which halve the per-tile weight decode and fetch.
+      if (n_tokens >= kRoutedWideGateTokens) {
+        routed_gate_offset_ = n_tiles;
+        for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+          for (std::uint32_t j = 0; j < (counts_host_[e] + 255u) / 256u; ++j) {
+            tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+          }
+        }
+        routed_gate_tiles_ = n_tiles - routed_gate_offset_;
       }
     }
   }
@@ -3232,11 +3246,19 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
         n_tokens >= 1024 && routed_tile_rows_ == 48 &&
                 gate_type != WeightType::kIQ4_XS &&
                 (gate_type != WeightType::kIQ3_S || wide_gate_up)
-            ? RoutedGatedF16Gemm(
-                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
-                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
-                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
+            ? (routed_gate_tiles_ != 0
+                   ? RoutedGatedF16Gemm(
+                         l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type,
+                         x_half, s_.routed_tiles + routed_gate_offset_,
+                         routed_gate_tiles_, 256, s_.routed_bounds,
+                         s_.rows_token, s_.rows_slot, up_half, c.expert_ff,
+                         c.hidden_size, stream_)
+                   : RoutedGatedF16Gemm(
+                         l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type,
+                         x_half, s_.routed_tiles + routed_pair_offset_,
+                         routed_pair_tiles_, routed_pair_rows_,
+                         s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
+                         c.expert_ff, c.hidden_size, stream_))
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              gate_up_tiles, gate_up_n_tiles, gate_up_rows,
                              s_.routed_bounds, s_.rows_token, s_.rows_slot,

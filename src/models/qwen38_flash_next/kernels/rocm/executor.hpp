@@ -722,6 +722,8 @@ private:
   mutable std::uint32_t routed_pair_offset_{0};
   mutable std::uint32_t routed_pair_tiles_{0};
   mutable std::uint32_t routed_pair_rows_{64};
+  mutable std::uint32_t routed_gate_offset_{0};  ///< 256-token gate/up map
+  mutable std::uint32_t routed_gate_tiles_{0};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};

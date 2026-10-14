@@ -4834,7 +4834,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     const std::uint32_t* __restrict__ iq3s_grid = nullptr) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
   static_assert(!kPair || BM == 128);
-  static_assert(BN % 16 == 0 && BN / 16 <= 8);
+  static_assert(BN % 16 == 0 && BN / 16 <= 16);
   static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
@@ -4940,7 +4940,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
   int f_i3_ib32[kWaveRowTiles];            ///< IQ3_S: sub-block in its super-block
   std::uint32_t f_dm[kWaveRowTiles];  ///< Q5_1: d | m; Q8_0: d
   int f_sb32[kWaveRowTiles];          ///< Q4_K: the K block in its superblock
-  constexpr int kActFetch = BN <= 64 ? 2 : 4;
+  constexpr int kActFetch = BN <= 64 ? 2 : BN <= 128 ? 4 : 8;
   uint4 a_data[kActFetch];
 
   // Activation fetch: BN tokens x (BK * 64) bytes per stage in 16-byte
@@ -6422,7 +6422,7 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
           rows_out, nullptr, nullptr, out, m, k, up);
       return true;
     case WeightType::kIQ3_S:
-      if constexpr (BN == 128) {
+      if constexpr (BN >= 128) {
         const std::uint32_t* grid_table = Iq3sGridDevice();
         if (grid_table == nullptr || up == nullptr)
           return false;
@@ -6445,6 +6445,11 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream) {
+  if (tile_rows == 256) {
+    return LaunchRoutedGatedF16<256>(gate, up, type, x, tiles, n_tiles,
+                                     pad_bounds, rows_in, rows_out, out, m, k,
+                                     stream);
+  }
   if (tile_rows == 128) {
     return LaunchRoutedGatedF16<128>(gate, up, type, x, tiles, n_tiles,
                                      pad_bounds, rows_in, rows_out, out, m, k,
