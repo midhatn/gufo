@@ -1,4 +1,4 @@
-# Strix Halo inference with the XDNA2 NPU
+# Strix Halo inference with the XDNA2 NPU: about 2,000 tok/s prefill
 
 Qwen3.8 Flash-Next on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`)
 with the prefill split between the GPU and the Ryzen AI NPU.
@@ -8,20 +8,31 @@ Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 | Prefill, UD-IQ4_XS | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `gufo bench -p 16384` | 1,698 tok/s | **1,821 tok/s** (+7.2%) |
-| `gufo bench -p 32768` | | **1,783 tok/s** |
-| Served, 40k tokens cold, MTP and caches on | | **1,637 tok/s** |
+| `gufo bench -p 8192` | 1,837 tok/s | **1,996 tok/s** (+8.7%) |
+| `gufo bench -p 12288` | 1,823 tok/s | **1,992 tok/s** (+9.3%) |
+| `gufo bench -p 16384` | 1,821 tok/s | **1,990 tok/s** (+9.3%) |
+| `gufo bench -p 32768` | 1,788 tok/s | **1,949 tok/s** (+9.0%) |
+| Served, 42k tokens cold, MTP and caches on | | **1,836 tok/s** |
 
-8192-token prefill chunks, the GPU fabric clock held, NPU in performance mode,
-nothing else running. Greedy output of 30 long prompts and a copy task are
-identical with and without the NPU.
+16384-token prefill tile, the GPU fabric clock held, EC and NPU in performance
+mode, nothing else running; best runs reach 2,013 tok/s at 8192 tokens. Prompts
+that are not a multiple of 4096 tokens also use the NPU (from 2,304 tokens up),
+which makes the server 2% to 8% faster on them than before. Speed depends on the
+text: a mix of code and markdown prefills 20% to 30% slower than code alone at
+the same length because expert routing differs. Of 30 long greedy prompts, 23
+give the same completion with and without the NPU on partial chunks; the other
+seven start with a first-token flip between an empty reply and text, which also
+happens on the GPU when only a one-character tag at the start of the prompt
+changes.
 
 ## How the NPU is used
 
 The NPU runs block-float 8-bit GEMMs on parts of each layer that the GPU does
 not need yet, and the GPU goes on with other work meanwhile: the `z` rows of the
-linear-attention projection, the query and gate rows of 16 attention heads, and
-the shared expert's gate and up projections. Each result is read back only where
+linear-attention projection, the query and gate rows of all 24 attention heads, and
+the shared expert's gate and up projections. Each 4096-token group is
+awaited separately, so the attention for one group runs while the NPU computes
+the next. Each result is read back only where
 the GPU first needs it.
 
 ## Try it
@@ -59,10 +70,10 @@ the GPU first needs it.
    query/gate of 12 layers` and `NPU: shared expert of 48 layers` while loading.
    For the server, run `GUFO_MODEL=<first shard> GUFO_MTP=<mtp sidecar> scripts/run-gufo.sh`.
    It enables the NPU only when the fabric clock is held and the NPU is not in
-   turbo mode (`GUFO_NPU=0` forces GPU-only), uses an 16384-token prefill tile
+   turbo mode (`GUFO_NPU=0` forces GPU-only), uses a 16384-token prefill tile
    (`GUFO_PREFILL_TILE`) and reads the options listed at the top of the script.
 
-Every option is described in [docs/NPU.md](docs/NPU.md). `GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 8) and
+Every option is described in [docs/NPU.md](docs/NPU.md). `GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 12) and
 `GUFO_NPU_SHEXP=0` tune or switch off parts of the offload. Without
 `GUFO_NPU_DIR` the build runs GPU-only.
 

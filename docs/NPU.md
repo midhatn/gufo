@@ -40,7 +40,7 @@ in turbo mode; otherwise it warns and runs GPU-only.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `GUFO_NPU_SLICES` | `6` | 1024-row slices of the linear-attention `ssm_in` projection (z rows) computed on the NPU, 1 to 12. |
-| `GUFO_NPU_GATE_SLICES` | `8` | 1024-row slices of the attention `attn_qkv` projection (query and gate rows, two heads per slice) on the NPU, 0 to 12. `0` turns this part off. |
+| `GUFO_NPU_GATE_SLICES` | `12` | 1024-row slices of the attention `attn_qkv` projection (query and gate rows, two heads per slice) on the NPU, 0 to 12. `0` turns this part off. |
 | `GUFO_NPU_SHEXP` | on | `0` keeps the shared-expert gate and up projections on the GPU. |
 | `GUFO_NPU_LAYERS` | all | Limit how many linear-attention layers use the NPU. |
 
@@ -48,7 +48,7 @@ in turbo mode; otherwise it warns and runs GPU-only.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GUFO_PREFILL_TILE` | `8192` | Prefill chunk in tokens (128 to 65536). Larger fills the routed-expert tiles better and is faster: 4096 gives 1533 tok/s, 8192 1582, 16384 1606 on a 40k cold prompt. Scratch memory grows with it: about 3 GiB at 8192, about 9 GiB at 16384. |
+| `GUFO_PREFILL_TILE` | `16384` | Prefill chunk in tokens (128 to 65536). Larger fills the routed-expert tiles better and is faster: 4096 gives 1533 tok/s, 8192 1582, 16384 1606 on a 40k cold prompt (older build). Scratch memory grows with it: about 3 GiB at 8192, about 9 GiB at 16384. |
 
 The server's `--prefill-chunk` is a separate scheduling setting (how much a
 prefill runs before decoding gets a turn); `scripts/run-gufo.sh` keeps it at 4096.
