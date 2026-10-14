@@ -66,6 +66,7 @@ struct Call {
   int a_id;
   std::vector<int> b_ids;
   std::vector<int> c_ids;
+  std::uint64_t ticket;
 };
 
 class CopyPool {
@@ -196,6 +197,7 @@ struct NpuGemm::Impl {
   std::condition_variable queue_idle;
   std::deque<Call> queue;
   std::uint64_t enqueued{0};
+  std::atomic<std::uint64_t> submitted{0};
   std::uint64_t completed{0};
   bool worker_stop{false};
   std::atomic<bool> failed{false};
@@ -435,12 +437,14 @@ struct NpuGemm::Impl {
     Trace("process_end", call.a_id);
   }
 
-  void WaitNow() {
+  void WaitNow(std::uint64_t ticket = 0) {
     Trace("wait_begin");
     const auto t0 = std::chrono::steady_clock::now();
     {
       std::unique_lock lock(queue_mutex);
-      queue_idle.wait(lock, [this] { return completed == enqueued; });
+      queue_idle.wait(lock, [this, ticket] {
+        return ticket != 0 ? completed >= ticket : completed == enqueued;
+      });
     }
     wait_us += std::chrono::duration<double, std::micro>(
                    std::chrono::steady_clock::now() - t0)
@@ -612,8 +616,11 @@ void NpuGemm::FinalizeWeights(int id) {
 bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
                      const int* c_ids, int count) {
   Trace("submit_host", a_id, count);
-  auto* call = new Call{
-      impl_.get(), a_id, {b_ids, b_ids + count}, {c_ids, c_ids + count}};
+  auto* call = new Call{impl_.get(),
+                        a_id,
+                        {b_ids, b_ids + count},
+                        {c_ids, c_ids + count},
+                        ++impl_->submitted};
   const hipError_t status = hipLaunchHostFunc(
       stream,
       [](void* data) {
@@ -630,6 +637,27 @@ bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
 
 void* NpuGemm::Staged(hipStream_t /*stream*/, int id) {
   return impl_->buffers.at(id).device;
+}
+
+std::uint64_t NpuGemm::Ticket() const noexcept { return impl_->submitted; }
+
+bool NpuGemm::Wait(hipStream_t stream, std::uint64_t ticket) {
+  struct Req {
+    Impl* impl;
+    std::uint64_t ticket;
+  };
+  auto* req = new Req{impl_.get(), ticket};
+  if (hipLaunchHostFunc(
+          stream,
+          [](void* data) {
+            std::unique_ptr<Req> r(static_cast<Req*>(data));
+            r->impl->WaitNow(r->ticket);
+          },
+          req) != hipSuccess) {
+    delete req;
+    return false;
+  }
+  return true;
 }
 
 bool NpuGemm::Wait(hipStream_t stream) {

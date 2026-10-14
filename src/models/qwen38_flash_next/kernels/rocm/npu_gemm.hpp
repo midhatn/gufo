@@ -61,6 +61,10 @@ public:
   /// Blocks the stream until every submitted run has finished and its C buffer
   /// is readable by the GPU.
   bool Wait(hipStream_t stream);
+  /// Blocks the stream until the first `ticket` submissions have finished.
+  bool Wait(hipStream_t stream, std::uint64_t ticket);
+  /// Number of submissions made so far; pass to Wait to wait for them only.
+  std::uint64_t Ticket() const noexcept;
 
   /// The GPU's view of C buffer `id`, to read once Wait has returned. A single
   /// pass over the pinned pages is cheaper than copying them first.
