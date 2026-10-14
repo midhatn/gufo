@@ -8,14 +8,15 @@ Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 | Prefill, UD-IQ4_XS | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `gufo bench -p 8192` | 1,837 tok/s | **1,996 tok/s** (+8.7%) |
-| `gufo bench -p 12288` | 1,823 tok/s | **1,992 tok/s** (+9.3%) |
-| `gufo bench -p 16384` | 1,821 tok/s | **1,990 tok/s** (+9.3%) |
+| `gufo bench -p 8192` | 1,837 tok/s | **2,013 tok/s** (+9.6%) |
+| `gufo bench -p 12288` | 1,823 tok/s | **1,973 tok/s** (+8.2%) |
+| `gufo bench -p 16384` | 1,821 tok/s | **1,963 tok/s** (+7.8%) |
 | `gufo bench -p 32768` | 1,788 tok/s | **1,949 tok/s** (+9.0%) |
 | Served, 42k tokens cold, MTP and caches on | | **1,836 tok/s** |
 
 16384-token prefill tile, the GPU fabric clock held, EC and NPU in performance
-mode, nothing else running; best runs reach 2,013 tok/s at 8192 tokens. Prompts
+mode, nothing else running; the GPU + NPU figures for 8192 to 16384 tokens are
+the owner's own runs (`-r 2`). Prompts
 that are not a multiple of 4096 tokens also use the NPU (from 2,304 tokens up),
 which makes the server 2% to 8% faster on them than before. Speed depends on the
 text: a mix of code and markdown prefills 20% to 30% slower than code alone at
