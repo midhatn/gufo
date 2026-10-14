@@ -648,7 +648,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       // GUFO_NPU_GATE_SLICES sets how many 1024-row slices of attn_qkv (two
       // heads' query and gate rows each) the NPU computes in the attention
       // layers.
-      std::uint32_t gate_slices = 7;
+      std::uint32_t gate_slices = 12;
       if (const char* gs = std::getenv("GUFO_NPU_GATE_SLICES"); gs != nullptr) {
         gate_slices = std::min(static_cast<std::uint32_t>(std::atoi(gs)), 12U);
       }

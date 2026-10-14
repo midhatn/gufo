@@ -2350,11 +2350,12 @@ __global__ void PrepareAttentionKernel(
     float eps, const qwen::vision::DeviceRope* rope,
     std::uint32_t q_only_heads = 0,
     const std::uint8_t* const* streams = nullptr,
-    std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0) {
+    std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0,
+    std::uint32_t first_token = 0) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
-  const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
-                      tid = threadIdx.x;
+  const std::uint32_t t = blockIdx.x + first_token,
+                      first = blockIdx.y * kHeadsPerBlock, tid = threadIdx.x;
   const std::uint32_t lane = tid % 32, wave = tid / 32;
   // q_only_heads: only the first heads' query and gate rows (the rest of the
   // projection was prepared by the projection kernel itself).
@@ -8301,22 +8302,19 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
   return true;
 }
 
-void PrepareQueryHeadsStreams(const std::uint8_t* const* streams,
-                              std::uint32_t stream_stride,
-                              std::uint32_t stream_tokens,
-                              const float* q_gamma, float* q, float* gate,
-                              std::uint32_t n_tokens, std::uint32_t heads,
-                              std::uint32_t kv_heads, std::uint32_t d,
-                              std::uint32_t rotary_dim,
-                              const std::uint32_t* start_pos, float theta,
-                              float eps, hipStream_t stream,
-                              const qwen::vision::DeviceRope* rope,
-                              std::uint32_t q_heads) {
-  hipLaunchKernelGGL((PrepareAttentionKernel<4, true>),
-                     dim3(n_tokens, (q_heads + 3) / 4), dim3(kThreads), 0,
-                     stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
-                     nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta,
-                     eps, rope, q_heads, streams, stream_stride, stream_tokens);
+void PrepareQueryHeadsStreams(
+    const std::uint8_t* const* streams, std::uint32_t stream_stride,
+    std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,
+    std::uint32_t n_tokens, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t d, std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+    float theta, float eps, hipStream_t stream,
+    const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
+    std::uint32_t first_token) {
+  hipLaunchKernelGGL(
+      (PrepareAttentionKernel<4, true>), dim3(n_tokens, (q_heads + 3) / 4),
+      dim3(kThreads), 0, stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
+      nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta, eps, rope,
+      q_heads, streams, stream_stride, stream_tokens, first_token);
 }
 
 void PrepareQueryHeads(const float* packed, std::uint32_t stride,

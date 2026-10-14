@@ -2770,6 +2770,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   std::uint32_t npu_gate_groups = 0;
+  std::array<std::uint64_t, 16> npu_gate_tickets{};
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
         !projections_ready && n_tokens >= 1024 &&
@@ -2802,6 +2803,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
               stream_, npu_a_[g], l.npu_gate.data(),
               npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax,
               static_cast<int>(l.npu_gate.size()));
+          npu_gate_tickets.at(g) = npu->Ticket();
         }
         skip_gate_heads = static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
       }
@@ -2924,7 +2926,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       list_stride = max_blocks;
     }
   }
-  if (npu_gate_groups != 0) {
+  const bool gate_by_group = npu_gate_groups > 1 && npu_c_dev_ != nullptr &&
+                             checkpoint_tokens == 0 && !last_only &&
+                             MatrixRows(n_tokens);
+  if (npu_gate_groups != 0 && !gate_by_group) {
     NpuGemm* npu = model_->npu();
     npu->Wait(stream_);
     const std::uint32_t group_tokens = npu->tokens();
@@ -3001,6 +3006,28 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     if (!attend(0, checkpoint_tokens, false) ||
         !attend(checkpoint_tokens, n_tokens - checkpoint_tokens, false)) {
       AssignError(error_msg, "checkpoint attention geometry is unsupported");
+      return false;
+    }
+    return !project_output ||
+           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  }
+  if (gate_by_group) {
+    NpuGemm* npu = model_->npu();
+    const std::uint32_t group_tokens = npu->tokens();
+    const std::uint32_t q_heads =
+        static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
+    bool attended = true;
+    for (std::uint32_t g = 0; g < npu_gate_groups && attended; ++g) {
+      npu->Wait(stream_, npu_gate_tickets.at(g));
+      PrepareQueryHeadsStreams(
+          npu_c_dev_, kNpuSlicesMax, group_tokens, l.attn_q_norm.f32(), s_.q,
+          s_.attn_gate, group_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
+          c.rotary_dim, pos, c.rope_theta, c.rms_eps, stream_, s.rope, q_heads,
+          g * group_tokens);
+      attended = attend(g * group_tokens, group_tokens, false);
+    }
+    if (!attended) {
+      AssignError(error_msg, "grouped attention launch failed");
       return false;
     }
     return !project_output ||

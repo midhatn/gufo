@@ -554,17 +554,14 @@ void PrepareQueryHeads(const float* packed, std::uint32_t stride,
                        const qwen::vision::DeviceRope* rope,
                        std::uint32_t q_heads);
 /// The same, reading the packed rows straight from the NPU's C streams.
-void PrepareQueryHeadsStreams(const std::uint8_t* const* streams,
-                              std::uint32_t stream_stride,
-                              std::uint32_t stream_tokens,
-                              const float* q_gamma, float* q, float* gate,
-                              std::uint32_t n_tokens, std::uint32_t heads,
-                              std::uint32_t kv_heads, std::uint32_t d,
-                              std::uint32_t rotary_dim,
-                              const std::uint32_t* start_pos, float theta,
-                              float eps, hipStream_t stream,
-                              const qwen::vision::DeviceRope* rope,
-                              std::uint32_t q_heads);
+void PrepareQueryHeadsStreams(
+    const std::uint8_t* const* streams, std::uint32_t stream_stride,
+    std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,
+    std::uint32_t n_tokens, std::uint32_t heads, std::uint32_t kv_heads,
+    std::uint32_t d, std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+    float theta, float eps, hipStream_t stream,
+    const qwen::vision::DeviceRope* rope, std::uint32_t q_heads,
+    std::uint32_t first_token = 0);
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, __half* k_cache, __half* v_cache,
