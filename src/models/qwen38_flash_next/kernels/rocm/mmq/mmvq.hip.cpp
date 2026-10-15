@@ -422,7 +422,7 @@ template<ggml_type type, int ncols_dst>
 static void launch_dense(const void* weights, const block_q8_1* input,
                          float* output, int k, int rows, int input_stride,
                          hipStream_t stream) {
-  constexpr int row_waves = 4;
+  constexpr int row_waves = 8;
   mul_mat_vec_q_dense<type, ncols_dst, row_waves>
       <<<(rows + row_waves - 1) / row_waves, 32 * row_waves, 0, stream>>>(
           weights, input, output, k, rows, input_stride);
@@ -1120,31 +1120,62 @@ __launch_bounds__(256) static __global__
     const auto* ub = reinterpret_cast<const uint8_t*>(buf[wave][1]);
     float acc_g[kMaxTokens] = {};
     float acc_u[kMaxTokens] = {};
-    for (int sb = lane; sb < sub_blocks; sb += 32) {
-      // One matrix at a time keeps a single sub-block's weights live.
-#pragma unroll
-      for (int m = 0; m < 2; ++m) {
-        half2 w[16];
-        float scale = 0.0f;
-        iq3s_subblock_half2((m == 0 ? gb : ub) + (sb / 8) * 110, sb % 8, grid,
-                            w, scale);
-        float* acc = m == 0 ? acc_g : acc_u;
-#pragma unroll
-        for (int c = 0; c < kMaxTokens; ++c) {
-          if (c >= count)
-            break;
+    if constexpr (kMaxTokens == 1) {
+      // Decode carries one active token, so the sub-block's F16 activation
+      // slice feeds gate and up alike: load it once and dot both matrices,
+      // instead of reloading it inside each matrix. Same products, order and
+      // rounding as the batched loop below.
+      if (count == 1) {
+        for (int sb = lane; sb < sub_blocks; sb += 32) {
           uint4 xv[4];
           const auto* xsrc = reinterpret_cast<const uint4*>(
-              x + static_cast<size_t>(active[c]) * kK + sb * 32);
+              x + static_cast<size_t>(active[0]) * kK + sb * 32);
 #pragma unroll
           for (int q = 0; q < 4; ++q)
             xv[q] = xsrc[q];
           const half2* xs = reinterpret_cast<const half2*>(xv);
-          float sum = 0.0f;
 #pragma unroll
-          for (int i = 0; i < 16; ++i)
-            ggml_hip_mad(sum, w[i], xs[i]);
-          acc[c] = __fmaf_rn(scale, sum, acc[c]);
+          for (int m = 0; m < 2; ++m) {
+            half2 w[16];
+            float scale = 0.0f;
+            iq3s_subblock_half2((m == 0 ? gb : ub) + (sb / 8) * 110, sb % 8,
+                                grid, w, scale);
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+              ggml_hip_mad(sum, w[i], xs[i]);
+            (m == 0 ? acc_g : acc_u)[0] =
+                __fmaf_rn(scale, sum, (m == 0 ? acc_g : acc_u)[0]);
+          }
+        }
+      }
+    } else {
+      for (int sb = lane; sb < sub_blocks; sb += 32) {
+        // One matrix at a time keeps a single sub-block's weights live.
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          half2 w[16];
+          float scale = 0.0f;
+          iq3s_subblock_half2((m == 0 ? gb : ub) + (sb / 8) * 110, sb % 8, grid,
+                              w, scale);
+          float* acc = m == 0 ? acc_g : acc_u;
+#pragma unroll
+          for (int c = 0; c < kMaxTokens; ++c) {
+            if (c >= count)
+              break;
+            uint4 xv[4];
+            const auto* xsrc = reinterpret_cast<const uint4*>(
+                x + static_cast<size_t>(active[c]) * kK + sb * 32);
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+              xv[q] = xsrc[q];
+            const half2* xs = reinterpret_cast<const half2*>(xv);
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+              ggml_hip_mad(sum, w[i], xs[i]);
+            acc[c] = __fmaf_rn(scale, sum, acc[c]);
+          }
         }
       }
     }
