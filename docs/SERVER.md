@@ -978,6 +978,14 @@ service is ready, then reports `status` and the active model. Both read the
 recorded device state without performing GPU work on each poll. HTTP model replacement and persistent Responses
 conversations are not implemented.
 
+While `gufo serve llm` loads its model and walks the disk cache tier, the port
+already answers every request, `/health` included, with 503
+`{"error":{"message":"Loading model","type":"unavailable_error","code":"loading"}}`
+and `Retry-After: 1`, as llama-server does. A refused connection therefore
+means the process is not running; supervisors such as llama-swap, which treat
+only a 200 health check as ready, keep waiting until the model is loaded. If
+the address cannot be bound early, the port stays closed until the load ends.
+
 A GPU reset (for example `amdgpu` recovering from a MES hang) permanently
 invalidates the process's HIP context. The text scheduler checks it after five
 seconds of continuous idle time, then every five seconds while idle. The probe
