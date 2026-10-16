@@ -325,6 +325,228 @@ private:
   hipMemPool_t pool_{nullptr};
 };
 
+bool Executor::AllocateScratch(std::size_t T, Scratch* out, const Scratch* base,
+                               std::string* error_msg) {
+  if (T == 0) {
+    AssignError(error_msg, "scratch row capacity is zero");
+    return false;
+  }
+  const Config& c = config();
+  const std::size_t hc_dim = c.HcDim();
+  const std::size_t hidden = c.hidden_size;
+  const std::size_t slots = T * c.num_experts_used;
+  auto& a = allocations_;
+  Scratch s{};
+
+  auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
+
+  s.tokens = Alloc<std::int32_t>(a, T, error_msg);
+  if (s.tokens == nullptr)
+    return false;
+  s.x_half = Alloc<std::uint16_t>(a, T * model_->max_half_cols(), error_msg);
+  if (s.x_half == nullptr)
+    return false;
+  s.half_capacity = T * model_->max_half_cols();
+
+  if (const std::size_t n =
+          std::min(model_->max_dequant_elems(), kDequantHalfMaxElems);
+      n > 0) {
+    s.w_half = Alloc<std::uint16_t>(a, n, error_msg);
+    if (s.w_half == nullptr)
+      return false;
+    s.w_half_capacity = n;
+  }
+
+  for (void*& slot : s.x_q8) {
+    slot = Alloc<std::uint8_t>(
+        a,
+        qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch),
+                           static_cast<int>(model_->max_q8_cols())),
+        error_msg);
+    if (slot == nullptr)
+      return false;
+  }
+
+  const auto q8_1 = [&](std::size_t k) {
+    return Alloc<std::uint8_t>(
+        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
+        error_msg);
+  };
+  s.xn_q8_1 = q8_1(hc_dim);
+  s.lo_q8_1 = q8_1(c.hc_low_rank);
+  s.mixed_q8_1 = q8_1(hidden);
+  s.gdn_q8_1 = q8_1(c.SsmValueDim());
+  s.ctx_q8_1 = q8_1(c.AttentionQDim());
+  if (s.xn_q8_1 == nullptr || s.lo_q8_1 == nullptr || s.mixed_q8_1 == nullptr ||
+      s.gdn_q8_1 == nullptr || s.ctx_q8_1 == nullptr)
+    return false;
+
+  s.x_q8t =
+      Alloc<std::uint8_t>(a, Q8TiledBytes(T, model_->max_q8_cols()), error_msg);
+  if (s.x_q8t == nullptr)
+    return false;
+
+  s.res = f32(T * hc_dim);
+  s.res_h = Alloc<__half>(a, T * hc_dim, error_msg);
+  s.xn = f32(T * hc_dim);
+  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
+  s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
+  s.lo = f32(T * c.hc_low_rank);
+  s.mixed = f32(T * hidden);
+  s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
+  s.block_out = f32(T * hidden);
+  if (s.res == nullptr || s.res_h == nullptr || s.xn == nullptr ||
+      s.xn_half == nullptr || s.xn_q8t == nullptr || s.lo == nullptr ||
+      s.mixed == nullptr || s.inject == nullptr || s.block_out == nullptr)
+    return false;
+
+  const std::size_t linear_projection = std::max<std::size_t>(
+      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
+  const std::size_t linear_floats =
+      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
+           2 * c.SsmValueDim()) +
+      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
+  const std::size_t attention_floats =
+      T *
+      (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
+       c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim + mask_words_);
+  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
+  float* const stage =
+      f32(std::max({linear_floats, attention_floats, expert_floats,
+                    T * (linear_projection + hc_dim)}));
+  if (stage == nullptr)
+    return false;
+
+  s.hc_gate = stage + T * linear_projection;
+  float* cursor = stage;
+  const auto take = [&](std::size_t count) {
+    float* result = cursor;
+    cursor += count;
+    return result;
+  };
+
+  s.qkvz = take(T * linear_projection);
+  s.qkv = s.qkvz;
+  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
+  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
+  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
+  s.qn = take(T * c.SsmKeyDim());
+  s.kn = take(T * c.SsmKeyDim());
+  s.gdn_raw = take(T * c.SsmValueDim());
+  s.gdn_out = take(T * c.SsmValueDim());
+
+  cursor = stage;
+  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
+  s.q = take(T * c.AttentionQDim());
+  s.attn_gate = take(T * c.AttentionQDim());
+  s.k = take(T * c.AttentionKvDim());
+  s.v = take(T * c.AttentionKvDim());
+  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
+  s.ik = take(T * c.indexer_head_dim);
+  s.mask = reinterpret_cast<std::uint32_t*>(take(T * mask_words_));
+  s.ctx = take(T * c.AttentionQDim());
+
+  s.scores = f32(select_score_floats_);
+  if (s.scores == nullptr)
+    return false;
+  s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
+                        kAttnSplits * (c.head_dim + 2));
+  if (s.attn_partials == nullptr)
+    return false;
+
+  if (c.ple_layer >= 0) {
+    s.ple_key = s.hc_gate;
+    s.ple_value = s.block_out;
+    s.ple_query = s.xn;
+    s.ple_gated = s.qkvz;
+    s.ple_norm = s.hc_gate;
+    s.ple_conv = s.xn;
+    s.ple_history_scratch =
+        f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
+    if (s.ple_history_scratch == nullptr)
+      return false;
+    if (base != nullptr) {
+      s.ple_emb = base->ple_emb;
+    } else {
+      void* pinned = nullptr;
+      if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float),
+                               hipHostMallocMapped | hipHostMallocCoherent),
+                 "pinned n-gram buffer", error_msg))
+        return false;
+      host_emb_ = static_cast<float*>(pinned);
+      if (!Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&s.ple_emb),
+                                         pinned, 0),
+                 "mapped n-gram buffer", error_msg))
+        return false;
+      host_rows_.resize(T * c.ple_heads);
+    }
+  }
+
+  s.router = f32(T * (c.num_experts + 1));
+  s.ids = Alloc<std::int32_t>(a, slots, error_msg);
+  s.dense_ids = Alloc<std::int32_t>(a, T, error_msg);
+  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
+  if (s.router == nullptr || s.ids == nullptr || s.dense_ids == nullptr ||
+      s.expert_counts == nullptr)
+    return false;
+
+  {
+    const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
+    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
+    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
+    s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
+    s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
+    s.routed_tiles =
+        Alloc<std::int32_t>(a, 6 * RoutedTileCapacity(slots, c), error_msg);
+    if (s.routed_bounds == nullptr || s.routed_cursors == nullptr ||
+        s.rows_token == nullptr || s.rows_slot == nullptr ||
+        s.routed_tiles == nullptr)
+      return false;
+  }
+
+  s.weights = f32(slots);
+  if (s.weights == nullptr)
+    return false;
+  cursor = stage;
+  s.gate_e = take(slots * c.expert_ff);
+  s.up_e = take(slots * c.expert_ff);
+  s.down_e = take(slots * hidden);
+  s.shexp_gate = f32(T * c.shared_expert_ff);
+  s.shexp_up = f32(T * c.shared_expert_ff);
+  s.shexp_out = f32(T * hidden);
+  s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg);
+  if (s.shexp_gate == nullptr || s.shexp_up == nullptr ||
+      s.shexp_out == nullptr || s.shexp_half == nullptr)
+    return false;
+
+  s.logits =
+      f32(static_cast<std::size_t>(options_.max_logit_rows) * c.vocab_size);
+  if (s.logits == nullptr)
+    return false;
+
+  if (model_->has_mtp()) {
+    s.mtp_h = s.xn;
+    s.mtp_embd = s.mixed;
+    s.mtp_eproj = s.qkvz;
+    s.mtp_res = s.res;
+    s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
+    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    const auto candidate_ids = std::max<std::size_t>(
+        MtpCandidateWorkspaceSize(c.vocab_size),
+        options_.max_speculative * kArgmaxParts *
+            sizeof(PenaltyArgmaxCandidate) / sizeof(std::uint32_t));
+    s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
+    s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
+    if (s.mtp_argmax == nullptr || s.mtp_token == nullptr ||
+        s.mtp_ids == nullptr || s.mtp_scratch_ids == nullptr)
+      return false;
+    s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
+  }
+
+  *out = s;
+  return true;
+}
+
 std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
     snapshot_allocator_ = std::make_shared<SnapshotAllocator>();
@@ -727,6 +949,14 @@ bool EnvFlag(const char* name, bool fallback) {
   return v[0] != '0';
 }
 
+bool TwoBankEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_TWO_BANK");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
 // Rollback row lifetime. Freeing a row is what makes a captured graph unsafe:
 // the row addresses are baked into the graph's kernel arguments. Several
 // sessions can be mid-flight on the one executor stream, so a free triggered by
@@ -1004,11 +1234,13 @@ Executor::~Executor() {
   }
   for (void* p :
        {static_cast<void*>(host_emb_), static_cast<void*>(host_emb_ahead_),
-        static_cast<void*>(control_host_),
-        static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
+        static_cast<void*>(control_host_), static_cast<void*>(tokens_host_),
+        static_cast<void*>(logits_host_), static_cast<void*>(mtp_token_host_),
+        static_cast<void*>(counts_host_),
         static_cast<void*>(mtp_candidates_host_),
-        static_cast<void*>(tiles_host_)}) {
+        static_cast<void*>(tiles_host_),
+        static_cast<void*>(bank_b_control_host_),
+        static_cast<void*>(bank_b_tokens_host_)}) {
     if (p != nullptr) {
       ForgetAllocation(p);
       (void)hipHostFree(p);
@@ -1059,170 +1291,18 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   if (e->blaslt_ == nullptr) {
     return nullptr;
   }
-  const std::size_t hc_dim = c.HcDim();
-  const std::size_t hidden = c.hidden_size;
-  const std::size_t slots = T * c.num_experts_used;
-  auto& a = e->allocations_;
-  Scratch& s = e->s_;
-  auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
-  s.tokens = Alloc<std::int32_t>(a, T, error_msg);
-  s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
-  s.half_capacity = s.x_half != nullptr ? T * model.max_half_cols() : 0;
-  // Wide batches expand one dense Q4_K/Q5_K/Q5_1 matrix at a time. The output
-  // head is larger than any trunk projection but never runs a wide batch.
-  if (const std::size_t n =
-          std::min(model.max_dequant_elems(), kDequantHalfMaxElems);
-      n > 0) {
-    s.w_half = Alloc<std::uint16_t>(a, n, error_msg);
-    s.w_half_capacity = s.w_half != nullptr ? n : 0;
-  }
-  for (void*& slot : s.x_q8) {
-    slot = Alloc<std::uint8_t>(
-        a,
-        qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch),
-                           static_cast<int>(model.max_q8_cols())),
-        error_msg);
-  }
-  const auto q8_1 = [&](std::size_t k) {
-    return Alloc<std::uint8_t>(
-        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch), static_cast<int>(k)),
-        error_msg);
-  };
-  s.xn_q8_1 = q8_1(hc_dim);
-  s.lo_q8_1 = q8_1(c.hc_low_rank);
-  s.mixed_q8_1 = q8_1(hidden);
-  s.gdn_q8_1 = q8_1(c.SsmValueDim());
-  s.ctx_q8_1 = q8_1(c.AttentionQDim());
-  s.x_q8t =
-      Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
-  s.res = f32(T * hc_dim);
-  s.res_h = Alloc<__half>(a, T * hc_dim, error_msg);
-  s.xn = f32(T * hc_dim);
-  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
-  s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
-  s.lo = f32(T * c.hc_low_rank);
-  s.mixed = f32(T * hidden);
-  s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
-  s.block_out = f32(T * hidden);
-  const std::uint32_t max_blocks =
-      (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
-  e->mask_words_ = (max_blocks + 31) / 32;
-  const std::size_t linear_projection = std::max<std::size_t>(
-      c.SsmConvChannels() + c.SsmValueDim(), c.ple_layer >= 0 ? hc_dim : 0);
-  const std::size_t linear_floats =
-      T * (linear_projection + 2 * c.ssm_num_v_heads + 2 * c.SsmKeyDim() +
-           2 * c.SsmValueDim()) +
-      (T + c.ssm_conv_kernel) * c.SsmConvChannels();
-  const std::size_t attention_floats =
-      T * (5 * c.AttentionQDim() + 4 * c.AttentionKvDim() +
-           c.indexer_heads * c.indexer_head_dim + c.indexer_head_dim +
-           e->mask_words_);
-  const std::size_t expert_floats = slots * (2 * c.expert_ff + hidden);
-  // Linear/full attention and routed experts run sequentially on stream_.
-  // Their intermediates die before the next stage, including batched rows,
-  // MTP catch-up and the deferred MoE epilogue consumed by Combine. Keep
-  // stable addresses for graph replay without reserving all three stages.
-  float* const stage =
-      f32(std::max({linear_floats, attention_floats, expert_floats,
-                    T * (linear_projection + hc_dim)}));
-  if (stage == nullptr) {
-    return nullptr;
-  }
-  // Mixer gates die before attention/experts start. PLE also uses this
-  // buffer as its key, so keep it beyond PLE's gated output at stage.
-  s.hc_gate = stage + T * linear_projection;
-  float* cursor = stage;
-  const auto take = [&](std::size_t count) {
-    float* result = cursor;
-    cursor += count;
-    return result;
-  };
-  // Stacked and separate SSM projections are mutually exclusive. MTP's
-  // projected embedding is consumed before attention and reuses this space.
-  s.qkvz = take(T * linear_projection);
-  s.qkv = s.qkvz;
-  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
-  s.alpha_beta = take(T * 2 * c.ssm_num_v_heads);
-  s.conv_scratch = take((T + c.ssm_conv_kernel) * c.SsmConvChannels());
-  s.qn = take(T * c.SsmKeyDim());
-  s.kn = take(T * c.SsmKeyDim());
-  s.gdn_raw = take(T * c.SsmValueDim());
-  s.gdn_out = take(T * c.SsmValueDim());
-  cursor = stage;
-  s.qg = take(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
-  s.q = take(T * c.AttentionQDim());
-  s.attn_gate = take(T * c.AttentionQDim());
-  s.k = take(T * c.AttentionKvDim());
-  s.v = take(T * c.AttentionKvDim());
-  s.iq = take(T * c.indexer_heads * c.indexer_head_dim);
-  s.ik = take(T * c.indexer_head_dim);
-  s.mask = reinterpret_cast<std::uint32_t*>(take(T * e->mask_words_));
-  s.ctx = take(T * c.AttentionQDim());
-  // Keep score/selection traffic near the device cache size. Captured
-  // verification still needs all its rows at the maximum context.
-  const std::size_t score_stride = std::size_t{e->mask_words_} * 32;
-  e->select_score_floats_ =
-      std::max(kVecBatch * score_stride,
-               std::min(std::size_t{5 * 1024 * 1024}, 512 * score_stride));
-  s.scores = f32(e->select_score_floats_);
-  s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
-                        kAttnSplits * (c.head_dim + 2));
-  if (c.ple_layer >= 0) {
-    // PLE finishes before this layer's mixer/SSM. Its gate consumes key
-    // and query before normalization/convolution reuse those two buffers.
-    // The gated input stays separate until PleInject consumes both outputs.
-    s.ple_key = s.hc_gate;
-    s.ple_value = s.block_out;
-    s.ple_query = s.xn;
-    s.ple_gated = s.qkvz;
-    s.ple_norm = s.hc_gate;
-    s.ple_conv = s.xn;
-    s.ple_history_scratch =
-        f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
-    // The quantizer reads each n-gram row once. On this UMA target it can
-    // consume the coherent reader buffer directly, without another device
-    // allocation or upload. Its address stays fixed for graph replay; the
-    // next-chunk prefetch uses separate storage until this forward finishes.
-    void* pinned = nullptr;
-    if (!Check(hipHostMalloc(&pinned, T * c.PleEmbeddingDim() * sizeof(float),
-                             hipHostMallocMapped | hipHostMallocCoherent),
-               "pinned n-gram buffer", error_msg)) {
-      return nullptr;
-    }
-    e->host_emb_ = static_cast<float*>(pinned);
-    if (!Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&s.ple_emb),
-                                       pinned, 0),
-               "mapped n-gram buffer", error_msg)) {
-      return nullptr;
-    }
-    e->host_rows_.resize(T * c.ple_heads);
-  }
-  s.router = f32(T * (c.num_experts + 1));
-  s.ids = Alloc<std::int32_t>(a, slots, error_msg);
-  // The vector kernel reads one expert id per token row, so a dense call
-  // needs a zero id for every row it can be given (Dense slices by T).
-  s.dense_ids = Alloc<std::int32_t>(a, T, error_msg);
-  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   {
-    const std::size_t compact = RoutedCompactRows(slots, c.num_experts);
-    s.routed_bounds = Alloc<std::int32_t>(a, c.num_experts + 1, error_msg);
-    s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
-    s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
-    s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
-    s.routed_tiles =
-        Alloc<std::int32_t>(a, 6 * RoutedTileCapacity(slots, c), error_msg);
+    const std::uint32_t max_blocks =
+        (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
+    e->mask_words_ = (max_blocks + 31) / 32;
+    const std::size_t score_stride = e->mask_words_ * 32;
+    e->select_score_floats_ =
+        std::max(kVecBatch * score_stride,
+                 std::min(std::size_t{5 * 1024 * 1024}, 512 * score_stride));
   }
-  s.weights = f32(slots);
-  cursor = stage;
-  s.gate_e = take(slots * c.expert_ff);
-  s.up_e = take(slots * c.expert_ff);
-  s.down_e = take(slots * hidden);
-  s.shexp_gate = f32(T * c.shared_expert_ff);
-  s.shexp_up = f32(T * c.shared_expert_ff);
-  s.shexp_out = f32(T * hidden);
-  s.shexp_half = Alloc<__half>(a, T * c.shared_expert_ff, error_msg);
-  s.logits =
-      f32(static_cast<std::size_t>(e->options_.max_logit_rows) * c.vocab_size);
+  if (!e->AllocateScratch(T, &e->s_, nullptr, error_msg))
+    return nullptr;
+  const std::size_t slots = T * c.num_experts_used;
   {
     void* control = nullptr;
     void* tokens = nullptr;
@@ -1327,21 +1407,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // The trunk's kept rows are session-owned. Its transient residual and
     // mixer buffers are free while MTP constructs its input. The split
     // projections consume h/embd before the first mixer rewrites xn/mixed.
-    s.mtp_h = s.xn;
-    s.mtp_embd = s.mixed;
-    s.mtp_eproj = s.qkvz;
-    s.mtp_res = s.res;
-    s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
-    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
-    const auto candidate_ids = std::max<std::size_t>(
-        MtpCandidateWorkspaceSize(c.vocab_size),
-        e->options_.max_speculative * kArgmaxParts *
-            sizeof(PenaltyArgmaxCandidate) / sizeof(std::uint32_t));
-    s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
-    s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
-    // Final selection consumes intermediate IDs before writing its scores.
-    // Pack those scores behind the 64 returned IDs for one host transfer.
-    s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
     if (!Check(GuardedHostMalloc(GUFO_SITE, &e->mtp_token_host_,
                                  sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
@@ -1354,7 +1419,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->mtp_candidates_host_->size =
         std::min<std::size_t>(c.vocab_size, kMtpCandidates);
   }
-  for (void* p : a) {
+  for (void* p : e->allocations_) {
     if (p == nullptr) {
       return nullptr;
     }
@@ -3602,6 +3667,282 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
 
+void Executor::SaveCache(BankCache* cache) const {
+  cache->half_src_ = half_src_;
+  cache->half_rows_ = half_rows_;
+  cache->half_cols_ = half_cols_;
+  cache->half_bf16_ = half_bf16_;
+  cache->q8t_src_ = q8t_src_;
+  cache->q8t_rows_ = q8t_rows_;
+  cache->q8t_cols_ = q8t_cols_;
+  cache->xn_q8_ready_ = xn_q8_ready_;
+  cache->mixed_q8_ready_ = mixed_q8_ready_;
+  cache->shexp_half_ready_ = shexp_half_ready_;
+  cache->moe_pending_ = moe_pending_;
+  cache->xn_half_ = xn_half_;
+  cache->inject_fused_ = inject_fused_;
+  cache->inject_fused_w_ = inject_fused_w_;
+  cache->inject_parts_ = inject_parts_;
+  cache->q8_slot_ = q8_slot_;
+}
+
+void Executor::LoadCache(const BankCache& cache) const {
+  half_src_ = cache.half_src_;
+  half_rows_ = cache.half_rows_;
+  half_cols_ = cache.half_cols_;
+  half_bf16_ = cache.half_bf16_;
+  q8t_src_ = cache.q8t_src_;
+  q8t_rows_ = cache.q8t_rows_;
+  q8t_cols_ = cache.q8t_cols_;
+  xn_q8_ready_ = cache.xn_q8_ready_;
+  mixed_q8_ready_ = cache.mixed_q8_ready_;
+  shexp_half_ready_ = cache.shexp_half_ready_;
+  moe_pending_ = cache.moe_pending_;
+  xn_half_ = cache.xn_half_;
+  inject_fused_ = cache.inject_fused_;
+  inject_fused_w_ = cache.inject_fused_w_;
+  inject_parts_ = cache.inject_parts_;
+  q8_slot_ = cache.q8_slot_;
+}
+
+void Executor::SetScratchHost(const Scratch& scratch, Session::Control* control,
+                              std::int32_t* tokens) {
+  UseScratch(scratch);
+  control_host_ = control;
+  tokens_host_ = tokens;
+}
+
+bool Executor::ForwardBodyRange(
+    Session& session, std::uint32_t n, std::uint32_t n_logits,
+    bool download_logits, bool speculative, bool sparse,
+    std::uint32_t start_pos, std::uint32_t pool_grid, std::uint32_t first_layer,
+    std::uint32_t end_layer, std::string* error_msg,
+    PrefillCheckpoint* checkpoint, bool initial_normed, bool initial_res_half,
+    bool convert_at_entry, bool convert_at_exit, bool upload_control,
+    bool* out_normed, bool* out_res_is_half) const {
+  const Config& c = config();
+  if (first_layer == 0 || upload_control) {
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.control_, control_host_,
+                                  sizeof(Session::Control),
+                                  hipMemcpyHostToDevice, stream_),
+               "control upload", error_msg))
+      return false;
+  }
+  if (first_layer == 0) {
+    if (!Check(GuardedMemcpyAsync(GUFO_SITE, s_.tokens, tokens_host_,
+                                  n * sizeof(std::int32_t),
+                                  hipMemcpyHostToDevice, stream_),
+               "token upload", error_msg))
+      return false;
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
+    session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
+                                 c.hc_count, stream_);
+  }
+
+  const auto& layers = model_->layers();
+  bool normed = initial_normed;
+  constexpr std::uint32_t kResidualHalfMinRows = 1024;
+  const bool res_half_mode = prefill_phase && wide_mixer_ && MatrixRows(n) &&
+                             !speculative && n >= kResidualHalfMinRows &&
+                             c.hc_count == 4 && c.hidden_size % 128 == 0 &&
+                             c.hidden_size <= 2560;
+  bool res_is_half = initial_res_half;
+  const std::size_t res_count = static_cast<std::size_t>(n) * c.HcDim();
+  const auto residual_to_half = [&] {
+    ResidualToHalf(s_.res, s_.res_h, res_count, stream_);
+    res_is_half = true;
+  };
+  const auto residual_to_float = [&] {
+    ResidualToFloat(s_.res_h, s_.res, res_count, stream_);
+    res_is_half = false;
+  };
+  const auto combine_rows = [&](const float* gamma, std::uint32_t rows,
+                                const DeviceMixer* next) {
+    Combine(
+        res_is_half ? static_cast<void*>(s_.res_h) : static_cast<void*>(s_.res),
+        gamma, rows, res_is_half, next);
+  };
+  if (res_half_mode && !res_is_half)
+    residual_to_half();
+
+  for (std::uint32_t il = first_layer; il < end_layer; ++il) {
+    if (!session.CheckCancellation(error_msg))
+      return false;
+    const DeviceLayer& l = layers[il];
+    if (c.IsPleLayer(il)) {
+      if (res_is_half) {
+        residual_to_float();
+      }
+      if (!Ple(l, session, n, s_.res, speculative, error_msg, false,
+               checkpoint)) {
+        return false;
+      }
+    }
+    const bool half_only =
+        prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
+        DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
+        l.ssm_alpha_beta.cols == l.ssm_in.cols;
+    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
+               half_only)) {
+      return false;
+    }
+    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
+                                il + 1 == c.num_layers && n >= 1024 &&
+                                n_logits == 1 && checkpoint == nullptr;
+    if (l.linear) {
+      const auto capture =
+          checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
+                                     checkpoint->state->linear_[il].conv_state,
+                                     checkpoint->tokens}
+                     : GdnCheckpoint{};
+      if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
+                           speculative, error_msg, false, true, capture)) {
+        return false;
+      }
+    } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
+                          &session.control_->position,
+                          &session.control_->blocks, start_pos, pool_grid,
+                          session.max_context_, sparse, error_msg,
+                          last_attention, false, true,
+                          checkpoint ? checkpoint->tokens : 0)) {
+      return false;
+    }
+
+    const float* next_norm =
+        il + 1 < c.num_layers
+            ? (c.IsPleLayer(il + 1) ? nullptr
+                                    : layers[il + 1].hc_attn.norm.f32())
+            : nullptr;
+    const auto needed =
+        std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
+    const auto skipped = prefill_phase && !session.mtp_enabled_ &&
+                                 !res_half_mode && il + 1 == c.num_layers &&
+                                 n > needed
+                             ? (n - needed) / 128 * 128
+                             : 0U;
+    const auto finish = [&](std::uint32_t rows) {
+      if (res_half_mode && !res_is_half) {
+        residual_to_half();
+      }
+      combine_rows(l.hc_ffn.norm.f32(), rows, &l.hc_ffn);
+      if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows,
+                 error_msg) ||
+          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
+        return false;
+      if (next_norm == nullptr && res_is_half) {
+        residual_to_float();
+      }
+      combine_rows(next_norm, rows,
+                   next_norm != nullptr ? &layers[il + 1].hc_attn : nullptr);
+      return true;
+    };
+    if (skipped != 0) {
+      struct RestoreScratch {
+        const Executor* executor;
+        Scratch scratch;
+        ~RestoreScratch() { executor->UseScratch(scratch); }
+      } restore{this, s_};
+      auto tail = RowScratch(s_, skipped);
+      tail.inject =
+          s_.inject + std::size_t{skipped} * c.hc_count * inject_parts_;
+      UseScratch(tail);
+      if (!finish(n - skipped))
+        return false;
+    } else if (!finish(n)) {
+      return false;
+    }
+    normed = next_norm != nullptr;
+  }
+
+  if (out_normed != nullptr)
+    *out_normed = normed;
+  if (out_res_is_half != nullptr)
+    *out_res_is_half = res_is_half;
+  if (convert_at_exit && res_is_half)
+    residual_to_float();
+  if (end_layer < c.num_layers)
+    return true;
+
+  if (checkpoint) {
+    if (checkpoint->hidden_rows != 0 &&
+        !Check(hipMemcpyAsync(checkpoint->state->mtp_.target_hidden,
+                              s_.res + std::size_t{checkpoint->tokens -
+                                                   checkpoint->hidden_rows} *
+                                           c.HcDim(),
+                              std::size_t{checkpoint->hidden_rows} * c.HcDim() *
+                                  sizeof(float),
+                              hipMemcpyDeviceToDevice, stream_),
+               "checkpoint hidden rows", error_msg))
+      return false;
+    PrefillPhase head_phase(false);
+    if (!HcMix(model_->hc_head(),
+               s_.res + std::size_t{checkpoint->tokens - 1} * c.HcDim(), false,
+               s_.mixed, nullptr, 1, error_msg) ||
+        !Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg) ||
+        !Check(hipMemcpyAsync(checkpoint->logits.data(), s_.logits,
+                              std::size_t{c.vocab_size} * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
+               "checkpoint logits", error_msg))
+      return false;
+  }
+
+  const auto kept = std::min(
+      checkpoint && checkpoint->tokens < n ? n - checkpoint->tokens : n,
+      options_.max_speculative);
+  if (session.mtp_enabled_ &&
+      !Check(GuardedMemcpyAsync(
+                 GUFO_SITE, session.mtp_.target_hidden,
+                 s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
+                 static_cast<std::size_t>(kept) * c.HcDim() * sizeof(float),
+                 hipMemcpyDeviceToDevice, stream_),
+             "hidden keep", error_msg))
+    return false;
+
+  if (n_logits > 0) {
+    PrefillPhase head_phase(false);
+    const std::size_t skip = static_cast<std::size_t>(n - n_logits);
+    const DeviceMixer& head = model_->hc_head();
+    if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
+               n_logits, error_msg) ||
+        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+      return false;
+    }
+    if (download_logits &&
+        !Check(GuardedMemcpyAsync(GUFO_SITE, logits_host_, s_.logits,
+                                  static_cast<std::size_t>(n_logits) *
+                                      c.vocab_size * sizeof(float),
+                                  hipMemcpyDeviceToHost, stream_),
+               "logits download", error_msg)) {
+      return false;
+    }
+    if (const char* dump = std::getenv("GUFO_LOGIT_DUMP");
+        dump != nullptr && n_logits > 0 &&
+        Check(hipStreamSynchronize(stream_), "logit dump", error_msg)) {
+      if (std::FILE* f = std::fopen(dump, "ab")) {
+        std::fwrite(logits_host_ +
+                        static_cast<std::size_t>(n_logits - 1) * c.vocab_size,
+                    sizeof(float), c.vocab_size, f);
+        std::fclose(f);
+      }
+    }
+  }
+  return true;
+}
+
+bool Executor::ForwardBody(Session& session, std::uint32_t n,
+                           std::uint32_t n_logits, bool download_logits,
+                           bool speculative, bool sparse,
+                           std::uint32_t start_pos, std::uint32_t pool_grid,
+                           std::uint32_t first_layer, std::uint32_t end_layer,
+                           std::string* error_msg,
+                           PrefillCheckpoint* checkpoint) const {
+  return ForwardBodyRange(session, n, n_logits, download_logits, speculative,
+                          sparse, start_pos, pool_grid, first_layer, end_layer,
+                          error_msg, checkpoint, false, false, true, true, true,
+                          nullptr, nullptr);
+}
+
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg, PrefillCheckpoint* checkpoint,
@@ -3790,230 +4131,274 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
-bool Executor::ForwardBody(Session& session, std::uint32_t n,
-                           std::uint32_t n_logits, bool download_logits,
-                           bool speculative, bool sparse,
-                           std::uint32_t start_pos, std::uint32_t pool_grid,
-                           std::uint32_t first_layer, std::uint32_t end_layer,
-                           std::string* error_msg,
-                           PrefillCheckpoint* checkpoint) const {
+bool Executor::CanForwardPair(const Session& session, std::size_t n,
+                              std::uint32_t n_logits, std::uint32_t* nA,
+                              std::uint32_t* nB, std::string* error_msg) const {
+  if (!TwoBankEnabled())
+    return false;
+  if (n < 8192 || n % 4096 != 0)
+    return false;
+  if (n > options_.max_batch)
+    return false;
+  if (session.owner_ != this)
+    return false;
+  if (session.position_ + n > session.max_context_)
+    return false;
+  const auto prefix = session.VisionLayout().PrefixLength();
+  if (prefix != 0 && session.position_ < prefix)
+    return false;
+  if (session.snapshots_ != nullptr || session.continuation_hooks_ != nullptr)
+    return false;
+  if (session.mtp_enabled_ && session.mtp_.position != session.position_)
+    return false;
+  if (n_logits > n)
+    return false;
+  if (n_logits > options_.max_logit_rows)
+    return false;
+
+  const std::uint32_t groups = static_cast<std::uint32_t>(n / 4096);
+  std::uint32_t a_groups = (groups + 1) / 2;
+  if (n % 8192 == 0)
+    a_groups = groups / 2;
+  const std::uint32_t a = a_groups * 4096;
+  const std::uint32_t b = static_cast<std::uint32_t>(n) - a;
+  if (a < 4096 || b < 4096 || a > options_.max_batch ||
+      b > options_.max_batch / 2 || b > n)
+    return false;
+
+  if (n_logits > b)
+    return false;
+
+  if (nA != nullptr)
+    *nA = a;
+  if (nB != nullptr)
+    *nB = b;
+  return true;
+}
+
+bool Executor::EnsureBankBScratch(std::string* error_msg) {
+  if (bank_b_allocated_)
+    return true;
+  const std::size_t T = options_.max_batch / 2;
+  if (T == 0) {
+    AssignError(error_msg, "two-bank scratch requires max_batch >= 2");
+    return false;
+  }
+  if (!AllocateScratch(T, &bank_b_scratch_, &s_, error_msg))
+    return false;
+
+  void* control = nullptr;
+  void* tokens = nullptr;
+  if (!Check(GuardedHostMalloc(GUFO_SITE, &control, sizeof(Session::Control)),
+             "pinned bank B control buffer", error_msg) ||
+      !Check(GuardedHostMalloc(GUFO_SITE, &tokens, T * sizeof(std::int32_t)),
+             "pinned bank B token buffer", error_msg))
+    return false;
+  bank_b_control_host_ = static_cast<Session::Control*>(control);
+  bank_b_tokens_host_ = static_cast<std::int32_t*>(tokens);
+  bank_b_allocated_ = true;
+  return true;
+}
+
+bool Executor::ForwardPair(Session& session,
+                           std::span<const std::int32_t> tokens,
+                           std::uint32_t n_logits, float* logits,
+                           std::string* error_msg) {
+  std::uint32_t nA = 0;
+  std::uint32_t nB = 0;
+  if (!CanForwardPair(session, tokens.size(), n_logits, &nA, &nB, error_msg))
+    return false;
+  if (!session.CheckCancellation(error_msg))
+    return false;
+  if (!EnsureBankBScratch(error_msg))
+    return false;
+
+  PrefillPhase phase(true);
+  Scratch saved_scratch = s_;
+  Session::Control* saved_control_host = control_host_;
+  std::int32_t* saved_tokens_host = tokens_host_;
+  BankCache saved_cache;
+  SaveCache(&saved_cache);
+
+  struct PinnedInputGuard {
+    hipStream_t stream;
+    bool completed{false};
+    ~PinnedInputGuard() {
+      if (!completed)
+        (void)hipStreamSynchronize(stream);
+    }
+  } pinned_inputs{stream_};
+
+  DropReadyQ8();
+  selected_logits_ = nullptr;
+
   const Config& c = config();
-  if (first_layer == 0) {
-    if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.control_, control_host_,
-                                  sizeof(Session::Control),
-                                  hipMemcpyHostToDevice, stream_),
-               "control upload", error_msg) ||
-        !Check(GuardedMemcpyAsync(GUFO_SITE, s_.tokens, tokens_host_,
-                                  n * sizeof(std::int32_t),
-                                  hipMemcpyHostToDevice, stream_),
-               "token upload", error_msg)) {
-      return false;
-    }
-    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-                s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
-    session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
-                                 c.hc_count, stream_);
-  }
-  const auto& layers = model_->layers();
-  bool normed = false;  ///< xn holds the next mixer's grouped norm of res
-  // Large wide-prefill chunks keep the residual in F16 between the combines,
-  // which halves the combine kernels' DRAM traffic (the normalized xn is still
-  // formed from the unrounded sum). Wherever the residual is read as F32 (the
-  // first mixer norm, the PLE layer, the head and MTP after the last layer)
-  // it is converted back first. Decode and verification keep F32.
-  constexpr std::uint32_t kResidualHalfMinRows = 1024;
-  const bool res_half_mode =
-      prefill_phase && wide_mixer_ && MatrixRows(n) && !speculative &&
-      n >= kResidualHalfMinRows && c.hc_count == 4 &&
-      c.hidden_size % 128 == 0 && c.hidden_size <= 2560;
-  bool res_is_half = false;
-  const std::size_t res_count = static_cast<std::size_t>(n) * c.HcDim();
-  const auto residual_to_half = [&] {
-    ResidualToHalf(s_.res, s_.res_h, res_count, stream_);
-    res_is_half = true;
+  const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
+  const std::uint32_t start_pos = session.position_;
+  const std::uint32_t b_start = start_pos + nA;
+  const std::uint32_t end_pos = start_pos + n;
+
+  auto compute = [&](std::uint32_t start, std::uint32_t count,
+                     std::uint32_t prev_blocks, bool* sparse,
+                     std::uint32_t* complete, std::uint32_t* pool_grid) {
+    *sparse = c.compress_ratio > 0 && start + count > c.indexer_top_k;
+    *complete = c.compress_ratio > 0 ? (start + count) / c.compress_ratio : 0;
+    *pool_grid =
+        *sparse && *complete > prev_blocks ? *complete - prev_blocks : 0;
   };
-  const auto residual_to_float = [&] {
-    ResidualToFloat(s_.res_h, s_.res, res_count, stream_);
-    res_is_half = false;
-  };
-  const auto combine_rows = [&](const float* gamma, std::uint32_t rows,
-                                const DeviceMixer* next) {
-    Combine(res_is_half ? static_cast<void*>(s_.res_h)
-                        : static_cast<void*>(s_.res),
-            gamma, rows, res_is_half, next);
-  };
-  if (res_half_mode) {
-    residual_to_half();
-  }
-  for (std::uint32_t il = first_layer; il < end_layer; ++il) {
-    if (!session.CheckCancellation(error_msg))
-      return false;
-    const DeviceLayer& l = layers[il];
-    if (c.IsPleLayer(il)) {
-      if (res_is_half) {
-        residual_to_float();
-      }
-      if (!Ple(l, session, n, s_.res, speculative, error_msg, false,
-               checkpoint)) {
+
+  bool a_sparse = false;
+  bool b_sparse = false;
+  std::uint32_t a_complete = 0;
+  std::uint32_t b_complete = 0;
+  std::uint32_t a_pool = 0;
+  std::uint32_t b_pool = 0;
+  compute(start_pos, nA, session.blocks_, &a_sparse, &a_complete, &a_pool);
+  const std::uint32_t blocks_after_a = a_sparse ? a_complete : session.blocks_;
+  compute(b_start, nB, blocks_after_a, &b_sparse, &b_complete, &b_pool);
+  const std::uint32_t blocks_after_b = b_sparse ? b_complete : blocks_after_a;
+
+  const std::span<const std::int32_t> tokensA = tokens.first(nA);
+  const std::span<const std::int32_t> tokensB = tokens.subspan(nA);
+
+  BankCache a_cache{};
+  BankCache b_cache{};
+  bool a_normed = false;
+  bool a_res_half = false;
+  bool b_normed = false;
+  bool b_res_half = false;
+
+  const std::uint32_t first_last =
+      c.ple_layer >= 0 ? static_cast<std::uint32_t>(c.ple_layer) + 1 : 1;
+
+  auto run = [&](const Scratch& scratch, Session::Control* control,
+                 std::int32_t* host_tokens, std::uint32_t start,
+                 std::uint32_t count, std::uint32_t blocks,
+                 std::uint32_t pool_grid, std::uint32_t first,
+                 std::uint32_t last, std::uint32_t out_logits, bool download,
+                 bool convert_exit, bool* normed, bool* res_half) -> bool {
+    SetScratchHost(scratch, control, host_tokens);
+    LoadCache(BankCache{});
+    if (c.ple_layer >= 0 && first == 0) {
+      const std::span<const std::int32_t> bank_tokens =
+          start == start_pos ? tokensA : tokensB;
+      if (!PleFetch(session, bank_tokens, false, error_msg))
         return false;
-      }
     }
-    // Both stacked SSM projections consume the same F16 input. Avoid writing
-    // unused F32/Q8 copies when the wide mixer can supply that input directly.
-    const bool half_only =
-        prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
-        DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
-        l.ssm_alpha_beta.cols == l.ssm_in.cols;
-    if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-               half_only)) {
+    SetGuardTokens(count);
+    bool out_n = false;
+    bool out_r = false;
+    const bool ok = ForwardBodyRange(
+        session, count, out_logits, download, false,
+        start == start_pos ? a_sparse : b_sparse, start, pool_grid, first, last,
+        error_msg, nullptr, *normed, *res_half, first == 0, convert_exit,
+        first != 0, &out_n, &out_r);
+    *normed = out_n;
+    *res_half = out_r;
+    // Only the prefix range consumes the single-buffered PLE staging rows.
+    if (first == 0 &&
+        !Check(hipStreamSynchronize(stream_), "two-bank range", error_msg))
       return false;
-    }
-    // The last target layer's query outputs have no later cache consumer.
-    // Preserve all K/V/indexer rows and the final query's original tile.
-    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
-                                il + 1 == c.num_layers && n >= 1024 &&
-                                n_logits == 1 && checkpoint == nullptr;
-    if (l.linear) {
-      const auto capture =
-          checkpoint ? GdnCheckpoint{checkpoint->state->linear_[il].state,
-                                     checkpoint->state->linear_[il].conv_state,
-                                     checkpoint->tokens}
-                     : GdnCheckpoint{};
-      if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
-                           speculative, error_msg, false, true, capture)) {
+    return ok;
+  };
+
+  try {
+    // Bank A prefix.
+    a_normed = false;
+    a_res_half = false;
+    if (!run(saved_scratch, saved_control_host, saved_tokens_host, start_pos,
+             nA, session.blocks_, a_pool, 0, first_last, 0, false,
+             first_last == c.num_layers, &a_normed, &a_res_half))
+      return false;
+    SaveCache(&a_cache);
+    a_cache.normed = a_normed;
+    a_cache.res_is_half = a_res_half;
+
+    // Bank B prefix.
+    b_normed = false;
+    b_res_half = false;
+    if (!run(bank_b_scratch_, bank_b_control_host_, bank_b_tokens_host_,
+             b_start, nB, blocks_after_a, b_pool, 0, first_last, n_logits, true,
+             first_last == c.num_layers, &b_normed, &b_res_half))
+      return false;
+    SaveCache(&b_cache);
+    b_cache.normed = b_normed;
+    b_cache.res_is_half = b_res_half;
+
+    // Lock-step suffix.
+    for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
+      const bool last = il + 1 == c.num_layers;
+
+      a_normed = a_cache.normed;
+      a_res_half = a_cache.res_is_half;
+      if (!run(saved_scratch, saved_control_host, saved_tokens_host, start_pos,
+               nA, session.blocks_, a_pool, il, il + 1, 0, false, last,
+               &a_normed, &a_res_half))
         return false;
-      }
-    } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
-                          &session.control_->position,
-                          &session.control_->blocks, start_pos, pool_grid,
-                          session.max_context_, sparse, error_msg,
-                          last_attention, false, true,
-                          checkpoint ? checkpoint->tokens : 0)) {
+      SaveCache(&a_cache);
+      a_cache.normed = a_normed;
+      a_cache.res_is_half = a_res_half;
+
+      b_normed = b_cache.normed;
+      b_res_half = b_cache.res_is_half;
+      if (!run(bank_b_scratch_, bank_b_control_host_, bank_b_tokens_host_,
+               b_start, nB, blocks_after_a, b_pool, il, il + 1, n_logits, true,
+               last, &b_normed, &b_res_half))
+        return false;
+      SaveCache(&b_cache);
+      b_cache.normed = b_normed;
+      b_cache.res_is_half = b_res_half;
+    }
+
+    if (const NpuGemm* npu = model_->npu(); npu != nullptr && !npu->Healthy()) {
+      AssignError(error_msg,
+                  "NPU run timed out; the batch result is discarded");
       return false;
     }
 
-    const float* next_norm =
-        il + 1 < c.num_layers
-            ? (c.IsPleLayer(il + 1) ? nullptr
-                                    : layers[il + 1].hc_attn.norm.f32())
-            : nullptr;
-    // Cache updates precede the FFN. Without MTP, only requested head rows
-    // and the checkpoint frontier consume the final layer's residual.
-    // Keep aligned tiles and at least 96 rows to retain the wide arithmetic.
-    const auto needed =
-        std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
-    const auto skipped = prefill_phase && !session.mtp_enabled_ &&
-                                 !res_half_mode && il + 1 == c.num_layers &&
-                                 n > needed
-                             ? (n - needed) / 128 * 128
-                             : 0U;
-    const auto finish = [&](std::uint32_t rows) {
-      // Each combine also norms the residual for the mixer that follows it,
-      // unless PLE rewrites the residual first.
-      if (res_half_mode && !res_is_half) {
-        residual_to_half();
-      }
-      combine_rows(l.hc_ffn.norm.f32(), rows, &l.hc_ffn);
-      if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, rows,
-                 error_msg) ||
-          !Moe(l, s_.mixed, s_.block_out, rows, error_msg))
-        return false;
-      if (next_norm == nullptr && res_is_half) {
-        residual_to_float();  // PLE rewrites the residual in F32 next
-      }
-      combine_rows(next_norm, rows,
-                   next_norm != nullptr ? &layers[il + 1].hc_attn : nullptr);
-      return true;
-    };
-    if (skipped != 0) {
-      struct RestoreScratch {
-        const Executor* executor;
-        Scratch scratch;
-        ~RestoreScratch() { executor->UseScratch(scratch); }
-      } restore{this, s_};
-      auto tail = RowScratch(s_, skipped);
-      tail.inject =
-          s_.inject + std::size_t{skipped} * c.hc_count * inject_parts_;
-      UseScratch(tail);
-      if (!finish(n - skipped))
-        return false;
-    } else if (!finish(n)) {
-      return false;
+    if (n_logits > 0 && logits != nullptr) {
+      std::copy_n(logits_host_,
+                  static_cast<std::size_t>(n_logits) * c.vocab_size, logits);
     }
-    normed = next_norm != nullptr;
-  }
-  if (res_is_half) {
-    residual_to_float();
-  }
-  if (end_layer < c.num_layers) {
+
+    if (session.mtp_enabled_) {
+      PrefillPhase draft_phase(false);
+
+      session.position_ = b_start;
+      session.blocks_ = blocks_after_a;
+      a_normed = a_cache.normed;
+      a_res_half = a_cache.res_is_half;
+      SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
+      LoadCache(a_cache);
+      if (!MtpForward(session, tokensA.subspan(1), 0, {.kv_only = true},
+                      error_msg, saved_scratch.res))
+        return false;
+
+      session.position_ = end_pos;
+      session.blocks_ = blocks_after_b;
+      b_normed = b_cache.normed;
+      b_res_half = b_cache.res_is_half;
+      SetScratchHost(bank_b_scratch_, bank_b_control_host_,
+                     bank_b_tokens_host_);
+      LoadCache(b_cache);
+      if (!MtpForward(session, tokensB.subspan(1), 0, {.kv_only = true},
+                      error_msg, bank_b_scratch_.res))
+        return false;
+    }
+
+    session.position_ = end_pos;
+    session.blocks_ = blocks_after_b;
+    session.spec_base_ = b_start;
+    session.spec_tokens_ = 0;
+    pinned_inputs.completed = true;
+    SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
+    LoadCache(saved_cache);
     return true;
+  } catch (...) {
+    SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
+    LoadCache(saved_cache);
+    throw;
   }
-  if (checkpoint) {
-    if (checkpoint->hidden_rows != 0 &&
-        !Check(hipMemcpyAsync(checkpoint->state->mtp_.target_hidden,
-                              s_.res + std::size_t{checkpoint->tokens -
-                                                   checkpoint->hidden_rows} *
-                                           c.HcDim(),
-                              std::size_t{checkpoint->hidden_rows} * c.HcDim() *
-                                  sizeof(float),
-                              hipMemcpyDeviceToDevice, stream_),
-               "checkpoint hidden rows", error_msg))
-      return false;
-    PrefillPhase head_phase(false);
-    if (!HcMix(model_->hc_head(),
-               s_.res + std::size_t{checkpoint->tokens - 1} * c.HcDim(), false,
-               s_.mixed, nullptr, 1, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg) ||
-        !Check(hipMemcpyAsync(checkpoint->logits.data(), s_.logits,
-                              std::size_t{c.vocab_size} * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
-               "checkpoint logits", error_msg))
-      return false;
-  }
-  // Prefill catches up immediately from shared scratch. Only the short tail
-  // needed across calls belongs to this session.
-  const auto kept = std::min(
-      checkpoint && checkpoint->tokens < n ? n - checkpoint->tokens : n,
-      options_.max_speculative);
-  if (session.mtp_enabled_ &&
-      !Check(GuardedMemcpyAsync(
-                 GUFO_SITE, session.mtp_.target_hidden,
-                 s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
-                 static_cast<std::size_t>(kept) * c.HcDim() * sizeof(float),
-                 hipMemcpyDeviceToDevice, stream_),
-             "hidden keep", error_msg)) {
-    return false;
-  }
-  if (n_logits > 0) {
-    PrefillPhase head_phase(false);
-    // Only the requested tail needs the head's normalization.
-    const std::size_t skip = static_cast<std::size_t>(n - n_logits);
-    const DeviceMixer& head = model_->hc_head();
-    if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
-               n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
-      return false;
-    }
-    if (download_logits &&
-        !Check(GuardedMemcpyAsync(GUFO_SITE, logits_host_, s_.logits,
-                                  static_cast<std::size_t>(n_logits) *
-                                      c.vocab_size * sizeof(float),
-                                  hipMemcpyDeviceToHost, stream_),
-               "logits download", error_msg)) {
-      return false;
-    }
-    if (const char* dump = std::getenv("GUFO_LOGIT_DUMP");
-        dump != nullptr && n_logits > 0 &&
-        Check(hipStreamSynchronize(stream_), "logit dump", error_msg)) {
-      if (std::FILE* f = std::fopen(dump, "ab")) {
-        std::fwrite(logits_host_ +
-                        static_cast<std::size_t>(n_logits - 1) * c.vocab_size,
-                    sizeof(float), c.vocab_size, f);
-        std::fclose(f);
-      }
-    }
-  }
-  return true;
 }
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,

@@ -669,9 +669,21 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         rest.size() <= exec.max_batch() ? exec.max_batch()
                                         : model_->PrefillCapacity(),
         rest.size()));
-    if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
-                      capture.get(), next)) {
-      return false;
+    bool used_pair = false;
+    if (prefill && capture == nullptr) {
+      std::uint32_t nA = 0;
+      std::uint32_t nB = 0;
+      if (exec.CanForwardPair(*session_, n, 1, &nA, &nB)) {
+        if (!exec.ForwardPair(*session_, chunk, 1, logits_.data(), error_msg))
+          return false;
+        used_pair = true;
+      }
+    }
+    if (!used_pair) {
+      if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
+                        capture.get(), next)) {
+        return false;
+      }
     }
     const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
     hidden_base_ = static_cast<std::uint32_t>(

@@ -232,6 +232,8 @@ public:
   };
 
   ~Executor();
+  // ForwardPair uses lazily allocated bank B buffers; they are freed by
+  // the destructor below.
   [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
@@ -265,6 +267,14 @@ public:
   /// prompt: once its own n-gram rows have arrived it starts reading the
   /// next chunk's, so that read overlaps this chunk's layers. The rows are
   /// used only if the next batch has exactly those tokens.
+  [[nodiscard]] bool ForwardPair(Session& session,
+                                 std::span<const std::int32_t> tokens,
+                                 std::uint32_t n_logits, float* logits,
+                                 std::string* error_msg);
+  [[nodiscard]] bool CanForwardPair(const Session& session, std::size_t n,
+                                    std::uint32_t n_logits, std::uint32_t* nA,
+                                    std::uint32_t* nB,
+                                    std::string* error_msg = nullptr) const;
   [[nodiscard]] bool Forward(Session& session,
                              std::span<const std::int32_t> tokens,
                              std::uint32_t n_logits, float* logits,
@@ -521,6 +531,7 @@ private:
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, bool full_vocab, std::string* error_msg) const;
+
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -528,6 +539,15 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
                    PrefillCheckpoint* checkpoint = nullptr) const;
+  bool ForwardBodyRange(Session& session, std::uint32_t n,
+                        std::uint32_t n_logits, bool download_logits,
+                        bool speculative, bool sparse, std::uint32_t start_pos,
+                        std::uint32_t pool_grid, std::uint32_t first_layer,
+                        std::uint32_t end_layer, std::string* error_msg,
+                        PrefillCheckpoint* checkpoint, bool initial_normed,
+                        bool initial_res_half, bool convert_at_entry,
+                        bool convert_at_exit, bool upload_control,
+                        bool* out_normed, bool* out_res_is_half) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
@@ -650,6 +670,17 @@ private:
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
+
+  void SetScratchHost(const Scratch& scratch, Session::Control* control,
+                      std::int32_t* tokens);
+  [[nodiscard]] bool AllocateScratch(std::size_t T, Scratch* out,
+                                     const Scratch* base,
+                                     std::string* error_msg);
+  [[nodiscard]] bool EnsureBankBScratch(std::string* error_msg);
+  mutable Scratch bank_b_scratch_{};
+  bool bank_b_allocated_{false};
+  Session::Control* bank_b_control_host_{nullptr};
+  std::int32_t* bank_b_tokens_host_{nullptr};
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
   bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
@@ -790,6 +821,32 @@ private:
     std::uint32_t n{0};
     std::uint32_t k{0};
   };
+  struct BankCache {
+    const float* half_src_{nullptr};
+    std::uint32_t half_rows_{0};
+    std::uint32_t half_cols_{0};
+    bool half_bf16_{false};
+
+    const float* q8t_src_{nullptr};
+    std::uint32_t q8t_rows_{0};
+    std::uint32_t q8t_cols_{0};
+
+    ReadyRows xn_q8_ready_{};
+    ReadyRows mixed_q8_ready_{};
+
+    bool shexp_half_ready_{false};
+    bool moe_pending_{false};
+    bool xn_half_{false};
+    bool inject_fused_{false};
+    const float* inject_fused_w_{nullptr};
+    std::uint32_t inject_parts_{1};
+    unsigned q8_slot_{0};
+
+    bool normed{false};
+    bool res_is_half{false};
+  };
+  void SaveCache(BankCache* cache) const;
+  void LoadCache(const BankCache& cache) const;
   mutable ReadyRows xn_q8_ready_;
   mutable ReadyRows mixed_q8_ready_;
 };
