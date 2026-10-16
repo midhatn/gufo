@@ -541,7 +541,8 @@ extern "C" int qfn_mmq_dense_vec(int weight_type, const void* W,
   constexpr const char* tag = "qfn_mmq_dense_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q6_K) {
+      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q4_1 &&
+      type != GGML_TYPE_Q6_K) {
     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
     return -1;
   }

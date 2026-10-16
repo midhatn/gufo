@@ -358,6 +358,9 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
 
 bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
                        hipStream_t stream);
+/// Re-encodes `blocks` Q8_0 blocks as Q4_1 (20 bytes each) for the decode GEMV.
+bool RequantQ8_0ToQ4_1(const void* src, void* dst, std::size_t blocks,
+                       hipStream_t stream);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
 /// F32 K16 chain per output. Token t's chain starts ((t / 32) % 4) * 128
 /// elements into K and wraps: hipBLASLt's MT32x32x64 order (BlasLt::Gemm).

@@ -550,9 +550,16 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
   }
   // Decode reads each large dense matrix once per round, so its bytes set the
-  // round's cost: a 5-bit copy cuts them by 29%. GUFO_DECODE_Q5=0 disables it.
-  if (const char* flag = std::getenv("GUFO_DECODE_Q5");
-      flag == nullptr || flag[0] != '0') {
+  // round's cost: a 4-bit (Q4_1) copy cuts them by 41% and a 5-bit copy by 29%.
+  // GUFO_DECODE_Q4=0 selects the Q5_1 copy instead; GUFO_DECODE_Q5=0 disables
+  // the copies altogether.
+  const char* q5_flag = std::getenv("GUFO_DECODE_Q5");
+  const bool q5_on = q5_flag == nullptr || q5_flag[0] != '0';
+  const char* q4_flag = std::getenv("GUFO_DECODE_Q4");
+  const bool q4_on = q5_on && (q4_flag == nullptr || q4_flag[0] != '0');
+  if (q4_on || q5_on) {
+    const std::size_t blk_bytes = q4_on ? 20 : 24;
+    const auto dec_type = q4_on ? core::GgmlType::kQ4_1 : core::GgmlType::kQ5_1;
     constexpr std::size_t kMinElements = std::size_t{2560} * 6144;
     std::size_t copied = 0;
     const auto add = [&](DeviceTensor& t) {
@@ -562,15 +569,20 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       const std::size_t blocks = std::size_t{t.rows} * t.cols / 32;
       void* copy = nullptr;
-      if (hipMalloc(&copy, blocks * 24 + kTailMargin) != hipSuccess) {
+      if (hipMalloc(&copy, blocks * blk_bytes + kTailMargin) != hipSuccess) {
         return;  // the tensor keeps its Q8_0 decode path
       }
       m->allocations_.push_back(copy);
-      RecordAllocation("decode_q5_1", copy, blocks * 24 + kTailMargin);
-      m->bytes_ += blocks * 24 + kTailMargin;
-      copied += blocks * 24;
-      if (RequantQ8_0ToQ5_1(t.data, copy, blocks, nullptr)) {
+      RecordAllocation(q4_on ? "decode_q4_1" : "decode_q5_1", copy,
+                       blocks * blk_bytes + kTailMargin);
+      m->bytes_ += blocks * blk_bytes + kTailMargin;
+      copied += blocks * blk_bytes;
+      const bool done = q4_on
+                            ? RequantQ8_0ToQ4_1(t.data, copy, blocks, nullptr)
+                            : RequantQ8_0ToQ5_1(t.data, copy, blocks, nullptr);
+      if (done) {
         t.decode_data = copy;
+        t.decode_type = dec_type;
       }
     };
     for (auto& l : m->layers_) {
@@ -585,7 +597,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       return nullptr;
     }
-    std::fprintf(stderr, "decode Q5_1 copies: %.2f GiB\n",
+    std::fprintf(stderr, "decode %s copies: %.2f GiB\n",
+                 q4_on ? "Q4_1" : "Q5_1",
                  static_cast<double>(copied) / (1024.0 * 1024.0 * 1024.0));
   }
 #ifdef GUFO_NPU

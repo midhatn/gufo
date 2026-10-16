@@ -1627,11 +1627,11 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
       AssignError(error_msg, "quantized input width mismatch");
       return false;
     }
-    if (qfn_mmq_dense_vec(static_cast<int>(GgmlType::kQ5_1), w.decode_data, q.x,
+    if (qfn_mmq_dense_vec(static_cast<int>(w.decode_type), w.decode_data, q.x,
                           out, static_cast<int>(w.rows),
                           static_cast<int>(w.cols), static_cast<int>(q.n),
                           stream_) != 0) {
-      AssignError(error_msg, "Q5_1 decode GEMV failed");
+      AssignError(error_msg, "decode GEMV failed");
       return false;
     }
     return true;
