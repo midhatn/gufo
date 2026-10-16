@@ -1272,7 +1272,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         e->options_.max_batch / npu->tokens(), 1, kMaxGroups);
     for (std::uint32_t g = 0; g < groups; ++g) {
       const int a = npu->NewBuffer(npu->ABytes(), &npu_error);
-      bool ok = a >= 0;
+      const int a_lo = npu->NewBuffer(npu->ABytes(), &npu_error);
+      bool ok = a >= 0 && a_lo >= 0;
       std::vector<int> cs;
       for (std::uint32_t i = 0; i < kNpuSlicesMax && ok; ++i) {
         const int id = npu->NewBuffer(npu->CBytes(), &npu_error);
@@ -1281,12 +1282,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       }
       if (!ok) {
         e->npu_a_.clear();
+        e->npu_a_lo_.clear();
         e->npu_c_.clear();
         std::fprintf(stderr, "NPU buffers unavailable: %s\n",
                      npu_error.c_str());
         break;
       }
       e->npu_a_.push_back(a);
+      e->npu_a_lo_.push_back(a_lo);
       e->npu_c_.insert(e->npu_c_.end(), cs.begin(), cs.end());
     }
     if (!e->npu_c_.empty()) {
@@ -3179,6 +3182,15 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       npu->Submit(stream_, npu_a_[g], l.npu_shexp.data(),
                   npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax,
                   2);
+      // The residual of the first encoding runs as a second pass.
+      NpuEncodeActivations(
+          static_cast<const __half*>(s_.x_half) +
+              static_cast<std::size_t>(g) * group_tokens * l.shexp_up.cols,
+          l.shexp_up.cols, group_tokens, npu->k(), 0, npu->k(),
+          npu->Device(npu_a_lo_[g]), stream_, true);
+      npu->Submit(
+          stream_, npu_a_lo_[g], l.npu_shexp.data(),
+          npu_c_.data() + static_cast<std::size_t>(g) * kNpuSlicesMax + 2, 2);
     }
   } else if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                          &l.shexp_down, error_msg)) {
@@ -3230,7 +3242,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     const std::size_t base = static_cast<std::size_t>(g) * group_tokens * ff;
     const std::size_t c0 = static_cast<std::size_t>(g) * kNpuSlicesMax;
     NpuSwiglu(npu->Staged(stream_, npu_c_[c0]),
-              npu->Staged(stream_, npu_c_[c0 + 1]), s_.shexp_half + base,
+              npu->Staged(stream_, npu_c_[c0 + 1]),
+              npu->Staged(stream_, npu_c_[c0 + 2]),
+              npu->Staged(stream_, npu_c_[c0 + 3]), s_.shexp_half + base,
               group_tokens, npu->n(), ff, stream_);
   }
   if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,

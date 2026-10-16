@@ -759,6 +759,7 @@ private:
   /// when the NPU is not in use.
   /// One A buffer and kNpuSlicesMax C buffers per 4096-token group of a chunk.
   std::vector<int> npu_a_;
+  std::vector<int> npu_a_lo_;
   std::vector<int> npu_c_;
   /// Device table of the C streams' GPU pointers, [group][kNpuSlicesMax]; the
   /// GDN epilogue reads z from them directly. Null when unavailable.

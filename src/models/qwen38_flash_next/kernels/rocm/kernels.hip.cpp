@@ -7574,6 +7574,7 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
 // row-major blocks, B tiles column-major over (K, N) with 1x2 super blocks of
 // 8x8 column-major blocks, C tiles (512 x 128) row-major with 2x2 super blocks.
 
+template<bool kResidual = false>
 __device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
   unsigned max_exp = 0;
 #pragma unroll
@@ -7582,6 +7583,19 @@ __device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
   }
   // 2^(133 - max_exp), the exact reciprocal of the group's mantissa unit.
   const float inv = __uint_as_float(max_exp >= 7 ? (260u - max_exp) << 23 : 0u);
+  if constexpr (kResidual) {
+    // The part of the group the high encoding cannot hold, encoded alone.
+    const float unit =
+        __uint_as_float(max_exp >= 7 ? (max_exp - 6u) << 23 : 0u);
+    float r[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const float q = fminf(127.0F, fmaxf(-128.0F, rintf(v[i] * inv)));
+      r[i] = v[i] - q * unit;
+    }
+    NpuEncodeGroup<false>(r, out);
+    return;
+  }
   out[0] = static_cast<std::uint8_t>(max_exp);
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
@@ -7592,6 +7606,7 @@ __device__ inline void NpuEncodeGroup(const float* v, std::uint8_t* out) {
 
 /// One block per A tile: coalesced 16-byte loads into LDS, then four groups
 /// per thread. Columns at or past k_valid encode as zero (K padding).
+template<bool kResidual>
 __global__ void __launch_bounds__(256)
     NpuEncodeActivationsKernel(const __half* __restrict__ x,
                                std::uint8_t* __restrict__ out,
@@ -7633,7 +7648,7 @@ __global__ void __launch_bounds__(256)
     for (int i = 0; i < 8; ++i) {
       v[i] = __half2float(h[i]);
     }
-    NpuEncodeGroup(v, staged + gi * 9);
+    NpuEncodeGroup<kResidual>(v, staged + gi * 9);
   }
   __syncthreads();
   const uint4* src = reinterpret_cast<const uint4*>(staged);
@@ -7746,6 +7761,8 @@ __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
 /// in between.
 __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
                                 const std::uint8_t* __restrict__ up_in,
+                                const std::uint8_t* __restrict__ gate_lo,
+                                const std::uint8_t* __restrict__ up_lo,
                                 __half* __restrict__ out, std::uint32_t tokens,
                                 std::uint32_t cols, std::uint32_t valid_cols) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
@@ -7773,37 +7790,56 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
   const std::uint8_t* pu = up_in + g * 9;
   const float mg = ldexpf(1.0F, static_cast<int>(pg[0]) - 127) / 64.0F;
   const float mu = ldexpf(1.0F, static_cast<int>(pu[0]) - 127) / 64.0F;
+  const std::uint8_t* pgl = gate_lo != nullptr ? gate_lo + g * 9 : pg;
+  const std::uint8_t* pul = up_lo != nullptr ? up_lo + g * 9 : pu;
+  const float mgl = ldexpf(1.0F, static_cast<int>(pgl[0]) - 127) / 64.0F;
+  const float mul = ldexpf(1.0F, static_cast<int>(pul[0]) - 127) / 64.0F;
   __half2 packed[4];
 #pragma unroll
   for (int i = 0; i < 8; i += 2) {
-    const float g0 = static_cast<float>(static_cast<std::int8_t>(pg[1 + i])) * mg;
-    const float g1 = static_cast<float>(static_cast<std::int8_t>(pg[2 + i])) * mg;
-    const float u0 = static_cast<float>(static_cast<std::int8_t>(pu[1 + i])) * mu;
-    const float u1 = static_cast<float>(static_cast<std::int8_t>(pu[2 + i])) * mu;
+    float g0 = static_cast<float>(static_cast<std::int8_t>(pg[1 + i])) * mg;
+    float g1 = static_cast<float>(static_cast<std::int8_t>(pg[2 + i])) * mg;
+    float u0 = static_cast<float>(static_cast<std::int8_t>(pu[1 + i])) * mu;
+    float u1 = static_cast<float>(static_cast<std::int8_t>(pu[2 + i])) * mu;
+    if (gate_lo != nullptr) {
+      g0 += static_cast<float>(static_cast<std::int8_t>(pgl[1 + i])) * mgl;
+      g1 += static_cast<float>(static_cast<std::int8_t>(pgl[2 + i])) * mgl;
+      u0 += static_cast<float>(static_cast<std::int8_t>(pul[1 + i])) * mul;
+      u1 += static_cast<float>(static_cast<std::int8_t>(pul[2 + i])) * mul;
+    }
     packed[i / 2] = __floats2half2_rn(SiluF(g0) * u0, SiluF(g1) * u1);
   }
   *reinterpret_cast<uint4*>(out + row * valid_cols + col) =
       *reinterpret_cast<const uint4*>(packed);
 }
 
-void NpuSwiglu(const void* gate, const void* up, __half* out,
-               std::uint32_t tokens, std::uint32_t cols,
-               std::uint32_t valid_cols, hipStream_t stream) {
+void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
+               const void* up_lo, __half* out, std::uint32_t tokens,
+               std::uint32_t cols, std::uint32_t valid_cols,
+               hipStream_t stream) {
   const std::size_t groups = std::size_t{tokens} * cols / 8;
   hipLaunchKernelGGL(NpuSwigluKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
                      stream, static_cast<const std::uint8_t*>(gate),
-                     static_cast<const std::uint8_t*>(up), out, tokens, cols,
+                     static_cast<const std::uint8_t*>(up),
+                     static_cast<const std::uint8_t*>(gate_lo),
+                     static_cast<const std::uint8_t*>(up_lo), out, tokens, cols,
                      valid_cols);
 }
 
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
                           std::uint32_t tokens, std::uint32_t k_slice,
                           std::uint32_t k_offset, std::uint32_t k_valid,
-                          void* dst, hipStream_t stream) {
-  hipLaunchKernelGGL(NpuEncodeActivationsKernel,
-                     dim3((tokens / kNpuTileM) * (k_slice / kNpuTileK)),
-                     dim3(256), 0, stream, x, static_cast<std::uint8_t*>(dst),
-                     k_slice, k_offset, k_valid, ldx);
+                          void* dst, hipStream_t stream, bool residual) {
+  const dim3 grid((tokens / kNpuTileM) * (k_slice / kNpuTileK));
+  if (residual) {
+    hipLaunchKernelGGL(NpuEncodeActivationsKernel<true>, grid, dim3(256), 0,
+                       stream, x, static_cast<std::uint8_t*>(dst), k_slice,
+                       k_offset, k_valid, ldx);
+    return;
+  }
+  hipLaunchKernelGGL(NpuEncodeActivationsKernel<false>, grid, dim3(256), 0,
+                     stream, x, static_cast<std::uint8_t*>(dst), k_slice,
+                     k_offset, k_valid, ldx);
 }
 
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
