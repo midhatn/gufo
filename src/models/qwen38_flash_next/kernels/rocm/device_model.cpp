@@ -562,9 +562,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const auto dec_type = q4_on ? core::GgmlType::kQ4_1 : core::GgmlType::kQ5_1;
     constexpr std::size_t kMinElements = std::size_t{2560} * 6144;
     std::size_t copied = 0;
-    const auto add = [&](DeviceTensor& t) {
+    const auto add = [&](DeviceTensor& t, std::size_t min_elements) {
       if (t.type != core::GgmlType::kQ8_0 || t.data == nullptr ||
-          t.cols % 32 != 0 || std::size_t{t.rows} * t.cols < kMinElements) {
+          t.cols % 32 != 0 || std::size_t{t.rows} * t.cols < min_elements) {
         return;
       }
       const std::size_t blocks = std::size_t{t.rows} * t.cols / 32;
@@ -585,11 +585,20 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         t.decode_type = dec_type;
       }
     };
+    // The four 320 x 10240 hyper-connection projections of every layer are
+    // 14% of the bytes decode reads.
+    constexpr std::size_t kHcElements = std::size_t{320} * 10240;
     for (auto& l : m->layers_) {
-      add(l.ssm_in);
-      add(l.ssm_out);
-      add(l.attn_qkv);
-      add(l.attn_out);
+      add(l.ssm_in, kMinElements);
+      add(l.ssm_out, kMinElements);
+      add(l.attn_qkv, kMinElements);
+      add(l.attn_out, kMinElements);
+      if (q4_on) {
+        for (DeviceMixer* mixer : {&l.hc_attn, &l.hc_ffn}) {
+          add(mixer->down, kHcElements);
+          add(mixer->up, kHcElements);
+        }
+      }
     }
     if (hipDeviceSynchronize() != hipSuccess) {
       if (error_msg != nullptr) {

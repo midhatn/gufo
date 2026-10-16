@@ -770,6 +770,95 @@ static void launch_q8_hc_down(const void* weights, const void* input,
     }
 }
 
+// The same projection from a Q4_1 copy of the weights (2.05 MB against 3.5 MB):
+// four lanes share a block, each taking one int of its 16 code bytes (four low
+// nibbles, weights 4p.., and four high nibbles, weights 16 + 4p..). The block's
+// m * s term is added once, by the first lane.
+template<int tokens>
+__launch_bounds__(32) __global__
+    static void qfn_q4_1_hc_down_kernel(const block_q4_1* __restrict__ weights,
+                                        const block_q8_1* __restrict__ input,
+                                        float* __restrict__ output) {
+  constexpr int blocks = 10240 / QK4_1;
+  constexpr int prefetch = tokens == 1 ? 4 : 2;
+  const int lane = threadIdx.x;
+  const int part = lane & 3;
+  float sum[tokens] = {};
+  for (int first = lane / 4; first < blocks; first += 8 * prefetch) {
+    int v[prefetch], u[prefetch][tokens][2];
+    float dw[prefetch], mw[prefetch], dx[prefetch][tokens],
+        sx[prefetch][tokens];
+#pragma unroll
+    for (int j = 0; j < prefetch; ++j) {
+      const int kb = first + 8 * j;
+      const auto& w = weights[blockIdx.x * blocks + kb];
+      dw[j] = __low2float(w.dm);
+      mw[j] = __high2float(w.dm);
+      v[j] = get_int_b4(w.qs, part);
+#pragma unroll
+      for (int t = 0; t < tokens; ++t) {
+        const auto& x = input[t * blocks + kb];
+        dx[j][t] = __low2float(x.ds);
+        sx[j][t] = __high2float(x.ds);
+        u[j][t][0] = get_int_b4(x.qs, part);
+        u[j][t][1] = get_int_b4(x.qs, part + 4);
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int j = 0; j < prefetch; ++j) {
+#pragma unroll
+      for (int t = 0; t < tokens; ++t) {
+        int dot = ggml_hip_dp4a(v[j] & 0x0F0F0F0F, u[j][t][0], 0);
+        dot = ggml_hip_dp4a((v[j] >> 4) & 0x0F0F0F0F, u[j][t][1], dot);
+        sum[t] += dw[j] * dx[j][t] * static_cast<float>(dot);
+        if (part == 0) {
+          sum[t] += mw[j] * sx[j][t];
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < tokens; ++t) {
+    sum[t] = warp_reduce_sum<32>(sum[t]);
+    if (lane == 0)
+      output[t * 320 + blockIdx.x] = sum[t];
+  }
+}
+
+template<int tokens = 1>
+static void launch_q4_1_hc_down(const void* weights, const void* input,
+                                float* output, int rows, hipStream_t stream) {
+  if (rows == tokens) {
+    qfn_q4_1_hc_down_kernel<tokens>
+        <<<320, 32, 0, stream>>>(static_cast<const block_q4_1*>(weights),
+                                 static_cast<const block_q8_1*>(input), output);
+  } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+    launch_q4_1_hc_down<tokens + 1>(weights, input, output, rows, stream);
+  }
+}
+
+extern "C" int qfn_mmq_q4_1_dense_vec_preq(const void* W, const void* X_q8,
+                                           float* out_f32, int M, int N, int K,
+                                           hipStream_t stream) {
+  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || N > MMVQ_MAX_BATCH_SIZE ||
+      K <= 0 || K % QK4_1 != 0) {
+    fprintf(stderr,
+            "qfn_mmq_q4_1_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
+            K);
+    return -1;
+  }
+  if (M == 320 && K == 10240) {
+    launch_q4_1_hc_down(W, X_q8, out_f32, N, stream);
+    return hipGetLastError() == hipSuccess ? 0 : -3;
+  }
+  const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
+  mul_mat_vec_dense_dispatch(W, GGML_TYPE_Q4_1,
+                             static_cast<const block_q8_1*>(X_q8), out_f32, K,
+                             M, N, input_stride, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            const void* X_q8, float* out_f32,
                                            int M, int N, int K,
