@@ -456,6 +456,71 @@ static void dispatch_dense(const void* weights, const block_q8_1* input,
   }
 }
 
+// Shared-expert gate/up pair from Q4_1 weights: one 32-lane block per row,
+// silu(gate) * up, as mul_mat_vec_q8<ncols_dst, true> does for Q8_0.
+template<int ncols_dst>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q4_1_gated(const void* __restrict__ weights,
+                                const void* __restrict__ gate,
+                                const block_q8_1* __restrict__ input,
+                                float* __restrict__ output,
+                                const uint32_t ncols_x, const uint32_t nrows_x,
+                                const uint32_t stride_col_y) {
+  constexpr int qi = QI4_1;
+  constexpr int vdr = VDR_Q4_1_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int blocks_per_row = ncols_x / QK4_1;
+  const int row_offset = row * blocks_per_row;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float sum[ncols_dst] = {};
+  float gate_sum[ncols_dst] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
+       kbx += blocks_per_iter) {
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+      sum[j] += vec_dot_q4_1_q8_1(weights, &input[j * stride_col_y + kbx],
+                                  row_offset + kbx, kqs);
+      gate_sum[j] += vec_dot_q4_1_q8_1(gate, &input[j * stride_col_y + kbx],
+                                       row_offset + kbx, kqs);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+    sum[j] = warp_reduce_sum<32>(sum[j]);
+    gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
+    if (lane == 0) {
+      output[j * nrows_x + row] = sum[j] * ggml_hip_op_silu_single(gate_sum[j]);
+    }
+  }
+}
+
+void mul_mat_vec_q4_1_gated_dispatch(const void* weights, const void* gate,
+                                     const block_q8_1* input, float* output,
+                                     int k, int rows, int tokens,
+                                     int input_stride, hipStream_t stream) {
+  GGML_ASSERT(k % QK4_1 == 0 && rows > 0);
+  switch (tokens) {
+#define Q4_1_GATED_LAUNCH(N)                                  \
+  case N:                                                     \
+    mul_mat_vec_q4_1_gated<N><<<rows, 32, 0, stream>>>(       \
+        weights, gate, input, output, k, rows, input_stride); \
+    break;
+    Q4_1_GATED_LAUNCH(1)
+    Q4_1_GATED_LAUNCH(2)
+    Q4_1_GATED_LAUNCH(3)
+    Q4_1_GATED_LAUNCH(4)
+    Q4_1_GATED_LAUNCH(5)
+    Q4_1_GATED_LAUNCH(6)
+    Q4_1_GATED_LAUNCH(7)
+    Q4_1_GATED_LAUNCH(8)
+#undef Q4_1_GATED_LAUNCH
+    default:
+      GGML_ABORT("unsupported gated Q4_1 token count");
+  }
+}
+
 void mul_mat_vec_dense_dispatch(const void* weights, ggml_type type,
                                 const block_q8_1* input, float* output, int k,
                                 int rows, int tokens, int input_stride,

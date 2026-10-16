@@ -69,6 +69,11 @@ int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,
                                 const void* X_q8, float* out_f32, int M, int N,
                                 int K, hipStream_t stream);
 
+// Shared-expert gate/up pair from Q4_1 weights: out = silu(gate) * up.
+int qfn_mmq_q4_1_gated_vec_preq(const void* W_up, const void* W_gate,
+                                const void* X_q8, float* out_f32, int M, int N,
+                                int K, hipStream_t stream);
+
 // Q4_1 projection of 1-8 tokens from rows already quantized to Q8_1 (the
 // 320x10240 HC down projection has its own kernel). out is [n_tokens][M].
 int qfn_mmq_q4_1_dense_vec_preq(const void* W, const void* X_q8, float* out_f32,

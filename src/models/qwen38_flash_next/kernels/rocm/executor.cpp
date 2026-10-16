@@ -1673,6 +1673,26 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
+  if (!MatrixRows(n_tokens) && n_tokens <= kVecBatch &&
+      up.decode_data != nullptr && gate.decode_data != nullptr &&
+      up.decode_type == GgmlType::kQ4_1 &&
+      gate.decode_type == GgmlType::kQ4_1 && up.rows == gate.rows &&
+      up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
+      return false;
+    }
+    if (xq.data != nullptr) {
+      if (qfn_mmq_q4_1_gated_vec_preq(
+              up.decode_data, gate.decode_data, xq.data, out,
+              static_cast<int>(up.rows), static_cast<int>(n_tokens),
+              static_cast<int>(up.cols), stream_) != 0) {
+        AssignError(error_msg, "gated Q4_1 GEMV failed");
+        return false;
+      }
+      return true;
+    }
+  }
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&

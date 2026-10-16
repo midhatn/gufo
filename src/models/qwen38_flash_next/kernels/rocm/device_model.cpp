@@ -598,6 +598,9 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           add(mixer->down, kHcElements);
           add(mixer->up, kHcElements);
         }
+        add(l.shexp_up, 1);
+        add(l.shexp_gate, 1);
+        add(l.shexp_down, 1);
       }
     }
     if (hipDeviceSynchronize() != hipSuccess) {
