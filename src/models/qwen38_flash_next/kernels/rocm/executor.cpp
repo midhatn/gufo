@@ -2573,22 +2573,6 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
 
 namespace {
 
-/// NPU row groups covering n_tokens rows (the last may be partial; its padding
-/// rows are computed and ignored), or 0 when the chunk cannot use the NPU.
-std::uint32_t NpuGroupCount(const NpuGemm& npu, std::uint32_t n_tokens,
-                            std::size_t buffers, std::uint32_t max_rows) {
-  // A group computes every row it holds: below this the padding costs more
-  // than the GPU time the NPU saves.
-  constexpr std::uint32_t kNpuMinTokens = 2304;
-  if (n_tokens < kNpuMinTokens) {
-    return 0;
-  }
-  const std::uint32_t group = npu.tokens();
-  const std::uint32_t groups = (n_tokens + group - 1) / group;
-  return groups != 0 && groups <= buffers && groups * group <= max_rows ? groups
-                                                                        : 0;
-}
-
 /// GUFO_NPU_WARMUP_MS=N keeps the NPU out of the first N ms of each burst of
 /// prefill work (a burst starts after 1.5 s without a linear-attention layer),
 /// so the GPU's idle-to-full power and bandwidth step happens alone.
@@ -2640,9 +2624,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       NpuGemm* npu = model_->npu();
       if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
-          !l.npu_z.empty() &&
-          NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch) !=
-              0 &&
+          !l.npu_z.empty() && n_tokens % npu->tokens() == 0 &&
+          n_tokens / npu->tokens() <= npu_a_.size() &&
           l.ssm_in.cols == npu->k() && NpuWarm()) {
         // The last rows of the projection run on the NPU while the GPU does
         // the rest; the NPU output lands in the tail of each qkvz row.
@@ -2652,8 +2635,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         // The NPU kernel is built for npu->tokens() rows: a larger chunk goes
         // through it as consecutive groups.
         const std::uint32_t group_tokens = npu->tokens();
-        const std::uint32_t groups =
-            NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch);
+        const std::uint32_t groups = n_tokens / group_tokens;
         for (std::uint32_t g = 0; g < groups; ++g) {
           NpuEncodeActivations(
               static_cast<const __half*>(s_.x_half) +
@@ -2859,13 +2841,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       NpuGemm* npu = model_->npu();
       std::uint32_t skip_gate_heads = 0;
       if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
-          !l.npu_gate.empty() &&
-          NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch) !=
-              0 &&
+          !l.npu_gate.empty() && n_tokens % npu->tokens() == 0 &&
+          n_tokens / npu->tokens() <= npu_a_.size() &&
           l.attn_qkv.cols == npu->k() && NpuWarm()) {
         const std::uint32_t group_tokens = npu->tokens();
-        npu_gate_groups =
-            NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch);
+        npu_gate_groups = n_tokens / group_tokens;
         for (std::uint32_t g = 0; g < npu_gate_groups; ++g) {
           NpuEncodeActivations(
               static_cast<const __half*>(s_.x_half) +
@@ -3092,14 +3072,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     bool attended = true;
     for (std::uint32_t g = 0; g < npu_gate_groups && attended; ++g) {
       npu->Wait(stream_, npu_gate_tickets.at(g));
-      const std::uint32_t rows =
-          std::min(group_tokens, n_tokens - (g * group_tokens));
-      PrepareQueryHeadsStreams(npu_c_dev_, kNpuSlicesMax, group_tokens,
-                               l.attn_q_norm.f32(), s_.q, s_.attn_gate, rows,
-                               c.num_heads, c.num_kv_heads, c.head_dim,
-                               c.rotary_dim, pos, c.rope_theta, c.rms_eps,
-                               stream_, s.rope, q_heads, g * group_tokens);
-      attended = attend(g * group_tokens, rows, false);
+      PrepareQueryHeadsStreams(
+          npu_c_dev_, kNpuSlicesMax, group_tokens, l.attn_q_norm.f32(), s_.q,
+          s_.attn_gate, group_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
+          c.rotary_dim, pos, c.rope_theta, c.rms_eps, stream_, s.rope, q_heads,
+          g * group_tokens);
+      attended = attend(g * group_tokens, group_tokens, false);
     }
     if (!attended) {
       AssignError(error_msg, "grouped attention launch failed");
@@ -3165,14 +3143,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   std::uint32_t npu_shexp_groups = 0;
   if (npu != nullptr && npu->Healthy() && !npu_a_.empty() &&
       l.npu_shexp.size() == 2 && !last_only && n_tokens >= 1024 &&
-      n_tokens <= options_.max_batch &&
-      NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch) != 0 &&
+      n_tokens <= options_.max_batch && n_tokens % npu->tokens() == 0 &&
+      n_tokens / npu->tokens() <= npu_a_.size() &&
       l.shexp_up.cols == npu->k() && l.shexp_up.rows <= npu->n() &&
       DenseF16Route(l.shexp_down, n_tokens) && NpuWarm()) {
     PrepareHalfInput(x, n_tokens, l.shexp_up.cols);
     const std::uint32_t group_tokens = npu->tokens();
-    npu_shexp_groups =
-        NpuGroupCount(*npu, n_tokens, npu_a_.size(), options_.max_batch);
+    npu_shexp_groups = n_tokens / group_tokens;
     for (std::uint32_t g = 0; g < npu_shexp_groups; ++g) {
       NpuEncodeActivations(
           static_cast<const __half*>(s_.x_half) +

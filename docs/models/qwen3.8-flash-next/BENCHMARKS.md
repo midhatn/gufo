@@ -117,8 +117,7 @@ C1, context capacity 133121, AR. Peak memory reported by HIP.
 
 Latest (NPU on, fabric clock held, quiet machine): p=4096 1901, p=6144 1823 (bench
 cannot use the NPU on its partial group), p=8192 1966–2009, p=12288 1972–1977,
-p=16384 1953–1969, p=32768 1934. In the server, which sizes its NPU buffers for
-the full 16384-token tile, prompts that are not multiples of 4096 now also use the
-NPU and prefill 2–8% faster than before. Prefill speed depends on the text: a
+p=16384 1953–1969, p=32768 1934. In the server, prompts that are not multiples of 4096 prefill on the GPU alone.
+Prefill speed depends on the text: a
 concatenation of code and markdown prefilled 20–30% slower than code alone at the
 same length because expert routing differs.

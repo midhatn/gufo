@@ -129,10 +129,7 @@ identities remain in [artifacts](artifacts/bench.json) and the
 
 Per-bucket expert tile sizes (256/192 versus 128 tokens) keep every output byte: the
 microbench hashes match and 30/30 greedy prompts are identical. Running the NPU on a
-final partial group changes 7 of 30 completions against the previous build; all seven
-begin with a first-token flip between an empty reply and text, and the same flip appears
-on the previous build alone when only the one-character tag at the start of the prompt
-changes (prompts 4, 6, 18, 25, 26 and 1).
+final partial group changed 4 of 30 first tokens against the previous build (which matches GPU-only on all 30) and was reverted.
 
 Q4_1 versus Q5_1 decode copies, UD-IQ4_XS, NPU off, greedy, thinking off, MTP off, with the Q8_0 weights (no copies) as the reference. Free-form text (48 prompts, 160 tokens): the output departs from the reference 3.9 ± 1.3 times per 1000 characters with Q5_1 and 5.5 ± 1.8 with Q4_1. Forty harder questions with brief reasoning (word problems, code tracing and arithmetic whose answers were computed by running Python): 28, 27 and 28 correct for the reference, Q5_1 and Q4_1, with 11 to 13 answers per arm cut off at the 450-token limit. Pooled over both sets, Q4_1 departs 1.7 times as often as Q5_1 (95% interval 1.2 to 2.4), so it adds measurably more numeric noise, while 80 questions show no accuracy loss; 40 easy exact-answer questions were 40/40 in all three arms. The scripts are the first ones in `tools/bench` plus a small harness kept outside the repository. A longer check on the DS4 cases was not run.
 
