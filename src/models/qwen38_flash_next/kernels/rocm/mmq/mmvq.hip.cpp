@@ -1054,13 +1054,34 @@ __launch_bounds__(256) static __global__
                             const uint32_t* __restrict__ up,
                             const half* __restrict__ x,
                             const int32_t* __restrict__ groups,
+                            const int32_t* __restrict__ ids,
                             float* __restrict__ output, int k, int rows,
                             int tokens, int experts_used) {
   __shared__ uint32_t grid[512];
   __shared__ uint32_t buf[8][2][kIq3sRowDwords + 1];
   const int anchor = blockIdx.y;
   const int32_t* group = groups + anchor * (tokens + 1);
-  const int expert = group[0];
+  int expert;
+  uint32_t decode_mask = 0;
+  if (groups == nullptr) {
+    // One token: its slot groups follow from the routing directly (the
+    // grouping pass would write the same expert, -1 for a repeat of an
+    // earlier slot, -2 for an inactive one, and the token's slot mask).
+    expert = ids[anchor];
+    if (expert >= 0) {
+      for (int i = 0; i < anchor; ++i)
+        if (ids[i] == expert)
+          expert = -1;
+      if (expert >= 0)
+        for (int j = 0; j < experts_used; ++j)
+          if (ids[j] == expert)
+            decode_mask |= uint32_t{1} << j;
+    } else {
+      expert = -2;
+    }
+  } else {
+    expert = group[0];
+  }
   const int tid = threadIdx.x;
   const int row0 = blockIdx.x * 8 * kRowsPerWave;
   if (expert == -1)
@@ -1075,12 +1096,18 @@ __launch_bounds__(256) static __global__
   int active[kMaxTokens];
   uint32_t masks[kMaxTokens];
   int count = 0;
-  for (int t = 0; t < tokens && count < kMaxTokens; ++t) {
-    const uint32_t m = static_cast<uint32_t>(group[t + 1]);
-    if (m != 0) {
-      active[count] = t;
-      masks[count] = m;
-      ++count;
+  if (groups == nullptr) {
+    active[0] = 0;
+    masks[0] = decode_mask;
+    count = 1;
+  } else {
+    for (int t = 0; t < tokens && count < kMaxTokens; ++t) {
+      const uint32_t m = static_cast<uint32_t>(group[t + 1]);
+      if (m != 0) {
+        active[count] = t;
+        masks[count] = m;
+        ++count;
+      }
     }
   }
   for (int i = tid; i < 512; i += 256)
@@ -1227,8 +1254,9 @@ void mul_mat_vec_iq3s_gated_f16(const void* gate, const void* up,
   narrow_rows_f16<<<(count + 255) / 256, 256, 0, stream>>>(x, x_half, count);
   const int anchors = tokens * experts_used;
   GGML_ASSERT(anchors <= kMoeGroupAnchors);
-  group_moe_slots<<<1, (anchors + 31) / 32 * 32, 0, stream>>>(
-      ids, groups, tokens, experts_used, false);
+  if (tokens > 1)
+    group_moe_slots<<<1, (anchors + 31) / 32 * 32, 0, stream>>>(
+        ids, groups, tokens, experts_used, false);
   constexpr int kRowsPerWave = 8;
   const dim3 grid((rows + 8 * kRowsPerWave - 1) / (8 * kRowsPerWave),
                   tokens * experts_used);
@@ -1237,12 +1265,12 @@ void mul_mat_vec_iq3s_gated_f16(const void* gate, const void* up,
   if (tokens == 1) {
     iq3s_moe_gated_f16<kRowsPerWave, 1><<<grid, 256, 0, stream>>>(
         static_cast<const uint32_t*>(gate), static_cast<const uint32_t*>(up),
-        x_half, groups, output, k, rows, tokens, experts_used);
+        x_half, nullptr, ids, output, k, rows, tokens, experts_used);
   } else {
     iq3s_moe_gated_f16<kRowsPerWave, MMVQ_MAX_BATCH_SIZE>
         <<<grid, 256, 0, stream>>>(static_cast<const uint32_t*>(gate),
                                    static_cast<const uint32_t*>(up), x_half,
-                                   groups, output, k, rows, tokens,
+                                   groups, ids, output, k, rows, tokens,
                                    experts_used);
   }
 }
