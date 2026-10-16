@@ -991,6 +991,85 @@ static void launch_moe(const void* weights, const block_q8_1* input,
           nullptr, dst_slots);
 }
 
+// IQ4_NL down projection of the routed slots (K = 640, one expert per slot) for
+// decode and short verifies. A wave owns four rows and each lane takes five
+// 16-weight halves of their blocks, so all 32 lanes work on every row; the
+// generic kernel leaves 24 of 32 lanes idle for the last four of a row's twenty
+// blocks. A half block's integer dot product is exact, the float sum order
+// differs from the generic kernel's.
+static __device__ __forceinline__ uint32_t iq4nl_bytes(uint32_t nibbles) {
+  constexpr uint32_t kT0 = 0x3F2D1801U;
+  constexpr uint32_t kT1 = 0x766A5D4FU;
+  constexpr uint32_t kT2 = 0xA6998D81U;
+  constexpr uint32_t kT3 = 0xF1D9C5B5U;
+  const uint32_t sel = nibbles & 0x07070707U;
+  const uint32_t lo = __builtin_amdgcn_perm(kT1, kT0, sel);
+  const uint32_t hi = __builtin_amdgcn_perm(kT3, kT2, sel);
+  const uint32_t mask = ((nibbles >> 3U) & 0x01010101U) * 0xFFU;
+  return (hi & mask) | (lo & ~mask);
+}
+
+__launch_bounds__(256) static __global__
+    void iq4nl_down_decode(const uint8_t* __restrict__ weights,
+                           const block_q8_1* __restrict__ input,
+                           const int32_t* __restrict__ ids,
+                           float* __restrict__ output, const int rows,
+                           const int input_stride) {
+  constexpr int kRowsPerWave = 4;
+  constexpr int kBlocks = 640 / QK4_NL;
+  constexpr int kUnitsPerRow = kBlocks * 2;
+  constexpr int kRowBytes = kBlocks * sizeof(block_iq4_nl);
+  const int slot = blockIdx.y;
+  const int lane = threadIdx.x & 31;
+  const int wave = threadIdx.x >> 5;
+  const int row0 = (blockIdx.x * 8 + wave) * kRowsPerWave;
+  const int32_t expert = ids[slot];
+  float acc[kRowsPerWave] = {0.0f, 0.0f, 0.0f, 0.0f};
+  if (expert >= 0) {
+    const uint8_t* base =
+        weights + (static_cast<size_t>(expert) * rows + row0) * kRowBytes;
+    const block_q8_1* y = input + static_cast<size_t>(slot) * input_stride;
+#pragma unroll
+    for (int i = 0; i < kRowsPerWave * kUnitsPerRow / 32; ++i) {
+      const int u = lane + 32 * i;
+      const int rr = u / kUnitsPerRow;
+      const int unit = u % kUnitsPerRow;
+      const int b = unit >> 1;
+      const int h = unit & 1;
+      const uint16_t* hp = reinterpret_cast<const uint16_t*>(
+          base + static_cast<size_t>(rr) * kRowBytes +
+          b * sizeof(block_iq4_nl));
+      const float d = __half2float(__ushort_as_half(hp[0]));
+      const uint32_t w0 =
+          hp[1 + 4 * h] | (static_cast<uint32_t>(hp[2 + 4 * h]) << 16);
+      const uint32_t w1 =
+          hp[3 + 4 * h] | (static_cast<uint32_t>(hp[4 + 4 * h]) << 16);
+      const block_q8_1& a = y[b];
+      const uint32_t* ai = reinterpret_cast<const uint32_t*>(a.qs);
+      const uint32_t lo0 = iq4nl_bytes(w0 & 0x0F0F0F0FU) ^ 0x80808080U;
+      const uint32_t hi0 = iq4nl_bytes((w0 >> 4) & 0x0F0F0F0FU) ^ 0x80808080U;
+      const uint32_t lo1 = iq4nl_bytes(w1 & 0x0F0F0F0FU) ^ 0x80808080U;
+      const uint32_t hi1 = iq4nl_bytes((w1 >> 4) & 0x0F0F0F0FU) ^ 0x80808080U;
+      int sumi = ggml_hip_dp4a(lo0, ai[2 * h], 0);
+      sumi = ggml_hip_dp4a(lo1, ai[2 * h + 1], sumi);
+      sumi = ggml_hip_dp4a(hi0, ai[4 + 2 * h], sumi);
+      sumi = ggml_hip_dp4a(hi1, ai[4 + 2 * h + 1], sumi);
+      const float c = d * __low2float(a.ds) * static_cast<float>(sumi);
+#pragma unroll
+      for (int r = 0; r < kRowsPerWave; ++r)
+        acc[r] += rr == r ? c : 0.0f;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < kRowsPerWave; ++r) {
+    const float sum = warp_reduce_sum<32>(acc[r]);
+    if (lane == 0) {
+      output[static_cast<size_t>(slot) * rows + row0 + r] =
+          isfinite(sum) ? sum : 0.0f;
+    }
+  }
+}
+
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
@@ -1052,6 +1131,13 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_IQ4_NL:
+          if (k == 640 && experts_used == 1 && rows % 32 == 0 && tokens <= 16 &&
+              !dst_slots) {
+            iq4nl_down_decode<<<dim3(rows / 32, tokens), 256, 0, stream>>>(
+                static_cast<const uint8_t*>(weights), input, ids, output, rows,
+                input_stride);
+            break;
+          }
             launch_moe<GGML_TYPE_IQ4_NL>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
