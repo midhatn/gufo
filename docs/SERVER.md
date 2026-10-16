@@ -234,6 +234,16 @@ With `preserve_thinking=false`, a new user turn removes reasoning from the
 preceding tool cycle. Gufo retains the state before that cycle and processes
 its changed suffix again.
 
+A loaded Qwen vision sidecar is prepared while the model loads, before the RAM
+cache is sized and before readiness: Gufo hashes the complete sidecar for image
+cache identities and uploads the encoder weights, so neither happens in the
+first image request and admission's free device memory already excludes them.
+The weights stay resident even if no image arrives, including a sidecar
+auto-discovered as `mmproj-BF16.gguf` in the model's directory or its parent.
+The startup line `event=vision_prepared` reports `resident_bytes`,
+`identity_ms` and `upload_ms`. Startup fails if the upload does not fit. Image
+encoding scratch is still allocated per image.
+
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
 `--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
