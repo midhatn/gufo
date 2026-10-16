@@ -571,6 +571,26 @@ bool Session::DraftReplay(std::int32_t next_token,
   return true;
 }
 
+[[nodiscard]] bool Session::WantFullVocab() const {
+  constexpr int kFullVocabWindow = 64;
+  constexpr int kFullVocabMinHigh = 3;
+  constexpr std::int32_t kHighIdBase = 131072;
+  constexpr std::int32_t kSpecialIdBase = 248044;
+
+  const int count = static_cast<int>(tokens_.size());
+  const int start = count > kFullVocabWindow ? count - kFullVocabWindow : 0;
+  int high_count = 0;
+  for (int i = start; i < count; ++i) {
+    const std::int32_t id = tokens_[i];
+    if (id >= kHighIdBase && id < kSpecialIdBase) {
+      ++high_count;
+      if (high_count >= kFullVocabMinHigh)
+        return true;
+    }
+  }
+  return false;
+}
+
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
                            std::string* error_msg,
                            MtpCandidateLogits* candidates, bool with_token) {
@@ -586,7 +606,8 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
           {.token = propose && (candidates == nullptr || with_token)
                         ? &draft_token_
                         : nullptr,
-           .candidates = candidates},
+           .candidates = candidates,
+           .full_vocab = WantFullVocab()},
           error_msg)) {
     return false;
   }
@@ -1108,7 +1129,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                              std::span<const std::int32_t>(&pending->draft, 1),
                              -1,
                              {.token = sampled ? nullptr : &pending->draft,
-                              .candidates = &pending->candidates},
+                              .candidates = &pending->candidates,
+                              .full_vocab = WantFullVocab()},
                              error_msg)) {
           return false;
         }

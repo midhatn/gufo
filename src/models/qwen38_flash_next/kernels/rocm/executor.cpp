@@ -3444,14 +3444,15 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool candidates, std::string* error_msg) const {
+                       bool candidates, bool full_vocab,
+                       std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
   std::uint32_t head_rows = output.rows;
   std::size_t row_bytes = 0;
-  if (mtp_head_rows_ != 0) {
+  if (mtp_head_rows_ != 0 && !full_vocab) {
     if (output.type == core::GgmlType::kQ6_K && output.cols % 256 == 0)
       row_bytes = std::size_t{output.cols} / 256 * 210;
     else if (output.type == core::GgmlType::kQ8_0 && output.cols % 32 == 0)
@@ -4930,25 +4931,26 @@ bool Executor::MtpForward(Session& session,
       (std::uint64_t{1} << 40) |
       (std::uint64_t{output.token != nullptr} << 41) |
       (std::uint64_t{output.candidates != nullptr} << 43) |
-      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45);
+      (std::uint64_t{sparse} << 44) | (std::uint64_t{output.kv_only} << 45) |
+      (std::uint64_t{output.full_vocab} << 46);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
                    output.candidates != nullptr, error_msg,
                    graph ? graph_pool : pool, hidden_source, output.trace,
-                   output.kv_only);
+                   output.kv_only, output.full_vocab);
   };
   if (!Run(session, key, graph, body, error_msg, true, "mtp")) {
     return false;
   }
   if (output.token != nullptr) {
-    *output.token =
-        static_cast<std::int32_t>(MtpTokenId(static_cast<std::uint32_t>(
-            *mtp_token_host_)));
+    *output.token = static_cast<std::int32_t>(MtpTokenId(
+        static_cast<std::uint32_t>(*mtp_token_host_), output.full_vocab));
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
     for (std::size_t i = 0; i < output.candidates->size; ++i)
-      output.candidates->ids[i] = MtpTokenId(output.candidates->ids[i]);
+      output.candidates->ids[i] =
+          MtpTokenId(output.candidates->ids[i], output.full_vocab);
   }
   session.mtp_.position = pos + n;
   session.mtp_.residual_valid = !output.kv_only;
@@ -4960,7 +4962,7 @@ bool Executor::MtpForward(Session& session,
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                        bool token, bool candidates, std::string* error_msg,
                        std::uint32_t pool_grid, const float* hidden_source,
-                       MtpTrace* trace, bool kv_only) const {
+                       MtpTrace* trace, bool kv_only, bool full_vocab) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -5163,7 +5165,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   return (!token && !candidates) ||
-         MtpHead(l.nextn_head, last, token, candidates, error_msg);
+         MtpHead(l.nextn_head, last, token, candidates, full_vocab, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

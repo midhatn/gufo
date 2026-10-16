@@ -267,6 +267,7 @@ private:
                            std::string* error_msg);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
+  [[nodiscard]] bool WantFullVocab() const;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr,

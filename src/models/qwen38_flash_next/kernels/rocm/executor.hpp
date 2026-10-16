@@ -310,6 +310,8 @@ public:
     /// Prefill needs only persistent KV. A subsequent full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
+    /// Score every output row, not the drafting subset.
+    bool full_vocab{false};
   };
   struct MtpHeadItem {
     Session* session;
@@ -518,7 +520,7 @@ private:
                 std::uint32_t rows, std::string* error) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool candidates, std::string* error_msg) const;
+               bool candidates, bool full_vocab, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -528,7 +530,8 @@ private:
                    PrefillCheckpoint* checkpoint = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
-               const float* hidden_source, MtpTrace* trace, bool kv_only) const;
+               const float* hidden_source, MtpTrace* trace, bool kv_only,
+               bool full_vocab) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -738,7 +741,10 @@ private:
   std::uint32_t mtp_head_rows_{0};
   std::uint32_t mtp_tail_rows_{0};
   std::uint32_t mtp_tail_base_{0};
-  [[nodiscard]] std::uint32_t MtpTokenId(std::uint32_t index) const noexcept {
+  [[nodiscard]] std::uint32_t MtpTokenId(
+      std::uint32_t index, bool full_vocab = false) const noexcept {
+    if (full_vocab)
+      return index;
     return mtp_head_rows_ != 0 && index >= mtp_head_rows_
                ? index - mtp_head_rows_ + mtp_tail_base_
                : index;

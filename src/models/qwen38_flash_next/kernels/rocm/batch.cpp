@@ -438,12 +438,15 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!item.session->CheckCancellation(nullptr))
         continue;
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
-                   item.output.candidates != nullptr, error) ||
+                   item.output.candidates != nullptr, item.output.full_vocab,
+                   error) ||
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
       if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+        *item.output.token = static_cast<std::int32_t>(
+            MtpTokenId(static_cast<std::uint32_t>(*mtp_token_host_),
+                       item.output.full_vocab));
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }
