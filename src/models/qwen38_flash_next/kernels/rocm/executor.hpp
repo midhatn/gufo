@@ -848,6 +848,7 @@ private:
   /// Set while a whole-projection linear layer runs: its qkv/z values are read
   /// straight from the NPU streams (fused convolution, z in the epilogue).
   mutable WholeStreams whole_streams_{};
+  mutable const float* out_check_ref_[2]{nullptr, nullptr};
   mutable std::uint32_t q8t_rows_{0};
   mutable std::size_t q8t_cols_{0};
   mutable const float* half_src_{nullptr};

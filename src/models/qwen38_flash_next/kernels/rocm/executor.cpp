@@ -4126,6 +4126,16 @@ bool Executor::ForwardBodyRange(
             AssignError(error_msg, "ssm_out tail GEMM failed");
             return false;
           }
+          if (std::getenv("GUFO_NPU_OUT_CHECK") != nullptr) {
+            static float* refs[2] = {nullptr, nullptr};
+            const int bank = out_state->a_ids == npu_out_a_[0].data() ? 0 : 1;
+            if (refs[bank] == nullptr)
+              (void)hipMalloc(&refs[bank],
+                              std::size_t{16384} * 2560 * sizeof(float));
+            (void)DenseF16Gemm(l.ssm_out.data, gdn_half, refs[bank], n,
+                               l.ssm_out.rows, l.ssm_out.cols, stream_, pitch);
+            out_check_ref_[bank] = refs[bank];
+          }
           out_state->valid = true;
           out_state->groups = prepared->groups;
           out_state->ticket = npu->Ticket();
@@ -4232,6 +4242,34 @@ bool Executor::ForwardBodyRange(
                     kNpuOutSlices * npu->n(), s_.qkvz, s_.block_out, n,
                     l.ssm_out.rows, stream_);
       out_state->valid = false;
+      if (std::getenv("GUFO_NPU_OUT_CHECK") != nullptr) {
+        static float* ref_dev = nullptr;
+        (void)ref_dev;
+        const float* ref =
+            out_check_ref_[out_state->a_ids == npu_out_a_[0].data() ? 0 : 1];
+        std::vector<float> a(std::size_t{n} * 2560), b(a.size());
+        (void)hipStreamSynchronize(stream_);
+        (void)hipMemcpy(a.data(), s_.block_out, a.size() * 4,
+                        hipMemcpyDeviceToHost);
+        (void)hipMemcpy(b.data(), ref, b.size() * 4, hipMemcpyDeviceToHost);
+        double num = 0, den = 0;
+        double col_num[3] = {0, 0, 0};
+        double col_den[3] = {0, 0, 0};
+        for (std::size_t i = 0; i < a.size(); ++i) {
+          const double d = double(a[i]) - double(b[i]);
+          num += d * d;
+          den += double(b[i]) * b[i];
+          const int part = (i % 2560) < 1024 ? 0 : (i % 2560) < 2048 ? 1 : 2;
+          col_num[part] += d * d;
+          col_den[part] += double(b[i]) * b[i];
+        }
+        std::fprintf(stderr,
+                     "out check layer %u n=%u rel_rmse=%.4g (cols0 %.4g cols1 %.4g tail %.4g)\n",
+                     il, n, std::sqrt(num / (den + 1e-30)),
+                     std::sqrt(col_num[0] / (col_den[0] + 1e-30)),
+                     std::sqrt(col_num[1] / (col_den[1] + 1e-30)),
+                     std::sqrt(col_num[2] / (col_den[2] + 1e-30)));
+      }
     }
     const float* next_norm =
         il + 1 < c.num_layers
@@ -4894,8 +4932,8 @@ bool Executor::ForwardPair(Session& session,
                                        : 0U};
         const std::uint32_t gpu_z = linear ? std::min(gpu_z_env[bank], 6U) : 0U;
         for (std::uint32_t part = 0; part < 2; ++part) {
-          const std::uint32_t begin = part == 0 ? 0 : first_run;
-          const std::uint32_t end = part == 0 ? first_run : slices - gpu_z;
+          const std::uint32_t begin = part == 0 ? 0 : first_run + gpu_z;
+          const std::uint32_t end = part == 0 ? first_run : slices;
           for (std::uint32_t g = 0; g < groups && end > begin; ++g) {
             if (!npu->Submit(stream_, a_ids[g], weight_ids + begin,
                              c_ids + static_cast<std::size_t>(g) * slices +
