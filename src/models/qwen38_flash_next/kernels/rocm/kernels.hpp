@@ -347,7 +347,16 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
-                      hipStream_t stream);
+                      hipStream_t stream,
+                      std::uint32_t rows_valid = 0xFFFFFFFFU);
+/// Sums `chunks` K-chunk partials of an NPU output projection (stream_cols /
+/// 1024 slices per chunk, slot chunk * slices + slice) into F32 rows of
+/// `cols`; columns past stream_cols come from the GPU's `tail` rows.
+void NpuSumStreams(const std::uint8_t* const* streams,
+                   std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                   std::uint32_t chunks, std::uint32_t stream_cols,
+                   const float* tail, float* out, std::uint32_t n_tokens,
+                   std::uint32_t cols, hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
                std::uint32_t cols, std::uint32_t valid_cols,

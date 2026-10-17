@@ -434,9 +434,24 @@ private:
     bool valid{false};
     bool linear{false};
     std::uint64_t ticket{0};
+    std::uint64_t ticket_qkv{0};  ///< runs up to the last qkv slice
     std::uint32_t groups{0};
     std::uint32_t slices{0};
+    std::uint32_t gpu_z{0};  ///< z slices the GPU computes itself
     const int* c_ids{nullptr};
+  };
+
+  /// Which half of a layer ForwardBodyRange runs. The mixer half ends by
+  /// handing the linear-attention output projection to the NPU; the FFN half
+  /// collects it.
+  enum class LayerPhase { kFull, kMixer, kFfn };
+  struct NpuOutState {
+    bool enabled{false};  ///< caller allows the NPU output projection
+    bool valid{false};    ///< a projection is in flight
+    std::uint32_t groups{0};
+    std::uint64_t ticket{0};
+    const int* c_ids{nullptr};
+    const int* a_ids{nullptr};  ///< 3 activation buffers per group
   };
 
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
@@ -560,7 +575,9 @@ private:
                         bool convert_at_exit, bool upload_control,
                         bool* out_normed, bool* out_res_is_half,
                         bool premixed = false,
-                        const PreparedNpu* prepared = nullptr) const;
+                        const PreparedNpu* prepared = nullptr,
+                        LayerPhase phase = LayerPhase::kFull,
+                        NpuOutState* out_state = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
@@ -816,6 +833,7 @@ private:
   const std::uint8_t** npu_c_dev_{nullptr};
   std::array<std::vector<int>, 2> npu_whole_a_{};
   std::array<std::vector<int>, 2> npu_whole_c_{};
+  std::array<std::vector<int>, 2> npu_out_a_{};
   std::uint32_t npu_whole_groups_{0};
   bool npu_whole_enabled_{false};
   struct WholeStreams {
@@ -823,6 +841,9 @@ private:
     std::uint32_t groups{0};
     std::uint32_t group_tokens{0};
     bool hybrid{false};
+    /// Ticket of the z-row runs still in flight (waited before the epilogue).
+    std::uint64_t z_ticket{0};
+    std::uint32_t gpu_z{0};  ///< leading z slices computed on the GPU (s_.z)
   };
   /// Set while a whole-projection linear layer runs: its qkv/z values are read
   /// straight from the NPU streams (fused convolution, z in the epilogue).

@@ -93,6 +93,13 @@ constexpr std::uint32_t kRoutedDownWideMin =
     129;                                     ///< bucket for 192-token tiles
 constexpr std::uint32_t kNpuSlicesMax = 12;  ///< C buffers per NPU group
 constexpr std::uint32_t kNpuWholeSlices = 16;
+constexpr std::uint32_t kNpuQkvSlices = 10;  ///< ssm_in slices before z
+constexpr std::uint32_t kNpuOutChunks = 3;  ///< K chunks of ssm_out
+constexpr std::uint32_t kNpuOutSlices = 2;  ///< 1024-row slices per chunk
+constexpr std::uint32_t kNpuOutSlots = kNpuOutChunks * kNpuOutSlices;
+constexpr std::uint32_t kNpuOutTailRows = 512;  ///< ssm_out rows kept on GPU
+/// Row padding of the F16 linear-attention output rows (see LinearAttention).
+constexpr std::uint32_t kGdnOutPadHalves = 128;
 // The widest dense trunk matrix: the linear-attention input stack.
 constexpr std::size_t kDequantHalfMaxElems = std::size_t{16384} * 2560;
 
@@ -1425,8 +1432,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
               }
             }
           }
+          for (std::size_t bank = 0; bank < 2 && ok; ++bank) {
+            e->npu_out_a_[bank].clear();
+            for (std::uint32_t i = 0; i < 3 * e->npu_whole_groups_; ++i) {
+              const int a = npu->NewBuffer(npu->ABytes(), &npu_error);
+              if (a < 0) {
+                ok = false;
+                break;
+              }
+              e->npu_out_a_[bank].push_back(a);
+            }
+          }
           e->npu_whole_enabled_ = ok;
           if (!ok) {
+            for (auto& v : e->npu_out_a_)
+              v.clear();
             for (auto& v : e->npu_whole_a_)
               v.clear();
             for (auto& v : e->npu_whole_c_)
@@ -2926,10 +2946,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         s_.qkvz + static_cast<std::size_t>(n_tokens - tail_rows) * qkv_stride,
         n_tokens - tail_rows, tail_rows, channels, qkv_stride, 0, stream_);
     convolved = true;
-    z_streams = whole_streams_.table + kZSlice0;
+    z_streams = whole_streams_.table + kZSlice0 + whole_streams_.gpu_z;
     z_stream_stride = kWholeSlices;
     z_group_tokens = whole_streams_.group_tokens;
-    z_gpu_cols = 0;
+    z_gpu_cols = whole_streams_.gpu_z * 1024;
+    if (whole_streams_.gpu_z != 0) {
+      z = s_.z;
+      z_stride = z_gpu_cols;
+    }
+    if (whole_streams_.z_ticket != 0) {
+      NpuGemm* npu = model_->npu();
+      const std::uint64_t ticket = whole_streams_.z_ticket;
+      npu_finish = [this, npu, ticket]() { npu->Wait(stream_, ticket); };
+    }
   }
   // Keep the same activation precision across prefill chunk boundaries.
   // The F16 epilogue reuses the F32 output allocation. Switching this
@@ -2947,7 +2976,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // The F16 rows feed a K = 6144 projection: their 12,288 B pitch is a
   // multiple of 4 KiB, so the 128 token rows of a tile all fetch from one
   // memory channel. Padding the pitch by 256 B cuts that projection by a third.
-  constexpr std::uint32_t kGdnOutPadHalves = 128;
   // The strided GEMM takes padded rows only for batches of 1024 tokens or more.
   const std::uint32_t half_stride =
       half_output && n_tokens >= 1024
@@ -3860,7 +3888,8 @@ bool Executor::ForwardBodyRange(
     PrefillCheckpoint* checkpoint, bool initial_normed, bool initial_res_half,
     bool convert_at_entry, bool convert_at_exit, bool upload_control,
     bool* out_normed, bool* out_res_is_half, bool premixed,
-    const PreparedNpu* prepared) const {
+    const PreparedNpu* prepared, LayerPhase phase,
+    NpuOutState* out_state) const {
   const Config& c = config();
   if (first_layer == 0 || upload_control) {
     if (!Check(GuardedMemcpyAsync(GUFO_SITE, session.control_, control_host_,
@@ -3911,6 +3940,7 @@ bool Executor::ForwardBodyRange(
     if (!session.CheckCancellation(error_msg))
       return false;
     const DeviceLayer& l = layers[il];
+    if (phase != LayerPhase::kFfn) {
     if (c.IsPleLayer(il)) {
       if (res_is_half) {
         residual_to_float();
@@ -3955,11 +3985,6 @@ bool Executor::ForwardBodyRange(
           AssignError(error_msg, "NPU whole projection shape mismatch");
           return false;
         }
-        if (!npu->Wait(stream_, prepared->ticket)) {
-          AssignError(error_msg, "NPU whole projection wait failed");
-          return false;
-        }
-
         auto& s = session.linear_[il];
         const std::uint32_t channels = c.SsmConvChannels();
         bool whole_streams = std::getenv("GUFO_WHOLE_GPUSUB") == nullptr &&
@@ -3968,6 +3993,14 @@ bool Executor::ForwardBodyRange(
                              prepared->slices == 16 && group_tokens != 0 &&
                              prepared->groups * group_tokens == n &&
                              channels == 10240 && stride == 16384;
+
+        // The fused path reads z from the streams in the epilogue, which
+        // waits for those slices itself.
+        if (!npu->Wait(stream_, whole_streams ? prepared->ticket_qkv
+                                              : prepared->ticket)) {
+          AssignError(error_msg, "NPU whole projection wait failed");
+          return false;
+        }
 
         const std::uint8_t* const* streams = nullptr;
         if (whole_streams) {
@@ -4014,7 +4047,18 @@ bool Executor::ForwardBodyRange(
             return false;
           }
         } else if (whole_streams) {
-          whole_streams_ = {streams, prepared->groups, group_tokens};
+          whole_streams_ = {streams, prepared->groups, group_tokens, false,
+                            prepared->ticket, prepared->gpu_z};
+          if (prepared->gpu_z != 0 &&
+              !DenseF16Gemm(static_cast<const std::uint8_t*>(l.ssm_in.data) +
+                                static_cast<std::size_t>(channels) *
+                                    (l.ssm_in.cols / 32 * 34),
+                            static_cast<const __half*>(s_.x_half), s_.z, n,
+                            prepared->gpu_z * npu->n(), l.ssm_in.cols,
+                            stream_)) {
+            AssignError(error_msg, "z GEMM failed");
+            return false;
+          }
         } else {
           for (std::uint32_t g = 0; g < prepared->groups; ++g) {
             float* dst =
@@ -4036,12 +4080,56 @@ bool Executor::ForwardBodyRange(
                                 checkpoint->state->linear_[il].conv_state,
                                 checkpoint->tokens}
                 : GdnCheckpoint{};
+        const bool out_npu =
+            phase == LayerPhase::kMixer && out_state != nullptr &&
+            out_state->enabled && out_state->a_ids != nullptr && !gpusub &&
+            whole_streams && l.npu_out_all.size() == kNpuOutSlots &&
+            l.ssm_out.cols == 6144 && l.ssm_out.rows == 2560 && n >= 1024 &&
+            checkpoint == nullptr;
         const bool linear_ok =
             LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
-                            speculative, error_msg, !gpusub, true, capture);
+                            speculative, error_msg, !gpusub, !out_npu, capture);
         whole_streams_ = {};
         if (!linear_ok) {
           return false;
+        }
+        if (out_npu) {
+          const std::uint32_t pitch = l.ssm_out.cols + kGdnOutPadHalves;
+          const auto* gdn_half = reinterpret_cast<const __half*>(s_.gdn_out);
+          for (std::uint32_t g = 0; g < prepared->groups; ++g) {
+            for (std::uint32_t q = 0; q < kNpuOutChunks; ++q) {
+              const int a_id = out_state->a_ids[g * kNpuOutChunks + q];
+              NpuEncodeActivations(
+                  gdn_half + static_cast<std::size_t>(g) * group_tokens * pitch,
+                  pitch, group_tokens, npu->k(), q * npu->k(), l.ssm_out.cols,
+                  npu->Device(a_id), stream_);
+              if (!npu->Submit(
+                      stream_, a_id,
+                      l.npu_out_all.data() + q * kNpuOutSlices,
+                      prepared->c_ids +
+                          static_cast<std::size_t>(g) * prepared->slices +
+                          q * kNpuOutSlices,
+                      static_cast<int>(kNpuOutSlices))) {
+                AssignError(error_msg, "NPU output projection submit failed");
+                return false;
+              }
+            }
+          }
+          // The rows past the NPU's slices are computed here, in parallel.
+          const std::size_t tail_offset =
+              static_cast<std::size_t>(kNpuOutSlices) * npu->n() * l.ssm_out.cols /
+              32 * 34;
+          if (!DenseF16Gemm(static_cast<const std::uint8_t*>(l.ssm_out.data) +
+                                tail_offset,
+                            gdn_half, s_.qkvz, n, kNpuOutTailRows,
+                            l.ssm_out.cols, stream_, pitch)) {
+            AssignError(error_msg, "ssm_out tail GEMM failed");
+            return false;
+          }
+          out_state->valid = true;
+          out_state->groups = prepared->groups;
+          out_state->ticket = npu->Ticket();
+          out_state->c_ids = prepared->c_ids;
         }
       } else {
         const std::uint32_t stride = l.attn_qkv.rows;
@@ -4119,6 +4207,32 @@ bool Executor::ForwardBodyRange(
       }
     }
 
+    if (phase == LayerPhase::kMixer) {
+      if (out_normed != nullptr)
+        *out_normed = normed;
+      if (out_res_is_half != nullptr)
+        *out_res_is_half = res_is_half;
+      return true;
+    }
+    }
+    if (out_state != nullptr && out_state->valid) {
+      NpuGemm* npu = model_->npu();
+      if (npu == nullptr || !npu->Wait(stream_, out_state->ticket)) {
+        AssignError(error_msg, "NPU output projection wait failed");
+        return false;
+      }
+      const std::uint8_t* const* table = MakeNpuWholeStreamTable(
+          npu, out_state->c_ids, out_state->groups, kNpuWholeSlices, 0,
+          kNpuOutSlots, kNpuOutSlots, stream_);
+      if (table == nullptr) {
+        AssignError(error_msg, "NPU output projection table failed");
+        return false;
+      }
+      NpuSumStreams(table, kNpuOutSlots, npu->tokens(), kNpuOutChunks,
+                    kNpuOutSlices * npu->n(), s_.qkvz, s_.block_out, n,
+                    l.ssm_out.rows, stream_);
+      out_state->valid = false;
+    }
     const float* next_norm =
         il + 1 < c.num_layers
             ? (c.IsPleLayer(il + 1) ? nullptr
@@ -4766,15 +4880,37 @@ bool Executor::ForwardPair(Session& session,
                   static_cast<std::size_t>(g) * group_tokens * w.cols,
               w.cols, group_tokens, npu->k(), 0, npu->k(),
               npu->Device(a_ids[g]), stream_);
-          if (!npu->Submit(stream_, a_ids[g], weight_ids,
-                           c_ids + static_cast<std::size_t>(g) * slices,
-                           static_cast<int>(slices))) {
-            AssignError(error_msg, "NPU whole projection submit failed");
-            return false;
+        }
+        // A linear layer's z rows (the last slices) are read only by the
+        // epilogue, so every group's qkv slices run first and the layer waits
+        // for the z slices later.
+        const std::uint32_t first_run = linear ? kNpuQkvSlices : slices;
+        static const std::uint32_t gpu_z_env[2] = {
+            std::getenv("GUFO_GPUZ_A") ? static_cast<std::uint32_t>(
+                                             std::atoi(std::getenv("GUFO_GPUZ_A")))
+                                       : 0U,
+            std::getenv("GUFO_GPUZ_B") ? static_cast<std::uint32_t>(
+                                             std::atoi(std::getenv("GUFO_GPUZ_B")))
+                                       : 0U};
+        const std::uint32_t gpu_z = linear ? std::min(gpu_z_env[bank], 6U) : 0U;
+        for (std::uint32_t part = 0; part < 2; ++part) {
+          const std::uint32_t begin = part == 0 ? 0 : first_run;
+          const std::uint32_t end = part == 0 ? first_run : slices - gpu_z;
+          for (std::uint32_t g = 0; g < groups && end > begin; ++g) {
+            if (!npu->Submit(stream_, a_ids[g], weight_ids + begin,
+                             c_ids + static_cast<std::size_t>(g) * slices +
+                                 begin,
+                             static_cast<int>(end - begin))) {
+              AssignError(error_msg, "NPU whole projection submit failed");
+              return false;
+            }
           }
+          if (part == 0)
+            prepared->ticket_qkv = npu->Ticket();
         }
         prepared->valid = true;
         prepared->linear = linear;
+        prepared->gpu_z = gpu_z;
         prepared->groups = groups;
         prepared->slices = slices;
         prepared->c_ids = c_ids;
@@ -4794,8 +4930,92 @@ bool Executor::ForwardPair(Session& session,
                     &b_prepared, &preparedB))
         return false;
 
+      // The linear-attention output projection runs on the NPU when every
+      // linear layer has its weights staged: both banks' mixers run first so
+      // the NPU works while the other bank's mixer runs on the GPU.
+      bool split = std::getenv("GUFO_NPU_OUT") == nullptr ||
+                   std::getenv("GUFO_NPU_OUT")[0] != '0';
+      for (std::uint32_t il = first_last; il < c.num_layers && split; ++il) {
+        if (layers[il].linear && layers[il].npu_out_all.size() != 6)
+          split = false;
+      }
+      if (npu_out_a_[0].size() < 3 * npu_whole_groups_ ||
+          npu_out_a_[1].size() < 3 * npu_whole_groups_)
+        split = false;
+      NpuOutState out_a{split, false, 0, 0, nullptr, npu_out_a_[0].data()};
+      NpuOutState out_b{split, false, 0, 0, nullptr, npu_out_a_[1].data()};
+      BankCache a_mixed = a_cache;
+      BankCache b_mixed = b_cache;
+
       for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
         const bool last = il + 1 == c.num_layers;
+
+        if (split) {
+          bool out_n = false;
+          bool out_r = false;
+          SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
+          LoadCache(a_prepared);
+          if (!ForwardBodyRange(session, nA, 0, false, false, a_sparse,
+                                start_pos, a_pool, il, il + 1, error_msg,
+                                nullptr, a_prepared.normed,
+                                a_prepared.res_is_half, false, last, true,
+                                &out_n, &out_r, preparedA.valid, &preparedA,
+                                LayerPhase::kMixer, &out_a))
+            return false;
+          SaveCache(&a_mixed);
+          a_mixed.normed = out_n;
+          a_mixed.res_is_half = out_r;
+
+          SetScratchHost(bank_b_scratch_, bank_b_control_host_,
+                         bank_b_tokens_host_);
+          LoadCache(b_prepared);
+          if (!ForwardBodyRange(session, nB, n_logits, true, false, b_sparse,
+                                b_start, b_pool, il, il + 1, error_msg, nullptr,
+                                b_prepared.normed, b_prepared.res_is_half,
+                                false, last, true, &out_n, &out_r,
+                                preparedB.valid, &preparedB,
+                                LayerPhase::kMixer, &out_b))
+            return false;
+          SaveCache(&b_mixed);
+          b_mixed.normed = out_n;
+          b_mixed.res_is_half = out_r;
+
+          SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
+          LoadCache(a_mixed);
+          if (!ForwardBodyRange(session, nA, 0, false, false, a_sparse,
+                                start_pos, a_pool, il, il + 1, error_msg,
+                                nullptr, a_mixed.normed, a_mixed.res_is_half,
+                                false, last, true, &out_n, &out_r, false,
+                                nullptr, LayerPhase::kFfn, &out_a))
+            return false;
+          SaveCache(&a_cache);
+          a_cache.normed = out_n;
+          a_cache.res_is_half = out_r;
+          if (il + 1 < c.num_layers &&
+              !prefetch(saved_scratch, saved_control_host, saved_tokens_host,
+                        a_cache, out_n, out_r, nA, il + 1, 0, &a_prepared,
+                        &preparedA))
+            return false;
+
+          SetScratchHost(bank_b_scratch_, bank_b_control_host_,
+                         bank_b_tokens_host_);
+          LoadCache(b_mixed);
+          if (!ForwardBodyRange(session, nB, n_logits, true, false, b_sparse,
+                                b_start, b_pool, il, il + 1, error_msg, nullptr,
+                                b_mixed.normed, b_mixed.res_is_half, false,
+                                last, true, &out_n, &out_r, false, nullptr,
+                                LayerPhase::kFfn, &out_b))
+            return false;
+          SaveCache(&b_cache);
+          b_cache.normed = out_n;
+          b_cache.res_is_half = out_r;
+          if (il + 1 < c.num_layers &&
+              !prefetch(bank_b_scratch_, bank_b_control_host_,
+                        bank_b_tokens_host_, b_cache, out_n, out_r, nB, il + 1,
+                        1, &b_prepared, &preparedB))
+            return false;
+          continue;
+        }
 
         a_normed = a_prepared.normed;
         a_res_half = a_prepared.res_is_half;

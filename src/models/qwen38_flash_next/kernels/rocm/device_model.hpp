@@ -61,6 +61,8 @@ struct DeviceLayer {
   std::vector<int> npu_ssm_all;
   /// Whole attn_qkv slices (13) staged only when GUFO_NPU_WHOLE=1.
   std::vector<int> npu_qkv_all;
+  /// ssm_out as three K chunks of three 1024-row slices (chunk-major).
+  std::vector<int> npu_out_all;
   /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,
