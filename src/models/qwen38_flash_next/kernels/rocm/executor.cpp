@@ -1222,6 +1222,10 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  if (gdn_chunk_scratch_ != nullptr) {
+    (void)hipStreamSynchronize(stream_);
+    (void)hipFree(gdn_chunk_scratch_);
+  }
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
   if (ple_pending_ || prefetch_.pending) {
@@ -2942,6 +2946,27 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                         c.ssm_head_dim == 128 &&
                         l.ssm_out.type == GgmlType::kQ8_0 &&
                         l.ssm_out.cols == value_dim && UnpaddedQ8(value_dim);
+  // The whole-projection path stores F16 convolution rows and runs the
+  // chunked recurrence; its scratch is shared by every layer and bank.
+  void* chunk_scratch = nullptr;
+  std::size_t chunk_scratch_bytes = 0;
+  if (whole_streams_.table != nullptr && n_tokens % 64 == 0) {
+    const std::size_t need = GdnChunkScratchBytesFor(n_tokens);
+    if (gdn_chunk_scratch_bytes_ < need) {
+      if (gdn_chunk_scratch_ != nullptr) {
+        (void)hipStreamSynchronize(stream_);
+        (void)hipFree(gdn_chunk_scratch_);
+        gdn_chunk_scratch_ = nullptr;
+        gdn_chunk_scratch_bytes_ = 0;
+      }
+      if (hipMalloc(&gdn_chunk_scratch_, need) == hipSuccess)
+        gdn_chunk_scratch_bytes_ = need;
+      else
+        gdn_chunk_scratch_ = nullptr;
+    }
+    chunk_scratch = gdn_chunk_scratch_;
+    chunk_scratch_bytes = gdn_chunk_scratch_bytes_;
+  }
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
@@ -2958,8 +2983,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                   finish = nullptr;
                 } : nullptr,
                 &npu_finish, z_streams, z_stream_stride, z_group_tokens,
-                z_gpu_cols,
-                whole_streams_.table != nullptr);
+                z_gpu_cols, whole_streams_.table != nullptr,
+                chunk_scratch, chunk_scratch_bytes);
   if (npu_finish) {
     npu_finish();
     npu_finish = nullptr;

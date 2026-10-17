@@ -520,7 +520,10 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    const std::uint8_t* const* z_streams = nullptr,
                    std::uint32_t z_stream_stride = 0,
                    std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0,
-                   bool conv_half = false);
+                   bool conv_half = false, void* chunk_scratch = nullptr,
+                   std::size_t chunk_scratch_bytes = 0);
+/// Bytes of scratch the chunked recurrence needs for `n_tokens` tokens.
+std::size_t GdnChunkScratchBytesFor(std::size_t n_tokens);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.
