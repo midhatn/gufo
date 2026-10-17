@@ -446,13 +446,9 @@ struct NpuGemm::Impl {
         return ticket != 0 ? completed >= ticket : completed == enqueued;
       });
     }
-    const double blocked = std::chrono::duration<double, std::micro>(
-                               std::chrono::steady_clock::now() - t0)
-                               .count();
-    wait_us += blocked;
-    if (std::getenv("GUFO_NPU_WAITLOG") != nullptr)
-      std::fprintf(stderr, "waitlog %llu %.0f\n",
-                   static_cast<unsigned long long>(ticket), blocked);
+    wait_us += std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
     Trace("wait_end");
     if (stats && ++waits % 36 == 0) {
       std::fprintf(stderr,

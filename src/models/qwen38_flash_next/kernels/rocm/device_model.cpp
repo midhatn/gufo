@@ -787,36 +787,6 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
             }
           }
         }
-        // ssm_out (2560 x 6144): three K chunks of 2560 (the last 1024 wide,
-        // zero padded) by two 1024-row slices; the last 512 rows stay on the
-        // GPU.
-        for (auto& l : m->layers_) {
-          if (!l.linear || l.ssm_out.data == nullptr ||
-              l.ssm_out.type != core::GgmlType::kQ8_0 ||
-              l.ssm_out.rows != 2560 || l.ssm_out.cols != 6144 ||
-              npu->k() != 2560 || npu->n() != 1024) {
-            continue;
-          }
-          std::vector<int> ids;
-          for (std::uint32_t q = 0; q < 3 && ids.size() == q * 2; ++q) {
-            for (std::uint32_t i = 0; i < 2; ++i) {
-              const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
-              if (id < 0)
-                break;
-              NpuEncodeWeights(l.ssm_out.data, l.ssm_out.cols, i * npu->n(),
-                               npu->n(), npu->k(), q * npu->k(), l.ssm_out.cols,
-                               npu->Device(id), nullptr);
-              ids.push_back(id);
-              staged += npu->BBytes();
-            }
-          }
-          if (hipDeviceSynchronize() != hipSuccess)
-            ids.clear();
-          for (int id : ids)
-            npu->FinalizeWeights(id);
-          if (ids.size() == 6)
-            l.npu_out_all = std::move(ids);
-        }
         for (auto& l : m->layers_) {
           if (!l.linear && l.attn_qkv.data != nullptr &&
               l.attn_qkv.type == core::GgmlType::kQ8_0 &&

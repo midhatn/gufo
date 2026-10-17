@@ -2562,69 +2562,6 @@ __global__ void SsmConv4StreamsV2Kernel(
   }
 }
 
-__global__ void NpuSumStreamsKernel(
-    const std::uint8_t* const* __restrict__ streams,
-    std::uint32_t stream_stride, std::uint32_t stream_tokens,
-    std::uint32_t chunks, std::uint32_t stream_cols,
-    const float* __restrict__ tail, float* __restrict__ out,
-    std::uint32_t n_tokens, std::uint32_t cols) {
-  const std::uint32_t cg = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::uint32_t c0 = cg * 8;
-  const std::uint32_t tb = blockIdx.y * 8;
-  if (c0 >= cols || tb >= n_tokens) {
-    return;
-  }
-  if (c0 >= stream_cols) {
-    // Columns the GPU computed itself.
-    const std::uint32_t tail_cols = cols - stream_cols;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float4* src = reinterpret_cast<const float4*>(
-          tail + static_cast<std::size_t>(tb + i) * tail_cols +
-          (c0 - stream_cols));
-      float4* dst = reinterpret_cast<float4*>(
-          out + static_cast<std::size_t>(tb + i) * cols + c0);
-      dst[0] = src[0];
-      dst[1] = src[1];
-    }
-    return;
-  }
-  const std::uint32_t slice = c0 / 1024;
-  const std::uint32_t col0 = c0 % 1024;
-  const std::uint32_t group = tb / stream_tokens;
-  const std::uint32_t tl = tb % stream_tokens;
-  float sum[8][8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      sum[i][k] = 0.0F;
-    }
-  }
-  for (std::uint32_t q = 0; q < chunks; ++q) {
-    const StreamRunWords words = LoadStreamWords(
-        streams[std::size_t{group} * stream_stride + q * (stream_cols / 1024) +
-                slice],
-        tl, col0);
-    float v[8][8];
-    DecodeStreamWords(words, v);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-#pragma unroll
-      for (int k = 0; k < 8; ++k) {
-        sum[i][k] += v[i][k];
-      }
-    }
-  }
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    float4* dst = reinterpret_cast<float4*>(
-        out + static_cast<std::size_t>(tb + i) * cols + c0);
-    dst[0] = make_float4(sum[i][0], sum[i][1], sum[i][2], sum[i][3]);
-    dst[1] = make_float4(sum[i][4], sum[i][5], sum[i][6], sum[i][7]);
-  }
-}
-
 __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
                                   float* q, float* gate, float* k, float* v,
                                   std::uint32_t heads, std::uint32_t d,
@@ -7787,22 +7724,14 @@ bool LaunchDenseF16Gemm(const void* w, const __half* x, float* out,
     return false;
   }
   if (input_stride != 0 && input_stride != k) {
-    if (batch < 1024 || m % 256 != 0 || k != 6144 || input_stride < k ||
+    if (batch < 1024 || m != 2560 || k != 6144 || input_stride < k ||
         input_stride % 8 != 0)
       return false;
-    if (m == 2560) {
-      hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 5, false, false, false, false, false, false, true>),
-                         dim3((batch + 127) / 128, (m + 255) / 256),
-                         dim3(kThreads), 0, stream, w, x, out, batch, m, k,
-                         nullptr, nullptr, nullptr, nullptr, nullptr,
-                         AttentionProjectionOutput{}, 0, input_stride);
-    } else {
-      hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false, false, false, false, false, true>),
-                         dim3((batch + 127) / 128, (m + 255) / 256),
-                         dim3(kThreads), 0, stream, w, x, out, batch, m, k,
-                         nullptr, nullptr, nullptr, nullptr, nullptr,
-                         AttentionProjectionOutput{}, 0, input_stride);
-    }
+    hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 5, false, false, false, false, false, false, true>),
+                       dim3((batch + 127) / 128, (m + 255) / 256),
+                       dim3(kThreads), 0, stream, w, x, out, batch, m, k,
+                       nullptr, nullptr, nullptr, nullptr, nullptr,
+                       AttentionProjectionOutput{}, 0, input_stride);
     return true;
   }
   // The same tile plan as the W8A8 route: a 128-token macro tile for wide
@@ -7984,8 +7913,7 @@ __global__ void __launch_bounds__(256)
 __global__ void NpuEncodeWeightsQ8Kernel(
     const Q8_0Block* __restrict__ w, std::uint8_t* __restrict__ out,
     std::uint32_t row0, std::uint32_t cols, std::uint32_t k_slice,
-    std::uint32_t k_offset, std::uint32_t k_valid, std::uint32_t k_total,
-    std::uint32_t rows_valid) {
+    std::uint32_t k_offset, std::uint32_t k_valid, std::uint32_t k_total) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
   const std::size_t total = std::size_t{k_slice} * cols / 8;
   if (g >= total) {
@@ -8004,7 +7932,7 @@ __global__ void NpuEncodeWeightsQ8Kernel(
   const std::uint32_t kk = k_offset + tile_row * kNpuTileK + sr * 8;
   const std::uint32_t nn = tile_col * kNpuTileN + (sc2 * 2 + block) * 8 + cib;
   float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  if (kk + 8 <= k_valid && row0 + nn < rows_valid) {
+  if (kk + 8 <= k_valid) {
     const Q8_0Block& b =
         w[static_cast<std::size_t>(row0 + nn) * (k_total / 32) + kk / 32];
     const float scale = __half2float(b.d);
@@ -8165,12 +8093,12 @@ void NpuEncodeActivations(const __half* x, std::size_t ldx,
 void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
-                      hipStream_t stream, std::uint32_t rows_valid) {
+                      hipStream_t stream) {
   const std::size_t groups = std::size_t{k_slice} * cols / 8;
   hipLaunchKernelGGL(
       NpuEncodeWeightsQ8Kernel, dim3(Blocks(groups)), dim3(kThreads), 0, stream,
       static_cast<const Q8_0Block*>(q8), static_cast<std::uint8_t*>(dst), row0,
-      cols, k_slice, k_offset, k_valid, k_total, rows_valid);
+      cols, k_slice, k_offset, k_valid, k_total);
 }
 
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
@@ -8197,21 +8125,6 @@ void NpuDecodeStreamRows(const std::uint8_t* const* streams,
   hipLaunchKernelGGL(NpuDecodeStreamRowsKernel, dim3(Blocks(cols), rows),
                      dim3(kThreads), 0, stream, streams, stream_stride,
                      stream_tokens, out, row0, rows, cols, out_pitch, col0);
-}
-
-void NpuSumStreams(const std::uint8_t* const* streams,
-                   std::uint32_t stream_stride, std::uint32_t stream_tokens,
-                   std::uint32_t chunks, std::uint32_t stream_cols,
-                   const float* tail, float* out, std::uint32_t n_tokens,
-                   std::uint32_t cols, hipStream_t stream) {
-  if (streams == nullptr || stream_stride == 0 || stream_tokens % 8 != 0 ||
-      n_tokens % 8 != 0 || cols % 8 != 0 || chunks == 0) {
-    return;
-  }
-  hipLaunchKernelGGL(NpuSumStreamsKernel,
-                     dim3(Blocks(cols / 8), n_tokens / 8), dim3(kThreads), 0,
-                     stream, streams, stream_stride, stream_tokens, chunks,
-                     stream_cols, tail, out, n_tokens, cols);
 }
 
 void SsmConv4Streams(const std::uint8_t* const* streams,
