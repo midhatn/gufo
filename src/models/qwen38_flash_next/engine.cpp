@@ -670,9 +670,6 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                                         : model_->PrefillCapacity(),
         rest.size()));
     bool used_pair = false;
-    if (std::getenv("GUFO_TWO_BANK_LOG") != nullptr)
-      std::fprintf(stderr, "two-bank: chunk n=%zu prefill=%d capture=%d\n", n,
-                   prefill ? 1 : 0, capture != nullptr ? 1 : 0);
     if (prefill && capture == nullptr) {
       std::uint32_t nA = 0;
       std::uint32_t nB = 0;

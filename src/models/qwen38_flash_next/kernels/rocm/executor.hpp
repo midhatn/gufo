@@ -602,7 +602,8 @@ private:
     void* ctx_q8_1;  ///< by the attention output gate (attn_out's input)
     void* x_q8t;     ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
-    __half* res_h;  ///< F16 residual of large wide-prefill chunks (see ForwardBody)
+    __half*
+        res_h;  ///< F16 residual of large wide-prefill chunks (see ForwardBody)
     float* xn;
     __half* xn_half;  ///< xn as F16 on the F16 mixer input route
     void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection
@@ -822,7 +823,6 @@ private:
     const std::uint8_t* const* table{nullptr};  ///< [group * 16 + slice]
     std::uint32_t groups{0};
     std::uint32_t group_tokens{0};
-    bool hybrid{false};
   };
   /// Set while a whole-projection linear layer runs: its qkv/z values are read
   /// straight from the NPU streams (fused convolution, z in the epilogue).
@@ -835,8 +835,10 @@ private:
   mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
-  mutable bool inject_fused_{false};  ///< the last combine formed the inject logits
-  mutable const float* inject_fused_w_{nullptr};  ///< for the mixer with these weights
+  mutable bool inject_fused_{
+      false};  ///< the last combine formed the inject logits
+  mutable const float* inject_fused_w_{
+      nullptr};  ///< for the mixer with these weights
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   mutable unsigned q8_slot_{0};

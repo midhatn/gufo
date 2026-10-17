@@ -718,7 +718,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         }
       }
       if (gate_layers != 0) {
-        std::fprintf(stderr, "NPU: attention query/gate of %u layers\n", gate_layers);
+        std::fprintf(stderr, "NPU: attention query/gate of %u layers\n",
+                     gate_layers);
       }
       // GUFO_NPU_SHEXP=0 keeps the shared expert gate and up projections on
       // the GPU.

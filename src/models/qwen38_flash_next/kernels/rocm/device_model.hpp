@@ -55,7 +55,8 @@ struct DeviceLayer {
   /// heads each) of attn_qkv; empty when unused.
   std::vector<int> npu_gate;
   /// NPU buffer ids of the shared expert gate and up weights (640 rows each,
-  /// in 1024-row slices with the unused rows left unwritten); empty when unused.
+  /// in 1024-row slices with the unused rows left unwritten); empty when
+  /// unused.
   std::vector<int> npu_shexp;
   /// Whole ssm_in slices (16) staged only when GUFO_NPU_WHOLE=1.
   std::vector<int> npu_ssm_all;

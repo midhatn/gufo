@@ -210,11 +210,12 @@ struct NpuGemm::Impl {
   // GUFO_NPU_STATS=1: wall-clock accounting printed every 36 waits.
   const bool stats{std::getenv("GUFO_NPU_STATS") != nullptr};
   double submit_us{0};
-  // Phase totals of the worker (GUFO_NPU_STATS): where the NPU path spends time.
-  double copy_a_us{0};     // A host->private copy + sync
-  double launch_us{0};     // kernel(...) submissions
-  double run_wait_us{0};   // waiting for the NPU itself
-  double copy_c_us{0};     // C sync + private->host copy
+  // Phase totals of the worker (GUFO_NPU_STATS): where the NPU path spends
+  // time.
+  double copy_a_us{0};    // A host->private copy + sync
+  double launch_us{0};    // kernel(...) submissions
+  double run_wait_us{0};  // waiting for the NPU itself
+  double copy_c_us{0};    // C sync + private->host copy
   double wait_us{0};
   std::uint64_t waits{0};
 
@@ -639,7 +640,9 @@ void* NpuGemm::Staged(hipStream_t /*stream*/, int id) {
   return impl_->buffers.at(id).device;
 }
 
-std::uint64_t NpuGemm::Ticket() const noexcept { return impl_->submitted; }
+std::uint64_t NpuGemm::Ticket() const noexcept {
+  return impl_->submitted;
+}
 
 bool NpuGemm::Wait(hipStream_t stream, std::uint64_t ticket) {
   struct Req {

@@ -2352,12 +2352,11 @@ void Executor::Combine(void* res, const float* gamma, std::uint32_t n_tokens,
     moe_pending_ = false;
     const auto* down = reinterpret_cast<const __half*>(s_.down_e);
     if (wide_mixer_ && MatrixRows(n_tokens) &&
-        HcCombineMoeF16(res, down, s_.weights, s_.shexp_out,
-                        s_.router + c.num_experts, c.num_experts + 1,
-                        c.num_experts_used, s_.inject, inject_parts_, gamma,
-                        s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
-                        c.hc_count, c.rms_eps, stream_, res_half, inject_w,
-                        inject_out)) {
+        HcCombineMoeF16(
+            res, down, s_.weights, s_.shexp_out, s_.router + c.num_experts,
+            c.num_experts + 1, c.num_experts_used, s_.inject, inject_parts_,
+            gamma, s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count,
+            c.rms_eps, stream_, res_half, inject_w, inject_out)) {
       return;
     }
     MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
@@ -2489,14 +2488,12 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       const bool inject_ready = normed && inject_fused_ && fused_inject &&
                                 inject_fused_w_ == m.inject.f32();
       if (up == nullptr ||
-          !HcMixF16Gemm(up, reinterpret_cast<const __half*>(s_.hc_gate),
-                        s_.xn_half,
-                        fused_inject && !inject_ready ? m.inject.f32()
-                                                      : nullptr,
-                        half_only ? nullptr : mixed,
-                        static_cast<__half*>(s_.x_half),
-                        half_only ? nullptr : s_.x_q8t, inject, n_tokens,
-                        c.hidden_size, c.hc_low_rank, stream_, half_mixer)) {
+          !HcMixF16Gemm(
+              up, reinterpret_cast<const __half*>(s_.hc_gate), s_.xn_half,
+              fused_inject && !inject_ready ? m.inject.f32() : nullptr,
+              half_only ? nullptr : mixed, static_cast<__half*>(s_.x_half),
+              half_only ? nullptr : s_.x_q8t, inject, n_tokens, c.hidden_size,
+              c.hc_low_rank, stream_, half_mixer)) {
         AssignError(error_msg, "fused HC projection failed");
         return false;
       }
@@ -2572,7 +2569,8 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   if (ple_ahead_.valid) {
     const auto& a = ple_ahead_;
     const bool match =
-        !speculative && a.owner == &session && a.tokens.size() == tokens.size() &&
+        !speculative && a.owner == &session &&
+        a.tokens.size() == tokens.size() &&
         std::equal(tokens.begin(), tokens.end(), a.tokens.begin()) &&
         a.before.prev == session.ngram_.prev;
     ple_ahead_.valid = false;
@@ -2809,9 +2807,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
         // through it as consecutive groups.
         const std::uint32_t group_tokens = npu->tokens();
         const std::uint32_t groups = n_tokens / group_tokens;
-        const bool hybrid =
-            whole_streams_.table != nullptr && whole_streams_.hybrid;
-        for (std::uint32_t g = 0; g < (hybrid ? 0U : groups); ++g) {
+        for (std::uint32_t g = 0; g < groups; ++g) {
           NpuEncodeActivations(
               static_cast<const __half*>(s_.x_half) +
                   static_cast<std::size_t>(g) * group_tokens * l.ssm_in.cols,
@@ -2829,20 +2825,13 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
             stream_, checkpoint.tokens, false, gpu_rows);
         // Past the convolution channels the epilogue reads z from the NPU
         // streams itself; the decode pass is only for the other layouts.
-        const bool z_direct =
-            hybrid || (npu_c_dev_ != nullptr && gpu_rows >= channels);
-        z_streams = hybrid ? whole_streams_.table + 10
-                           : (z_direct ? npu_c_dev_ : nullptr);
-        if (hybrid) {
-          z_stream_stride = 16;
-        }
+        const bool z_direct = npu_c_dev_ != nullptr && gpu_rows >= channels;
+        z_streams = z_direct ? npu_c_dev_ : nullptr;
         z_gpu_cols = gpu_rows - channels;
         z_group_tokens = group_tokens;
-        npu_finish = [this, &l, npu, groups, group_tokens, gpu_rows, hybrid,
+        npu_finish = [this, &l, npu, groups, group_tokens, gpu_rows,
                       z_direct]() {
-          if (!hybrid) {
-            npu->Wait(stream_);
-          }
+          npu->Wait(stream_);
           if (z_direct) {
             return;
           }
@@ -2867,12 +2856,6 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
           SsmConvTail(s_.qkvz, l.ssm_conv1d.f32(), s.conv_state,
                       s_.conv_scratch, n_tokens, channels, l.ssm_in.rows,
                       gpu_rows, stream_);
-        }
-      } else if (std::getenv("GUFO_FORCE_UNFUSED") != nullptr) {
-        if (!DenseF16Gemm(l.ssm_in.data, static_cast<const __half*>(s_.x_half),
-                          s_.qkvz, n_tokens, l.ssm_in.rows, l.ssm_in.cols,
-                          stream_)) {
-          return false;
         }
       } else {
         convolved = DenseF16SsmGemm(
@@ -2909,7 +2892,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
-  if (whole_streams_.table != nullptr && !whole_streams_.hybrid) {
+  if (whole_streams_.table != nullptr) {
     // Whole projection from the NPU streams: the convolution reads the qkv
     // slices directly and the epilogue reads z (slices 10..15) from the
     // streams. Only the last kernel-1 raw rows are decoded, for the history.
@@ -2976,7 +2959,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 } : nullptr,
                 &npu_finish, z_streams, z_stream_stride, z_group_tokens,
                 z_gpu_cols,
-                whole_streams_.table != nullptr && !whole_streams_.hybrid);
+                whole_streams_.table != nullptr);
   if (npu_finish) {
     npu_finish();
     npu_finish = nullptr;
@@ -3082,8 +3065,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       }
     } else if (projections_ready && whole_streams_.table != nullptr &&
                c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
-               l.attn_qkv.rows == 13312 &&
-               std::getenv("GUFO_ATTN_NOFUSE") == nullptr) {
+               l.attn_qkv.rows == 13312) {
       const std::uint32_t group_tokens = whole_streams_.group_tokens;
       PrepareQueryHeadsStreams(whole_streams_.table, 13, group_tokens,
                                l.attn_q_norm.f32(), s_.q, s_.attn_gate,
@@ -3214,11 +3196,10 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     const std::uint32_t q_heads =
         static_cast<std::uint32_t>(l.npu_gate.size()) * 2;
     if (npu_c_dev_ != nullptr) {
-      PrepareQueryHeadsStreams(npu_c_dev_, kNpuSlicesMax, group_tokens,
-                               l.attn_q_norm.f32(), s_.q, s_.attn_gate,
-                               n_tokens, c.num_heads, c.num_kv_heads,
-                               c.head_dim, c.rotary_dim, pos, c.rope_theta,
-                               c.rms_eps, stream_, s.rope, q_heads);
+      PrepareQueryHeadsStreams(
+          npu_c_dev_, kNpuSlicesMax, group_tokens, l.attn_q_norm.f32(), s_.q,
+          s_.attn_gate, n_tokens, c.num_heads, c.num_kv_heads, c.head_dim,
+          c.rotary_dim, pos, c.rope_theta, c.rms_eps, stream_, s.rope, q_heads);
     } else {
       const std::uint32_t packed_stride =
           2 * c.AttentionQDim() + 2 * c.AttentionKvDim();
@@ -3668,8 +3649,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     first.rows = mtp_head_rows_;
     DeviceTensor tail = output;
     tail.rows = mtp_tail_rows_;
-    tail.data = static_cast<std::uint8_t*>(output.data) +
-                row_bytes * mtp_tail_base_;
+    tail.data =
+        static_cast<std::uint8_t*>(output.data) + row_bytes * mtp_tail_base_;
     if (!Dense(first, s_.mixed, s_.logits, 1, error_msg) ||
         !Dense(tail, s_.mixed, s_.logits + mtp_head_rows_, 1, error_msg)) {
       return false;
@@ -3962,9 +3943,7 @@ bool Executor::ForwardBodyRange(
 
         auto& s = session.linear_[il];
         const std::uint32_t channels = c.SsmConvChannels();
-        bool whole_streams = std::getenv("GUFO_WHOLE_GPUSUB") == nullptr &&
-                             std::getenv("GUFO_WHOLE_NOFUSE") == nullptr &&
-                             !speculative && checkpoint == nullptr &&
+        bool whole_streams = !speculative && checkpoint == nullptr &&
                              prepared->slices == 16 && group_tokens != 0 &&
                              prepared->groups * group_tokens == n &&
                              channels == 10240 && stride == 16384;
@@ -3979,14 +3958,7 @@ bool Executor::ForwardBodyRange(
           }
         }
 
-        if (std::getenv("GUFO_WHOLE_REMIX") != nullptr &&
-            !HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
-                   half_only)) {
-          return false;
-        }
-        const bool gpusub = std::getenv("GUFO_WHOLE_GPUSUB2") != nullptr ||
-                            std::getenv("GUFO_WHOLE_HYBRID") != nullptr;
-        if (!gpusub && !l.ssm_alpha_beta.empty()) {
+        if (!l.ssm_alpha_beta.empty()) {
           if (l.ssm_alpha_beta.type == GgmlType::kF16) {
             if (!blaslt_->Gemm(
                     l.ssm_alpha_beta.data, s_.x_half, s_.alpha_beta, HIP_R_16F,
@@ -4001,19 +3973,7 @@ bool Executor::ForwardBodyRange(
           }
         }
 
-        if (gpusub) {
-          if (std::getenv("GUFO_WHOLE_HYBRID") != nullptr &&
-              streams != nullptr) {
-            whole_streams_ = {streams, prepared->groups, group_tokens, true};
-          }
-        } else if (std::getenv("GUFO_WHOLE_GPUSUB") != nullptr) {
-          if (!DenseF16Gemm(l.ssm_in.data,
-                            static_cast<const __half*>(s_.x_half), s_.qkvz, n,
-                            l.ssm_in.rows, l.ssm_in.cols, stream_)) {
-            AssignError(error_msg, "gpusub gemm failed");
-            return false;
-          }
-        } else if (whole_streams) {
+        if (whole_streams) {
           whole_streams_ = {streams, prepared->groups, group_tokens};
         } else {
           for (std::uint32_t g = 0; g < prepared->groups; ++g) {
@@ -4038,7 +3998,7 @@ bool Executor::ForwardBodyRange(
                 : GdnCheckpoint{};
         const bool linear_ok =
             LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out, n,
-                            speculative, error_msg, !gpusub, true, capture);
+                            speculative, error_msg, true, true, capture);
         whole_streams_ = {};
         if (!linear_ok) {
           return false;
@@ -4054,7 +4014,7 @@ bool Executor::ForwardBodyRange(
           return false;
         }
         const std::uint8_t* const* attn_streams =
-            std::getenv("GUFO_ATTN_NOFUSE") != nullptr || prepared->slices != 13
+            prepared->slices != 13
                 ? nullptr
                 : MakeNpuWholeStreamTable(
                       npu, prepared->c_ids, prepared->groups, prepared->slices,
@@ -4226,16 +4186,6 @@ bool Executor::ForwardBodyRange(
                                   hipMemcpyDeviceToHost, stream_),
                "logits download", error_msg)) {
       return false;
-    }
-    if (const char* dump = std::getenv("GUFO_LOGIT_DUMP");
-        dump != nullptr && n_logits > 0 &&
-        Check(hipStreamSynchronize(stream_), "logit dump", error_msg)) {
-      if (std::FILE* f = std::fopen(dump, "ab")) {
-        std::fwrite(logits_host_ +
-                        static_cast<std::size_t>(n_logits - 1) * c.vocab_size,
-                    sizeof(float), c.vocab_size, f);
-        std::fclose(f);
-      }
     }
   }
   return true;
@@ -4445,13 +4395,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 bool Executor::CanForwardPair(const Session& session, std::size_t n,
                               std::uint32_t n_logits, std::uint32_t* nA,
                               std::uint32_t* nB, std::string* error_msg) const {
-  auto why = [&](int line) {
-    if (std::getenv("GUFO_TWO_BANK_LOG") != nullptr)
-      std::fprintf(stderr,
-                   "two-bank: cannot pair (line %d) n=%zu max_batch=%u\n", line,
-                   n, options_.max_batch);
-    return false;
-  };
+  auto why = [&](int) { return false; };
   if (!TwoBankEnabled())
     return why(__LINE__);
   const char* mode = std::getenv("GUFO_TWO_BANK");
@@ -4467,13 +4411,8 @@ bool Executor::CanForwardPair(const Session& session, std::size_t n,
   const auto prefix = session.VisionLayout().PrefixLength();
   if (prefix != 0 && session.position_ < prefix)
     return why(__LINE__);
-  if ((session.snapshots_ != nullptr ||
-       session.continuation_hooks_ != nullptr) &&
-      std::getenv("GUFO_TWO_BANK_FORCE") == nullptr) {
-    if (std::getenv("GUFO_TWO_BANK_LOG") != nullptr)
-      std::fprintf(stderr, "two-bank: skipped (snapshots/hooks)\n");
+  if (session.snapshots_ != nullptr || session.continuation_hooks_ != nullptr)
     return why(__LINE__);
-  }
   if (session.mtp_enabled_ && session.mtp_.position != session.position_)
     return why(__LINE__);
   if (n_logits > n)
@@ -4680,12 +4619,6 @@ bool Executor::ForwardPair(Session& session,
               a_groups != 0 && b_groups != 0 && a_groups <= npu_whole_groups_ &&
               b_groups <= npu_whole_groups_ &&
               max_half_cols >= static_cast<std::size_t>(npu->k());
-      std::fprintf(stderr,
-                   "two-bank: whole=%d enabled=%d npu=%d healthy=%d groups=%u "
-                   "nA=%u nB=%u first_last=%u\n",
-                   whole ? 1 : 0, npu_whole_enabled_ ? 1 : 0, npu != nullptr,
-                   npu != nullptr && npu->Healthy(), npu_whole_groups_, nA, nB,
-                   first_last);
       if (whole) {
         for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
           const DeviceLayer& l = layers[il];
@@ -4723,13 +4656,6 @@ bool Executor::ForwardPair(Session& session,
         LoadCache(cache);
         const DeviceLayer& l = layers[il];
         const bool linear = l.linear;
-        if (const char* only = std::getenv("GUFO_WHOLE_ONLY");
-            only != nullptr && ((only[0] == 'l') != linear)) {
-          SaveCache(out_cache);
-          (*out_cache).normed = normed;
-          (*out_cache).res_is_half = res_half;
-          return true;
-        }
         const DeviceTensor& w = linear ? l.ssm_in : l.attn_qkv;
         if (w.empty() || w.cols != npu->k() ||
             static_cast<std::size_t>(w.cols) > model_->max_half_cols() ||
@@ -4841,35 +4767,7 @@ bool Executor::ForwardPair(Session& session,
         }
       }
     } else {
-      const bool seq_debug = std::getenv("GUFO_PAIR_SEQ") != nullptr;
-      if (seq_debug) {
-        for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
-          const bool last = il + 1 == c.num_layers;
-          a_normed = a_cache.normed;
-          a_res_half = a_cache.res_is_half;
-          if (!run(saved_scratch, saved_control_host, saved_tokens_host,
-                   start_pos, nA, session.blocks_, a_pool, il, il + 1, 0, false,
-                   last, &a_normed, &a_res_half))
-            return false;
-          SaveCache(&a_cache);
-          a_cache.normed = a_normed;
-          a_cache.res_is_half = a_res_half;
-        }
-        for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
-          const bool last = il + 1 == c.num_layers;
-          b_normed = b_cache.normed;
-          b_res_half = b_cache.res_is_half;
-          if (!run(bank_b_scratch_, bank_b_control_host_, bank_b_tokens_host_,
-                   b_start, nB, blocks_after_a, b_pool, il, il + 1, n_logits,
-                   true, last, &b_normed, &b_res_half))
-            return false;
-          SaveCache(&b_cache);
-          b_cache.normed = b_normed;
-          b_cache.res_is_half = b_res_half;
-        }
-      }
-      for (std::uint32_t il = seq_debug ? c.num_layers : first_last;
-           il < c.num_layers; ++il) {
+      for (std::uint32_t il = first_last; il < c.num_layers; ++il) {
         const bool last = il + 1 == c.num_layers;
 
         a_normed = a_cache.normed;
