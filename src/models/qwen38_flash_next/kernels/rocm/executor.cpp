@@ -2917,7 +2917,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     constexpr std::uint32_t kZSlice0 = 10;
     SsmConv4Streams(whole_streams_.table, kWholeSlices,
                     whole_streams_.group_tokens, l.ssm_conv1d.f32(),
-                    s.conv_state, s_.conv_scratch, n_tokens, channels, stream_);
+                    s.conv_state, s_.conv_scratch, n_tokens, channels, stream_,
+                    true);
     const std::uint32_t tail_rows =
         std::min<std::uint32_t>(n_tokens, c.ssm_conv_kernel - 1);
     NpuDecodeStreamRows(
@@ -2974,7 +2975,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                   finish = nullptr;
                 } : nullptr,
                 &npu_finish, z_streams, z_stream_stride, z_group_tokens,
-                z_gpu_cols);
+                z_gpu_cols,
+                whole_streams_.table != nullptr && !whole_streams_.hybrid);
   if (npu_finish) {
     npu_finish();
     npu_finish = nullptr;

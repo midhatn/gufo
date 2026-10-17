@@ -363,24 +363,12 @@ void NpuDecodeStreamRows(const std::uint8_t* const* streams,
                          std::uint32_t row0, std::uint32_t rows,
                          std::uint32_t cols, std::size_t out_pitch,
                          std::uint32_t col0, hipStream_t stream);
-void SsmConv4Streams(const std::uint8_t* const* streams,
-                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
-                     const float* w, float* conv_state, float* out,
-                     std::uint32_t n_tokens, std::uint32_t channels,
-                     hipStream_t stream);
-
-void NpuDecodeStreamRows(const std::uint8_t* const* streams,
-                         std::uint32_t stream_stride,
-                         std::uint32_t stream_tokens, float* out,
-                         std::uint32_t row0, std::uint32_t rows,
-                         std::uint32_t cols, std::size_t out_pitch,
-                         std::uint32_t col0, hipStream_t stream);
 
 void SsmConv4Streams(const std::uint8_t* const* streams,
                      std::uint32_t stream_stride, std::uint32_t stream_tokens,
-                     const float* w, float* conv_state, float* out,
+                     const float* w, float* conv_state, void* out,
                      std::uint32_t n_tokens, std::uint32_t channels,
-                     hipStream_t stream);
+                     hipStream_t stream, bool half_out = false);
 
 bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
                        hipStream_t stream);
@@ -514,7 +502,7 @@ struct GdnCheckpoint {
 /// `out_q8_1` also receives the rows' unpadded Q8_1 rows (as
 /// qfn_mmq_quantize_q8_1 writes them; d == 128). `convolved` consumes
 /// convolution rows already in conv_scratch; it requires null speculative
-/// snapshots.
+/// snapshots. `conv_half` says those rows are F16 (row-split path only).
 void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -531,7 +519,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    void* before_epilogue_arg = nullptr,
                    const std::uint8_t* const* z_streams = nullptr,
                    std::uint32_t z_stream_stride = 0,
-                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0);
+                   std::uint32_t z_tokens = 0, std::uint32_t z_gpu_cols = 0,
+                   bool conv_half = false);
 
 /// Private rows for one request in a decode batch. Scratch regions and all
 /// recurrent/history/rollback buffers must be disjoint between requests.

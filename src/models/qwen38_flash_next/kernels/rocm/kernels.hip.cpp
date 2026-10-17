@@ -1559,7 +1559,15 @@ __global__ void GdnPrepKernel(const float* conv_out, float* qn, float* kn,
   }
 }
 
-__global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
+__device__ inline float4 LoadHalf4(const __half* p) {
+  const uint2 u = *reinterpret_cast<const uint2*>(p);
+  const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+  const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+  return make_float4(lo.x, lo.y, hi.x, hi.y);
+}
+
+template<bool kHalf = false>
+__global__ void GdnPrepKqKernel(const void* conv_raw, float* scales,
                                 std::uint32_t n_tokens, std::uint32_t k_heads,
                                 std::uint32_t channels, float eps) {
   constexpr std::uint32_t d = kGdnDim;
@@ -1569,11 +1577,19 @@ __global__ void GdnPrepKqKernel(const float* conv_out, float* scales,
   if (t >= n_tokens || kh >= k_heads) {
     return;
   }
-  const float* row = conv_out + static_cast<std::size_t>(t) * channels;
-  const auto* q = reinterpret_cast<const float4*>(row + kh * d);
-  const auto* k = reinterpret_cast<const float4*>(row + (k_heads + kh) * d);
-  const float4 q4 = q[lane];
-  const float4 k4 = k[lane];
+  float4 q4;
+  float4 k4;
+  if constexpr (kHalf) {
+    const auto* row = static_cast<const __half*>(conv_raw) +
+                      static_cast<std::size_t>(t) * channels;
+    q4 = LoadHalf4(row + kh * d + lane * 4);
+    k4 = LoadHalf4(row + (k_heads + kh) * d + lane * 4);
+  } else {
+    const float* row = static_cast<const float*>(conv_raw) +
+                       static_cast<std::size_t>(t) * channels;
+    q4 = reinterpret_cast<const float4*>(row + kh * d)[lane];
+    k4 = reinterpret_cast<const float4*>(row + (k_heads + kh) * d)[lane];
+  }
   float qs = q4.x * q4.x + q4.y * q4.y + q4.z * q4.z + q4.w * q4.w;
   float ks = k4.x * k4.x + k4.y * k4.y + k4.z * k4.z + k4.w * k4.w;
   float kq = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
@@ -1638,9 +1654,9 @@ constexpr int kGdnRows = 2;   // state rows per lane
 constexpr int kGdnWaves = 2;  // waves per block (tuned on this fork; upstream uses 4)
 constexpr int kGdnRowSplitRowsPerBlock = 8 * kGdnRows * kGdnWaves;
 
-template<int kRows, int kWaves>
+template<int kRows, int kWaves, bool kHalf = false>
 __launch_bounds__(kWaves * 32) __global__
-    void GdnRowSplitKernelT(const float* conv_out, const float* scales,
+    void GdnRowSplitKernelT(const void* conv_raw, const float* scales,
                             const float* ab, float* state, float* raw,
                             std::uint32_t n_tokens, std::uint32_t k_heads,
                             std::uint32_t v_heads, GdnCheckpoint checkpoint) {
@@ -1659,6 +1675,8 @@ __launch_bounds__(kWaves * 32) __global__
   static_assert(kQkChunks % kThreadsPerBlock == 0);
   static_assert(kVChunks % kThreadsPerBlock == 0);
   static_assert(kW * 5 <= kThreadsPerBlock, "scales and decays per window");
+  const float* conv_out = static_cast<const float*>(conv_raw);
+  const __half* conv_h = static_cast<const __half*>(conv_raw);
   const int h = blockIdx.y;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -1694,7 +1712,7 @@ __launch_bounds__(kWaves * 32) __global__
 
   // Window loads: chunk c of the q/k plane is (q or k, token, float4 index),
   // laid out so a token's 128 floats are 32 consecutive chunks.
-  const float* qk_src[kQkPerThread];
+  std::size_t qk_off[kQkPerThread];
   int qk_tok[kQkPerThread];
   int qk_which[kQkPerThread];
   int qk_slot[kQkPerThread];
@@ -1704,13 +1722,12 @@ __launch_bounds__(kWaves * 32) __global__
     qk_which[j] = c >> 7;
     qk_tok[j] = (c >> 5) & 3;
     const int qk_vec = c & 31;
-    qk_src[j] =
-        conv_out + (qk_which[j] == 0 ? kh : k_heads + kh) * d + (qk_vec * 4);
+    qk_off[j] = (qk_which[j] == 0 ? kh : k_heads + kh) * d + (qk_vec * 4);
     // A token's 32 float4 are stored [i][segment] so the four segments of
     // a row's lanes read adjacent 16-byte chunks.
     qk_slot[j] = ((qk_vec % kVec) * kLanesPerRow) + (qk_vec / kVec);
   }
-  const float* v_src[kVPerThread];
+  std::size_t v_off[kVPerThread];
   int v_tok[kVPerThread];
   int v_row[kVPerThread];
 #pragma unroll
@@ -1718,8 +1735,7 @@ __launch_bounds__(kWaves * 32) __global__
     const int e = tid + j * kThreadsPerBlock;
     v_tok[j] = e / kRowsPerBlock;
     v_row[j] = e % kRowsPerBlock;
-    v_src[j] = conv_out + 2 * k_heads * d + h * d + blockIdx.x * kRowsPerBlock +
-               v_row[j];
+    v_off[j] = 2 * k_heads * d + h * d + blockIdx.x * kRowsPerBlock + v_row[j];
   }
   const int m_tok = tid / 5;
   const int m_idx = tid % 5;
@@ -1742,13 +1758,22 @@ __launch_bounds__(kWaves * 32) __global__
 #pragma unroll
     for (int j = 0; j < kQkPerThread; ++j) {
       const int t_qk = min((w * kW) + qk_tok[j], last);
-      r.qk[j] = *reinterpret_cast<const float4*>(
-          qk_src[j] + static_cast<std::size_t>(t_qk) * channels);
+      const std::size_t at = qk_off[j] + static_cast<std::size_t>(t_qk) * channels;
+      if constexpr (kHalf) {
+        r.qk[j] = LoadHalf4(conv_h + at);
+      } else {
+        r.qk[j] = *reinterpret_cast<const float4*>(conv_out + at);
+      }
     }
 #pragma unroll
     for (int j = 0; j < kVPerThread; ++j) {
       const int t_v = min((w * kW) + v_tok[j], last);
-      r.v[j] = v_src[j][static_cast<std::size_t>(t_v) * channels];
+      const std::size_t at = v_off[j] + static_cast<std::size_t>(t_v) * channels;
+      if constexpr (kHalf) {
+        r.v[j] = __half2float(conv_h[at]);
+      } else {
+        r.v[j] = conv_out[at];
+      }
     }
     if (tid < 5 * kW) {
       const int t_m = min((w * kW) + m_tok, last);
@@ -2392,9 +2417,13 @@ __global__ void SsmConv4StreamsKernel(
 constexpr std::uint32_t kStreamConvRuns = 2;
 constexpr std::uint32_t kStreamConvTokens = 16 * kStreamConvRuns;
 
-__device__ inline void LoadStreamRun(const std::uint8_t* stream,
-                                     std::uint32_t tl, std::uint32_t cc,
-                                     float (&v)[8][8]) {
+struct StreamRunWords {
+  unsigned long long w[9];
+};
+
+__device__ inline StreamRunWords LoadStreamWords(const std::uint8_t* stream,
+                                                 std::uint32_t tl,
+                                                 std::uint32_t cc) {
   constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
   constexpr std::uint32_t kTilesN = 1024 / kNpuTileN;
   const std::uint32_t tile_row = tl / kNpuTileRowsC;
@@ -2409,15 +2438,21 @@ __device__ inline void LoadStreamRun(const std::uint8_t* stream,
   const auto* p = reinterpret_cast<const unsigned long long*>(
       stream +
       (std::size_t{tile_row * kTilesN + tile_col} * kGroupsPerTile + gi) * 9);
-  unsigned long long w[9];
+  StreamRunWords words;
 #pragma unroll
   for (int i = 0; i < 9; ++i) {
-    w[i] = p[i];
+    words.w[i] = p[i];
   }
+  return words;
+}
+
+__device__ inline void DecodeStreamWords(const StreamRunWords& words,
+                                         float (&v)[8][8]) {
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
     const auto byte_at = [&](int j) {
-      return static_cast<std::uint32_t>((w[j >> 3] >> ((j & 7) * 8)) & 0xFFU);
+      return static_cast<std::uint32_t>((words.w[j >> 3] >> ((j & 7) * 8)) &
+                                        0xFFU);
     };
     const float scale =
         ldexpf(1.0F, static_cast<int>(byte_at(9 * i)) - 127) / 64.0F;
@@ -2430,11 +2465,15 @@ __device__ inline void LoadStreamRun(const std::uint8_t* stream,
   }
 }
 
+template<bool kHalfOut = false>
 __global__ void SsmConv4StreamsV2Kernel(
     const std::uint8_t* const* __restrict__ streams,
     std::uint32_t stream_stride, std::uint32_t stream_tokens,
     const float* __restrict__ w, const float* __restrict__ conv_state,
-    float* __restrict__ out, std::uint32_t n_tokens, std::uint32_t channels) {
+    void* __restrict__ out_raw, std::uint32_t n_tokens,
+    std::uint32_t channels) {
+  float* const out = static_cast<float*>(out_raw);
+  __half* const out_h = static_cast<__half*>(out_raw);
   const std::uint32_t cg = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t c0 = cg * 8;
   if (c0 >= channels) {
@@ -2443,6 +2482,14 @@ __global__ void SsmConv4StreamsV2Kernel(
   const std::uint32_t slice = c0 / 1024;
   const std::uint32_t col0 = c0 % 1024;
   const std::uint32_t t0 = blockIdx.y * kStreamConvTokens;
+  constexpr std::uint32_t kRuns = 2 * kStreamConvRuns;
+  // The tile's tokens never straddle two stream sets (stream_tokens is a
+  // multiple of kStreamConvTokens), so one table lookup serves the thread.
+  const std::uint8_t* const tile_stream =
+      streams[static_cast<std::size_t>(t0 / stream_tokens) * stream_stride +
+              slice];
+  const std::uint32_t tl0 = t0 % stream_tokens;
+  StreamRunWords cur = LoadStreamWords(tile_stream, tl0, col0);
   float4 taps[8];
 #pragma unroll
   for (int k = 0; k < 8; ++k) {
@@ -2470,16 +2517,18 @@ __global__ void SsmConv4StreamsV2Kernel(
       }
     }
   }
-  for (std::uint32_t run = 0; run < 2 * kStreamConvRuns; ++run) {
+#pragma unroll 1
+  for (std::uint32_t run = 0; run < kRuns; ++run) {
     const std::uint32_t tb = t0 + run * 8;
     if (tb >= n_tokens) {
       break;
     }
+    StreamRunWords next = cur;
+    if (run + 1 < kRuns && tb + 8 < n_tokens) {
+      next = LoadStreamWords(tile_stream, tl0 + (run + 1) * 8, col0);
+    }
     float v[8][8];
-    LoadStreamRun(
-        streams[static_cast<std::size_t>(tb / stream_tokens) * stream_stride +
-                slice],
-        tb % stream_tokens, col0, v);
+    DecodeStreamWords(cur, v);
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       float res[8];
@@ -2493,11 +2542,23 @@ __global__ void SsmConv4StreamsV2Kernel(
         win[k][1] = win[k][2];
         win[k][2] = x;
       }
-      float4* dst = reinterpret_cast<float4*>(
-          out + static_cast<std::size_t>(tb + i) * channels + c0);
-      dst[0] = make_float4(res[0], res[1], res[2], res[3]);
-      dst[1] = make_float4(res[4], res[5], res[6], res[7]);
+      if constexpr (kHalfOut) {
+        __half2 packed[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          packed[k] = __floats2half2_rn(res[2 * k], res[2 * k + 1]);
+        }
+        *reinterpret_cast<uint4*>(out_h +
+                                  static_cast<std::size_t>(tb + i) * channels +
+                                  c0) = *reinterpret_cast<const uint4*>(packed);
+      } else {
+        float4* dst = reinterpret_cast<float4*>(
+            out + static_cast<std::size_t>(tb + i) * channels + c0);
+        dst[0] = make_float4(res[0], res[1], res[2], res[3]);
+        dst[1] = make_float4(res[4], res[5], res[6], res[7]);
+      }
     }
+    cur = next;
   }
 }
 
@@ -8068,52 +8129,25 @@ void NpuDecodeStreamRows(const std::uint8_t* const* streams,
 
 void SsmConv4Streams(const std::uint8_t* const* streams,
                      std::uint32_t stream_stride, std::uint32_t stream_tokens,
-                     const float* w, float* conv_state, float* out,
+                     const float* w, float* conv_state, void* out,
                      std::uint32_t n_tokens, std::uint32_t channels,
-                     hipStream_t stream) {
+                     hipStream_t stream, bool half_out) {
   if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
       n_tokens == 0 || channels == 0) {
     return;
   }
-  if (std::getenv("GUFO_CONV_CHECK") != nullptr &&
-      n_tokens % kStreamConvTokens == 0) {
-    float* tmp = nullptr;
-    (void)hipMalloc(&tmp, std::size_t{n_tokens} * channels * sizeof(float));
-    hipLaunchKernelGGL(SsmConv4StreamsV2Kernel,
-                       dim3(Blocks(channels / 8), n_tokens / kStreamConvTokens),
-                       dim3(kThreads), 0, stream, streams, stream_stride,
-                       stream_tokens, w, conv_state, tmp, n_tokens, channels);
-    hipLaunchKernelGGL(
-        SsmConv4StreamsKernel,
-        dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
-                                   kSsmConvTokensPerThread),
-        dim3(kThreads), 0, stream, streams, stream_stride, stream_tokens, w,
-        conv_state, out, n_tokens, channels);
-    (void)hipStreamSynchronize(stream);
-    std::vector<float> a(std::size_t{n_tokens} * channels);
-    std::vector<float> b(a.size());
-    (void)hipMemcpy(a.data(), out, a.size() * 4, hipMemcpyDeviceToHost);
-    (void)hipMemcpy(b.data(), tmp, a.size() * 4, hipMemcpyDeviceToHost);
-    std::size_t bad = 0;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-      if (a[i] != b[i]) {
-        if (bad < 5) {
-          std::fprintf(stderr, "conv mismatch t=%zu c=%zu v1=%g v2=%g\n",
-                       i / channels, i % channels, a[i], b[i]);
-        }
-        ++bad;
-      }
-    }
-    std::fprintf(stderr, "conv check n=%u bad=%zu\n", n_tokens, bad);
-    (void)hipFree(tmp);
-    return;
-  }
   if (n_tokens % kStreamConvTokens == 0 && channels % 8 == 0 &&
-      stream_tokens % 16 == 0 && std::getenv("GUFO_CONV_V1") == nullptr) {
-    hipLaunchKernelGGL(SsmConv4StreamsV2Kernel,
-                       dim3(Blocks(channels / 8), n_tokens / kStreamConvTokens),
-                       dim3(kThreads), 0, stream, streams, stream_stride,
-                       stream_tokens, w, conv_state, out, n_tokens, channels);
+      stream_tokens % kStreamConvTokens == 0) {
+    const dim3 grid(Blocks(channels / 8), n_tokens / kStreamConvTokens);
+    if (half_out) {
+      hipLaunchKernelGGL(SsmConv4StreamsV2Kernel<true>, grid, dim3(kThreads), 0,
+                         stream, streams, stream_stride, stream_tokens, w,
+                         conv_state, out, n_tokens, channels);
+    } else {
+      hipLaunchKernelGGL(SsmConv4StreamsV2Kernel<false>, grid, dim3(kThreads),
+                         0, stream, streams, stream_stride, stream_tokens, w,
+                         conv_state, out, n_tokens, channels);
+    }
     return;
   }
   hipLaunchKernelGGL(
@@ -8121,7 +8155,7 @@ void SsmConv4Streams(const std::uint8_t* const* streams,
       dim3(Blocks(channels),
            (n_tokens + kSsmConvTokensPerThread - 1) / kSsmConvTokensPerThread),
       dim3(kThreads), 0, stream, streams, stream_stride, stream_tokens, w,
-      conv_state, out, n_tokens, channels);
+      conv_state, static_cast<float*>(out), n_tokens, channels);
 }
 
 /// One thread re-encodes one Q8_0 block as Q5_1 with ggml's reference
@@ -8503,7 +8537,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    void (*before_epilogue)(void*), void* before_epilogue_arg,
                    const std::uint8_t* const* z_streams,
                    std::uint32_t z_stream_stride, std::uint32_t z_tokens,
-                   std::uint32_t z_gpu_cols) {
+                   std::uint32_t z_gpu_cols, bool conv_half) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   const bool saved_history = !convolved && kernel == kSsmConvTaps &&
@@ -8550,18 +8584,31 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   }
   const unsigned waves = kThreads / 32;
   if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
-    hipLaunchKernelGGL(GdnPrepKqKernel, dim3(k_heads, n_tokens), dim3(32), 0,
-                       stream, conv_scratch, qn, n_tokens, k_heads, channels,
-                       eps);
+    if (conv_half) {
+      hipLaunchKernelGGL(GdnPrepKqKernel<true>, dim3(k_heads, n_tokens),
+                         dim3(32), 0, stream, conv_scratch, qn, n_tokens,
+                         k_heads, channels, eps);
+    } else {
+      hipLaunchKernelGGL(GdnPrepKqKernel<false>, dim3(k_heads, n_tokens),
+                         dim3(32), 0, stream, conv_scratch, qn, n_tokens,
+                         k_heads, channels, eps);
+    }
     hipLaunchKernelGGL(
         GdnPrepAbKernel,
         dim3(Blocks(static_cast<std::size_t>(n_tokens) * v_heads)),
         dim3(kThreads), 0, stream, alpha_beta, a, dt, kn,
         static_cast<std::size_t>(n_tokens) * v_heads, v_heads);
-    hipLaunchKernelGGL((GdnRowSplitKernelT<kGdnRows, kGdnWaves>),
-                       dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
-                       dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
-                       state, raw, n_tokens, k_heads, v_heads, checkpoint);
+    if (conv_half) {
+      hipLaunchKernelGGL((GdnRowSplitKernelT<kGdnRows, kGdnWaves, true>),
+                         dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                         dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                         state, raw, n_tokens, k_heads, v_heads, checkpoint);
+    } else {
+      hipLaunchKernelGGL((GdnRowSplitKernelT<kGdnRows, kGdnWaves, false>),
+                         dim3(kGdnDim / kGdnRowSplitRowsPerBlock, v_heads),
+                         dim3(kGdnWaves * 32), 0, stream, conv_scratch, qn, kn,
+                         state, raw, n_tokens, k_heads, v_heads, checkpoint);
+    }
   } else {
     hipLaunchKernelGGL(GdnPrepKernel<false>,
                        dim3((n_tokens * k_heads + waves - 1) / waves),
