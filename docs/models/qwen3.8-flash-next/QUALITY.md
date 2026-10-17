@@ -136,3 +136,6 @@ Q4_1 versus Q5_1 decode copies, UD-IQ4_XS, NPU off, greedy, thinking off, MTP of
 With the hyper-connection projections also in Q4_1 (same method, NPU off): free-form departures from the Q8_0 reference 6.5 ± 2.0 per 1000 characters against 5.5 ± 1.8 without them (within noise), 40 easy questions 40/40 in all arms, and the 40 harder questions 28 (reference), 28 (Q4_1 dense only) and 29 (Q4_1 with hyper-connections).
 
 With the shared expert also in Q4_1 (same method, NPU off): free-form departures from the Q8_0 reference 6.8 ± 2.1 per 1000 characters against 6.5 ± 2.0 without it (within noise), 40 easy questions 40/40, and the 40 harder questions 33 against 28 for the reference and 29 without the shared expert.
+
+
+Two-bank whole-projection prefill (`GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1`, NPU on): final-token KL divergence from the GPU-only prefill, four 16K-token windows of real text (a window must reach 16,384 tokens or the NPU path never runs), mean 0.0128 against 0.0165 for the slice mode and 0.0198 for the whole mode before the chunked gated delta rule; top-1 identical on three windows and one near-tie flip on the fourth. The chunked recurrence matches the exact one to 3–4e-4 relative on every layer of a pp16384 run. Greedy text is not identical to the single-bank path.

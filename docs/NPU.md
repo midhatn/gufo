@@ -10,7 +10,7 @@ GPU-only.
 | Requirement | Command |
 | --- | --- |
 | GPU fabric clock held at its top level | `sudo tools/npu/fabric-clock.sh hold` (`status`, `release`) |
-| NPU power mode `balanced` or `performance` (not `turbo`) | `sudo xrt-smi configure --pmode performance` |
+| NPU power mode `balanced`, `performance` or `turbo` (turbo is stable with the fabric clock held and measured identical to `performance`) | `sudo xrt-smi configure --pmode performance` |
 | NPU kept out of runtime suspend | `echo on \| sudo tee /sys/bus/pci/devices/<npu pci id>/power/control` |
 | XRT libraries on the loader path | `LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:$LD_LIBRARY_PATH` |
 
@@ -52,6 +52,17 @@ in turbo mode; otherwise it warns and runs GPU-only.
 
 The server's `--prefill-chunk` is a separate scheduling setting (how much a
 prefill runs before decoding gets a turn); `scripts/run-gufo.sh` keeps it at 4096.
+
+### Two-bank prefill (experimental, not bit-identical)
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GUFO_TWO_BANK` | unset | `1` splits a prefill chunk of 8192 tokens or more (a multiple of 8192, or 8192 + 4096 groups) into two equal banks that run layer by layer. While one bank runs on the GPU, the NPU computes the other bank's next projection. Needs `GUFO_NPU_WHOLE=1`. `scripts/run-gufo.sh` sets both when the NPU is enabled (`GUFO_TWO_BANK=0` turns it off). |
+| `GUFO_NPU_WHOLE` | unset | `1` moves the complete `ssm_in` (16 slices) and `attn_qkv` (13 slices) projections to the NPU in the two-bank path. The GPU reads the NPU output streams directly: F16 convolution rows, a chunked (64-token) gated delta rule, and fused attention preparation. Adds about 3.3 GiB of NPU weight buffers and about 240 MB of shared scratch. |
+
+pp16384 rises from about 1,965 to about 2,120 tok/s (+8%) at the cost of block-float
+rounding: final-token KL against GPU-only prefill averages 0.013 against 0.017
+for the slice mode. See `EXPERIMENTS.md` for what was tried and rejected.
 
 ### Reliability and diagnostics
 
