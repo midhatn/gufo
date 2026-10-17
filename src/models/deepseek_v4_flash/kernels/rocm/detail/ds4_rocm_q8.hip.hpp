@@ -118,7 +118,7 @@ typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
 /* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
- * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
+ * This is the llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns. The host selects it when the token batch is large
