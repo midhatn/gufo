@@ -646,7 +646,19 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const auto capacity = remaining <= exec.max_batch()
                               ? exec.max_batch()
                               : model_->PrefillCapacity();
-    const std::size_t n = std::min<std::size_t>(capacity, remaining);
+    std::size_t n = std::min<std::size_t>(capacity, remaining);
+    // The two-bank path wants equal banks (a multiple of 8192 tokens; 8192 +
+    // 4096 is slower than one bank). Feed that multiple now and the remainder
+    // as its own chunk, unless a checkpoint boundary sits in this chunk.
+    if (prefill && n > 8192 && n % 8192 != 0) {
+      const std::size_t rounded = n / 8192 * 8192;
+      const bool boundary_inside = checkpoint && boundary > tokens_.size() &&
+                                   boundary <= tokens_.size() + n;
+      if (!boundary_inside &&
+          exec.CanForwardPair(*session_, rounded, 1, nullptr, nullptr)) {
+        n = rounded;
+      }
+    }
     const auto chunk = tokens.subspan(off, n);
     if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
