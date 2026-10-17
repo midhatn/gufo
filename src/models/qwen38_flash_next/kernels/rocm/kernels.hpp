@@ -357,6 +357,31 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,
                      std::uint32_t valid_cols = 0);
 
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream);
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, float* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream);
+
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream);
+
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, float* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream);
+
 bool RequantQ8_0ToQ5_1(const void* src, void* dst, std::size_t blocks,
                        hipStream_t stream);
 /// Re-encodes `blocks` Q8_0 blocks as Q4_1 (20 bytes each) for the decode GEMV.
@@ -558,6 +583,15 @@ void PrepareQueryHeads(const float* packed, std::uint32_t stride,
                        const qwen::vision::DeviceRope* rope,
                        std::uint32_t q_heads);
 /// The same, reading the packed rows straight from the NPU's C streams.
+/// Keys and values of the packed rows (heads query/gate pairs, then k, then v)
+/// into the caches: the kv heads' blocks of PrepareAttention only.
+bool PrepareKvHeads(const float* packed, std::uint32_t stride,
+                    const float* k_gamma, __half* k_cache, __half* v_cache,
+                    std::uint32_t n_tokens, std::uint32_t heads,
+                    std::uint32_t kv_heads, std::uint32_t d,
+                    std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                    float theta, float eps, hipStream_t stream,
+                    const qwen::vision::DeviceRope* rope);
 void PrepareQueryHeadsStreams(
     const std::uint8_t* const* streams, std::uint32_t stream_stride,
     std::uint32_t stream_tokens, const float* q_gamma, float* q, float* gate,

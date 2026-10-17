@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -428,6 +429,16 @@ private:
     std::uint32_t n;
     std::uint32_t k;
   };
+
+  struct PreparedNpu {
+    bool valid{false};
+    bool linear{false};
+    std::uint64_t ticket{0};
+    std::uint32_t groups{0};
+    std::uint32_t slices{0};
+    const int* c_ids{nullptr};
+  };
+
   bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
                 Q8Input* q, std::string* error_msg) const;
   /// Q8_1 rows of a small-batch input that its producer kernel already
@@ -547,7 +558,9 @@ private:
                         PrefillCheckpoint* checkpoint, bool initial_normed,
                         bool initial_res_half, bool convert_at_entry,
                         bool convert_at_exit, bool upload_control,
-                        bool* out_normed, bool* out_res_is_half) const;
+                        bool* out_normed, bool* out_res_is_half,
+                        bool premixed = false,
+                        const PreparedNpu* prepared = nullptr) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
                const float* hidden_source, MtpTrace* trace, bool kv_only,
@@ -801,6 +814,19 @@ private:
   /// Device table of the C streams' GPU pointers, [group][kNpuSlicesMax]; the
   /// GDN epilogue reads z from them directly. Null when unavailable.
   const std::uint8_t** npu_c_dev_{nullptr};
+  std::array<std::vector<int>, 2> npu_whole_a_{};
+  std::array<std::vector<int>, 2> npu_whole_c_{};
+  std::uint32_t npu_whole_groups_{0};
+  bool npu_whole_enabled_{false};
+  struct WholeStreams {
+    const std::uint8_t* const* table{nullptr};  ///< [group * 16 + slice]
+    std::uint32_t groups{0};
+    std::uint32_t group_tokens{0};
+    bool hybrid{false};
+  };
+  /// Set while a whole-projection linear layer runs: its qkv/z values are read
+  /// straight from the NPU streams (fused convolution, z in the epilogue).
+  mutable WholeStreams whole_streams_{};
   mutable std::uint32_t q8t_rows_{0};
   mutable std::size_t q8t_cols_{0};
   mutable const float* half_src_{nullptr};

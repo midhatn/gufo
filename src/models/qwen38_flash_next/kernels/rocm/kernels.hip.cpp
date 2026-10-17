@@ -2093,6 +2093,25 @@ __device__ inline float NpuStreamValue(const std::uint8_t* stream,
          (ldexpf(1.0F, static_cast<int>(p[0]) - 127) / 64.0F);
 }
 
+__global__ void NpuDecodeStreamRowsKernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    float* __restrict__ out, std::uint32_t row0, std::uint32_t rows,
+    std::uint32_t cols, std::size_t out_pitch, std::uint32_t col0) {
+  const std::uint32_t row = blockIdx.y;
+  const std::uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const std::uint32_t gt = row0 + row;
+  const std::uint32_t slice = col / 1024;
+  const std::uint8_t* stream =
+      streams[static_cast<std::size_t>(gt / stream_tokens) * stream_stride +
+              slice];
+  out[static_cast<std::size_t>(row) * out_pitch + col0 + col] =
+      NpuStreamValue(stream, gt % stream_tokens, col % 1024);
+}
+
 template<bool kBatch>
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
@@ -2315,6 +2334,173 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
   }
 }
 
+__global__ void SsmConv4StreamsKernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    const float* __restrict__ w, float* __restrict__ conv_state,
+    float* __restrict__ out, std::uint32_t n_tokens, std::uint32_t channels) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+  const std::uint32_t slice = c / 1024;
+  const std::uint32_t col = c % 1024;
+  const std::uint32_t t0 = blockIdx.y * kSsmConvTokensPerThread;
+  const float4 taps = *reinterpret_cast<const float4*>(w + c * kSsmConvTaps);
+
+  float window[kSsmConvTaps - 1];
+#pragma unroll
+  for (std::uint32_t i = 0; i < kSsmConvTaps - 1; ++i) {
+    const std::int32_t src_t =
+        static_cast<std::int32_t>(t0) - 3 + static_cast<std::int32_t>(i);
+    if (src_t >= 0) {
+      const std::uint32_t gt = static_cast<std::uint32_t>(src_t);
+      const std::uint8_t* stream =
+          streams[static_cast<std::size_t>(gt / stream_tokens) * stream_stride +
+                  slice];
+      window[i] = NpuStreamValue(stream, gt % stream_tokens, col);
+    } else {
+      window[i] =
+          conv_state[static_cast<std::size_t>(kSsmConvTaps - 1 + src_t) *
+                         channels +
+                     c];
+    }
+  }
+
+#pragma unroll
+  for (std::uint32_t i = 0; i < kSsmConvTokensPerThread; ++i) {
+    const std::uint32_t t = t0 + i;
+    if (t >= n_tokens) {
+      break;
+    }
+    const std::uint8_t* stream =
+        streams[static_cast<std::size_t>(t / stream_tokens) * stream_stride +
+                slice];
+    const float v = NpuStreamValue(stream, t % stream_tokens, col);
+    const float acc = taps.x * window[0] + taps.y * window[1] +
+                      taps.z * window[2] + taps.w * v;
+    out[static_cast<std::size_t>(t) * channels + c] = SiluF(acc);
+    window[0] = window[1];
+    window[1] = window[2];
+    window[2] = v;
+  }
+}
+
+// One thread convolves eight adjacent channels (one C-stream group) over
+// kRunsPerThread runs of 16 tokens. A run's eight tokens of a group are
+// consecutive 9-byte groups, so they load as nine aligned 64-bit words.
+constexpr std::uint32_t kStreamConvRuns = 2;
+constexpr std::uint32_t kStreamConvTokens = 16 * kStreamConvRuns;
+
+__device__ inline void LoadStreamRun(const std::uint8_t* stream,
+                                     std::uint32_t tl, std::uint32_t cc,
+                                     float (&v)[8][8]) {
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileRowsC * kNpuTileN / 8;
+  constexpr std::uint32_t kTilesN = 1024 / kNpuTileN;
+  const std::uint32_t tile_row = tl / kNpuTileRowsC;
+  const std::uint32_t r = tl % kNpuTileRowsC;
+  const std::uint32_t tile_col = cc / kNpuTileN;
+  const std::uint32_t c = cc % kNpuTileN;
+  const std::uint32_t br = (r >> 3) & 1;
+  const std::uint32_t sr = r >> 4;
+  const std::uint32_t bc = (c >> 3) & 1;
+  const std::uint32_t sc = c >> 4;
+  const std::uint32_t gi = (bc << 3) | (br << 4) | (sc << 5) | (sr << 8);
+  const auto* p = reinterpret_cast<const unsigned long long*>(
+      stream +
+      (std::size_t{tile_row * kTilesN + tile_col} * kGroupsPerTile + gi) * 9);
+  unsigned long long w[9];
+#pragma unroll
+  for (int i = 0; i < 9; ++i) {
+    w[i] = p[i];
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const auto byte_at = [&](int j) {
+      return static_cast<std::uint32_t>((w[j >> 3] >> ((j & 7) * 8)) & 0xFFU);
+    };
+    const float scale =
+        ldexpf(1.0F, static_cast<int>(byte_at(9 * i)) - 127) / 64.0F;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      v[i][k] =
+          static_cast<float>(static_cast<std::int8_t>(byte_at(9 * i + 1 + k))) *
+          scale;
+    }
+  }
+}
+
+__global__ void SsmConv4StreamsV2Kernel(
+    const std::uint8_t* const* __restrict__ streams,
+    std::uint32_t stream_stride, std::uint32_t stream_tokens,
+    const float* __restrict__ w, const float* __restrict__ conv_state,
+    float* __restrict__ out, std::uint32_t n_tokens, std::uint32_t channels) {
+  const std::uint32_t cg = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t c0 = cg * 8;
+  if (c0 >= channels) {
+    return;
+  }
+  const std::uint32_t slice = c0 / 1024;
+  const std::uint32_t col0 = c0 % 1024;
+  const std::uint32_t t0 = blockIdx.y * kStreamConvTokens;
+  float4 taps[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    taps[k] = *reinterpret_cast<const float4*>(w + (c0 + k) * kSsmConvTaps);
+  }
+  float win[8][3];
+#pragma unroll
+  for (int i = 0; i < 3; ++i) {
+    const std::int32_t src_t =
+        static_cast<std::int32_t>(t0) - 3 + static_cast<std::int32_t>(i);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      if (src_t >= 0) {
+        const std::uint32_t gt = static_cast<std::uint32_t>(src_t);
+        win[k][i] = NpuStreamValue(
+            streams[static_cast<std::size_t>(gt / stream_tokens) *
+                        stream_stride +
+                    slice],
+            gt % stream_tokens, col0 + k);
+      } else {
+        win[k][i] =
+            conv_state[static_cast<std::size_t>(kSsmConvTaps - 1 + src_t) *
+                           channels +
+                       c0 + k];
+      }
+    }
+  }
+  for (std::uint32_t run = 0; run < 2 * kStreamConvRuns; ++run) {
+    const std::uint32_t tb = t0 + run * 8;
+    if (tb >= n_tokens) {
+      break;
+    }
+    float v[8][8];
+    LoadStreamRun(
+        streams[static_cast<std::size_t>(tb / stream_tokens) * stream_stride +
+                slice],
+        tb % stream_tokens, col0, v);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      float res[8];
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const float x = v[i][k];
+        const float acc = taps[k].x * win[k][0] + taps[k].y * win[k][1] +
+                          taps[k].z * win[k][2] + taps[k].w * x;
+        res[k] = SiluF(acc);
+        win[k][0] = win[k][1];
+        win[k][1] = win[k][2];
+        win[k][2] = x;
+      }
+      float4* dst = reinterpret_cast<float4*>(
+          out + static_cast<std::size_t>(tb + i) * channels + c0);
+      dst[0] = make_float4(res[0], res[1], res[2], res[3]);
+      dst[1] = make_float4(res[4], res[5], res[6], res[7]);
+    }
+  }
+}
+
 __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
                                   float* q, float* gate, float* k, float* v,
                                   std::uint32_t heads, std::uint32_t d,
@@ -2351,11 +2537,12 @@ __global__ void PrepareAttentionKernel(
     std::uint32_t q_only_heads = 0,
     const std::uint8_t* const* streams = nullptr,
     std::uint32_t stream_stride = 0, std::uint32_t stream_tokens = 0,
-    std::uint32_t first_token = 0) {
+    std::uint32_t first_token = 0, std::uint32_t head_block0 = 0) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   const std::uint32_t t = blockIdx.x + first_token,
-                      first = blockIdx.y * kHeadsPerBlock, tid = threadIdx.x;
+                      first = (blockIdx.y + head_block0) * kHeadsPerBlock,
+                      tid = threadIdx.x;
   const std::uint32_t lane = tid % 32, wave = tid / 32;
   // q_only_heads: only the first heads' query and gate rows (the rest of the
   // projection was prepared by the projection kernel itself).
@@ -7864,6 +8051,79 @@ void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      out_pitch, col0, accumulate, valid_cols);
 }
 
+void NpuDecodeStreamRows(const std::uint8_t* const* streams,
+                         std::uint32_t stream_stride,
+                         std::uint32_t stream_tokens, float* out,
+                         std::uint32_t row0, std::uint32_t rows,
+                         std::uint32_t cols, std::size_t out_pitch,
+                         std::uint32_t col0, hipStream_t stream) {
+  if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
+      rows == 0 || cols == 0) {
+    return;
+  }
+  hipLaunchKernelGGL(NpuDecodeStreamRowsKernel, dim3(Blocks(cols), rows),
+                     dim3(kThreads), 0, stream, streams, stream_stride,
+                     stream_tokens, out, row0, rows, cols, out_pitch, col0);
+}
+
+void SsmConv4Streams(const std::uint8_t* const* streams,
+                     std::uint32_t stream_stride, std::uint32_t stream_tokens,
+                     const float* w, float* conv_state, float* out,
+                     std::uint32_t n_tokens, std::uint32_t channels,
+                     hipStream_t stream) {
+  if (streams == nullptr || stream_stride == 0 || stream_tokens == 0 ||
+      n_tokens == 0 || channels == 0) {
+    return;
+  }
+  if (std::getenv("GUFO_CONV_CHECK") != nullptr &&
+      n_tokens % kStreamConvTokens == 0) {
+    float* tmp = nullptr;
+    (void)hipMalloc(&tmp, std::size_t{n_tokens} * channels * sizeof(float));
+    hipLaunchKernelGGL(SsmConv4StreamsV2Kernel,
+                       dim3(Blocks(channels / 8), n_tokens / kStreamConvTokens),
+                       dim3(kThreads), 0, stream, streams, stream_stride,
+                       stream_tokens, w, conv_state, tmp, n_tokens, channels);
+    hipLaunchKernelGGL(
+        SsmConv4StreamsKernel,
+        dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
+                                   kSsmConvTokensPerThread),
+        dim3(kThreads), 0, stream, streams, stream_stride, stream_tokens, w,
+        conv_state, out, n_tokens, channels);
+    (void)hipStreamSynchronize(stream);
+    std::vector<float> a(std::size_t{n_tokens} * channels);
+    std::vector<float> b(a.size());
+    (void)hipMemcpy(a.data(), out, a.size() * 4, hipMemcpyDeviceToHost);
+    (void)hipMemcpy(b.data(), tmp, a.size() * 4, hipMemcpyDeviceToHost);
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      if (a[i] != b[i]) {
+        if (bad < 5) {
+          std::fprintf(stderr, "conv mismatch t=%zu c=%zu v1=%g v2=%g\n",
+                       i / channels, i % channels, a[i], b[i]);
+        }
+        ++bad;
+      }
+    }
+    std::fprintf(stderr, "conv check n=%u bad=%zu\n", n_tokens, bad);
+    (void)hipFree(tmp);
+    return;
+  }
+  if (n_tokens % kStreamConvTokens == 0 && channels % 8 == 0 &&
+      stream_tokens % 16 == 0 && std::getenv("GUFO_CONV_V1") == nullptr) {
+    hipLaunchKernelGGL(SsmConv4StreamsV2Kernel,
+                       dim3(Blocks(channels / 8), n_tokens / kStreamConvTokens),
+                       dim3(kThreads), 0, stream, streams, stream_stride,
+                       stream_tokens, w, conv_state, out, n_tokens, channels);
+    return;
+  }
+  hipLaunchKernelGGL(
+      SsmConv4StreamsKernel,
+      dim3(Blocks(channels),
+           (n_tokens + kSsmConvTokensPerThread - 1) / kSsmConvTokensPerThread),
+      dim3(kThreads), 0, stream, streams, stream_stride, stream_tokens, w,
+      conv_state, out, n_tokens, channels);
+}
+
 /// One thread re-encodes one Q8_0 block as Q5_1 with ggml's reference
 /// quantizer: 32 levels over the block's own [min, max].
 __global__ void RequantQ8ToQ5_1Kernel(const Q8_0Block* __restrict__ src,
@@ -8412,6 +8672,25 @@ void PrepareQueryHeadsStreams(
       dim3(kThreads), 0, stream, nullptr, 0, q_gamma, nullptr, q, gate, nullptr,
       nullptr, heads, kv_heads, d, rotary_dim, start_pos, theta, eps, rope,
       q_heads, streams, stream_stride, stream_tokens, first_token);
+}
+
+bool PrepareKvHeads(const float* packed, std::uint32_t stride,
+                    const float* k_gamma, __half* k_cache, __half* v_cache,
+                    std::uint32_t n_tokens, std::uint32_t heads,
+                    std::uint32_t kv_heads, std::uint32_t d,
+                    std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                    float theta, float eps, hipStream_t stream,
+                    const qwen::vision::DeviceRope* rope) {
+  if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
+      rotary_dim % 2 != 0 || kv_heads == 0 || heads % 4 != 0) {
+    return false;
+  }
+  hipLaunchKernelGGL(
+      (PrepareAttentionKernel<4>), dim3(n_tokens, (kv_heads + 3) / 4),
+      dim3(kThreads), 0, stream, packed, stride, nullptr, k_gamma, nullptr,
+      nullptr, k_cache, v_cache, heads, kv_heads, d, rotary_dim, start_pos,
+      theta, eps, rope, 0U, nullptr, 0U, 0U, 0U, heads / 4);
+  return true;
 }
 
 void PrepareQueryHeads(const float* packed, std::uint32_t stride,

@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <vector>
 
@@ -58,6 +59,14 @@ struct Conversion {
   void* destination;
   std::size_t count;
 };
+
+bool WholeNpuEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_NPU_WHOLE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 struct Uploader {
   hip::WeightUpload& stager;
@@ -750,6 +759,61 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (shexp_layers != 0) {
         std::fprintf(stderr, "NPU: shared expert of %u layers\n", shexp_layers);
       }
+      std::uint32_t whole_layers = 0;
+      if (WholeNpuEnabled()) {
+        for (auto& l : m->layers_) {
+          if (l.linear && l.ssm_in.data != nullptr &&
+              l.ssm_in.type == core::GgmlType::kQ8_0 &&
+              l.ssm_in.rows == 16 * npu->n() && l.ssm_in.cols == npu->k()) {
+            std::vector<int> ids;
+            for (std::uint32_t i = 0; i < 16; ++i) {
+              const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+              if (id < 0)
+                break;
+              NpuEncodeWeights(l.ssm_in.data, l.ssm_in.cols,
+                               static_cast<std::uint32_t>(i) * npu->n(),
+                               npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
+                               nullptr);
+              ids.push_back(id);
+              staged += npu->BBytes();
+            }
+            if (hipDeviceSynchronize() != hipSuccess)
+              ids.clear();
+            for (int id : ids)
+              npu->FinalizeWeights(id);
+            if (ids.size() == 16) {
+              l.npu_ssm_all = std::move(ids);
+              ++whole_layers;
+            }
+          }
+        }
+        for (auto& l : m->layers_) {
+          if (!l.linear && l.attn_qkv.data != nullptr &&
+              l.attn_qkv.type == core::GgmlType::kQ8_0 &&
+              l.attn_qkv.rows == 13 * npu->n() && l.attn_qkv.cols == npu->k()) {
+            std::vector<int> ids;
+            for (std::uint32_t i = 0; i < 13; ++i) {
+              const int id = npu->NewBuffer(npu->BBytes(), &npu_error);
+              if (id < 0)
+                break;
+              NpuEncodeWeights(l.attn_qkv.data, l.attn_qkv.cols,
+                               static_cast<std::uint32_t>(i) * npu->n(),
+                               npu->n(), npu->k(), 0, npu->k(), npu->Device(id),
+                               nullptr);
+              ids.push_back(id);
+              staged += npu->BBytes();
+            }
+            if (hipDeviceSynchronize() != hipSuccess)
+              ids.clear();
+            for (int id : ids)
+              npu->FinalizeWeights(id);
+            if (ids.size() == 13) {
+              l.npu_qkv_all = std::move(ids);
+              ++whole_layers;
+            }
+          }
+        }
+      }
       if (hipDeviceSynchronize() != hipSuccess) {
         if (error_msg != nullptr) {
           *error_msg = "NPU weight staging failed";
@@ -759,7 +823,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       std::fprintf(stderr, "NPU: z projection of %u layers, %.2f GiB staged\n",
                    layers_on,
                    static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
-      if (layers_on != 0) {
+      if (layers_on != 0 || whole_layers != 0) {
         m->npu_ = std::move(npu);
       }
     }
