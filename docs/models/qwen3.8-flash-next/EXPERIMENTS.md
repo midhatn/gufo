@@ -105,6 +105,7 @@
 | Activation encode written by the HC mix epilogue | Rejected: streams bit-identical, pp16384 2,058 against 2,103; scattered sub-dword stores cost more than the separate encode. Kept on branch `exp/encode-fusion`. |
 | Register prefetch in the stream convolution; routed tile threshold sweep; `__restrict__` on the HC combine kernels | Rejected: no change beyond noise. |
 | Two-stage-deep weight prefetch and a separate 16-row tile class for experts with up to 16 tokens in the routed GEMM | Rejected: on real routing about 190 of 512 experts have fewer than 16 tokens; their tiles already cost about 9 µs per expert against a 7 µs streaming floor for 1.4 MB of IQ3_S weights, so the class split only moved time (gate/up 3.26 → 2.02 + 1.60 ms per layer-bank). |
+| 32-key tiles in the packed sparse prefill attention kernel | Rejected: the kernel already needs 224–232 VGPRs and 29.7 KB of LDS (six waves per SIMD) for 16-key tiles; 32-key tiles split each S tile four ways (three tasks per wave) and reach 256 VGPRs with spills and 59 KB of LDS (four waves), and pp32768 fell from 2,062 to 1,949–1,956 (2,010 with the late-V schedule). Occupancy settings of 1, 2 and 3 blocks per CU gave 2,070/2,076/2,069. The per-tile barrier chain (about 1.3 µs per 16 keys against 0.15 µs of matrix work) stays unless the Q fragments can leave the registers. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
 to dense projections and 12.6% to attention/indexing. Final-tile catch-up
