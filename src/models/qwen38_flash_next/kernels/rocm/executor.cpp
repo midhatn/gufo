@@ -1406,7 +1406,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       const std::uint32_t bank_rows = e->options_.max_batch / 2;
       if (group_tokens != 0 && bank_rows >= group_tokens) {
         e->npu_whole_groups_ =
-            std::min<std::uint32_t>(2, bank_rows / group_tokens);
+            std::min<std::uint32_t>(3, bank_rows / group_tokens);
         if (e->npu_whole_groups_ != 0) {
           bool ok = true;
           for (std::size_t bank = 0; bank < 2 && ok; ++bank) {

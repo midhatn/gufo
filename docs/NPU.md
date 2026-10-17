@@ -23,8 +23,9 @@ hold it before starting. The clock and power mode reset at boot.
 GUFO_MODEL=<first shard .gguf> GUFO_MTP=<mtp sidecar .gguf> scripts/run-gufo.sh
 ```
 
-The script enables the NPU only when the fabric clock is held and the NPU is not
-in turbo mode; otherwise it warns and runs GPU-only.
+The script enables the NPU only while the fabric clock is held (any NPU power mode,
+turbo included), and turns the two-bank prefill on with it (`GUFO_TWO_BANK=0` opts
+out). `GUFO_PREFILL_TILE=24576` (two 12288-token banks) prefills 24K-token prompts about 2.7% faster for about 6 GB more RAM.
 
 ## Environment variables
 

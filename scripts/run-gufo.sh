@@ -3,10 +3,11 @@
 #
 # Required: GUFO_MODEL = first shard of UD-IQ4_XS (...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (shared Q8_0 sidecar), GUFO_BIN, PORT, JOBS, GUFO_CONTEXT, GUFO_EFFORT,
-#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 16384)
+#           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 16384; 24576 is faster for 24K+ prompts, +6 GB RAM),
+#           GUFO_TWO_BANK (default 1; 0 turns the two-bank NPU prefill off)
 # NPU build: GUFO_NPU=0 forces GPU-only; XRT_DIR (default /opt/xilinx/xrt) holds the XRT libraries.
 #            The NPU is used only while `tools/npu/fabric-clock.sh status` reports held
-#            (sudo tools/npu/fabric-clock.sh hold) and the NPU is not in turbo mode.
+#            (sudo tools/npu/fabric-clock.sh hold).
 set -euo pipefail
 
 GUFO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,6 +29,8 @@ MTP=${GUFO_MTP:-}
 
 export LD_LIBRARY_PATH="${ROCM_PATH:-/opt/rocm}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
+# GUFO_PREFILL_TILE=24576 (two 12288-token banks) prefills prompts of 24K tokens and
+# more about 2.7% faster than 16384 but needs about 6 GB more RAM.
 export GUFO_PREFILL_TILE=${GUFO_PREFILL_TILE:-16384}
 
 NPU_ENV=()
@@ -35,10 +38,11 @@ if [ "${GUFO_NPU:-1}" != 0 ] && [ -e /dev/accel/accel0 ] && [ -d "$GUFO_DIR/tool
   XRT_DIR=${XRT_DIR:-/opt/xilinx/xrt}
   if ! "$GUFO_DIR/tools/npu/fabric-clock.sh" status > /dev/null 2>&1; then
     echo "WARNING: GPU fabric clock not held (sudo $GUFO_DIR/tools/npu/fabric-clock.sh hold): running without the NPU." >&2
-  elif "$XRT_DIR/bin/xrt-smi" examine -r platform 2>&1 | grep -qi "power mode *: turbo"; then
-    echo "WARNING: NPU is in turbo mode: running without the NPU (use balanced or performance)." >&2
   else
     NPU_ENV=(GUFO_NPU_DIR="$GUFO_DIR/tools/npu")
+    # Two-bank prefill with the whole projections on the NPU (about +8%, not
+    # bit-identical to the single-bank path; see docs/NPU.md).
+    [ "${GUFO_TWO_BANK:-1}" != 0 ] && NPU_ENV+=(GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1)
     export LD_LIBRARY_PATH="$XRT_DIR/lib:$LD_LIBRARY_PATH"
   fi
 fi
