@@ -4411,8 +4411,6 @@ bool Executor::CanForwardPair(const Session& session, std::size_t n,
   const auto prefix = session.VisionLayout().PrefixLength();
   if (prefix != 0 && session.position_ < prefix)
     return why(__LINE__);
-  if (session.snapshots_ != nullptr || session.continuation_hooks_ != nullptr)
-    return why(__LINE__);
   if (session.mtp_enabled_ && session.mtp_.position != session.position_)
     return why(__LINE__);
   if (n_logits > n)
@@ -4499,6 +4497,16 @@ bool Executor::ForwardPair(Session& session,
   const Config& c = config();
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t start_pos = session.position_;
+  // Same protocol as Forward: start the continuation-cache rows and protect
+  // retained checkpoints before the chunk overwrites session state.
+  if (session.continuation_hooks_) {
+    const std::uint32_t end = start_pos + n;
+    session.continuation_hooks_->BeforeWrite(
+        false, start_pos, end, session.blocks_,
+        end > c.indexer_top_k ? end / c.compress_ratio : session.blocks_);
+  }
+  session.PreserveSnapshots(start_pos, session.mtp_.position);
+  ++session.mutation_epoch_;
   const std::uint32_t b_start = start_pos + nA;
   const std::uint32_t end_pos = start_pos + n;
 
