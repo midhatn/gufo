@@ -13,6 +13,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -769,8 +770,12 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       const std::size_t half_bytes = rows * hidden_size * sizeof(__half);
       const std::size_t float_count =
           (rows * experts) + rows + (3 * rows * sff) + (rows * hidden_size);
+      const std::size_t split_x_bytes =
+          rows * 3 * hidden_size * sizeof(std::uint16_t);
+      const std::size_t split_y_bytes = rows * kRouterSplitRows * sizeof(float);
       HIP_CHECK(hipMalloc(&d_moe_prefill_buf_,
-                          half_bytes + float_count * sizeof(float)));
+                          half_bytes + float_count * sizeof(float) +
+                              split_x_bytes + split_y_bytes));
       auto* base = static_cast<std::uint8_t*>(d_moe_prefill_buf_);
       moe_prefill.x_half = reinterpret_cast<__half*>(base);
       float* floats = reinterpret_cast<float*>(base + half_bytes);
@@ -785,6 +790,10 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       moe_prefill.shared_act = floats;
       floats += rows * sff;
       moe_prefill.shared_out = floats;
+      floats += rows * hidden_size;
+      moe_prefill.router_x = reinterpret_cast<std::uint16_t*>(floats);
+      moe_prefill.router_y = reinterpret_cast<float*>(
+          reinterpret_cast<std::uint8_t*>(floats) + split_x_bytes);
     }
 
     const std::size_t scratch_elements =

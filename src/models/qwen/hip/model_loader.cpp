@@ -9,14 +9,17 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
 
+#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -175,7 +178,47 @@ QwenGpuModel::QwenGpuModel(
       vision_(std::move(vision)) {}
 
 QwenGpuModel::~QwenGpuModel() {
+  for (auto* buffer : router_split_) {
+    if (buffer != nullptr)
+      (void)hipFree(buffer);
+  }
   ReleaseWeightRegions(weight_regions_);
+}
+
+const std::uint16_t* QwenGpuModel::RouterSplitWeights(
+    std::uint32_t layer) const {
+  std::lock_guard lock(router_split_mutex_);
+  if (router_split_.empty())
+    router_split_.assign(weights_.layers.size(), nullptr);
+  if (layer >= router_split_.size())
+    return nullptr;
+  if (router_split_[layer] != nullptr)
+    return router_split_[layer];
+  const auto& config = weights_.config;
+  const auto& gate = weights_.layers[layer].ffn_gate_inp;
+  const auto& shared = weights_.layers[layer].ffn_gate_inp_shexp;
+  const auto is_supported = [](const models::QwenTensorRef& tensor) {
+    return tensor.type == core::GgmlType::kF32 ||
+           tensor.type == core::GgmlType::kBF16;
+  };
+  const std::size_t hidden = config.hidden_size;
+  if (config.num_experts + 1 > kRouterSplitRows || !is_supported(gate) ||
+      !is_supported(shared) ||
+      gate.num_elements != config.num_experts * hidden ||
+      shared.num_elements != hidden)
+    return nullptr;
+  std::uint16_t* buffer = nullptr;
+  const std::size_t bytes = kRouterSplitRows * 3 * hidden * sizeof(*buffer);
+  if (hipMalloc(&buffer, bytes) != hipSuccess)
+    return nullptr;
+  HIP_CHECK(hipMemset(buffer, 0, bytes));
+  LaunchRouterSplitWeights(gate.data, gate.type == core::GgmlType::kBF16,
+                           buffer, 0, config.num_experts, hidden);
+  LaunchRouterSplitWeights(shared.data, shared.type == core::GgmlType::kBF16,
+                           buffer, config.num_experts, 1, hidden);
+  HIP_CHECK(hipDeviceSynchronize());
+  router_split_[layer] = buffer;
+  return buffer;
 }
 
 std::size_t QwenGpuModel::GetResidentBytes() const noexcept {

@@ -179,7 +179,87 @@ __global__ void MoeCombineKernel(float* __restrict__ out,
   out[i] = sum + shared_weight[0] * shared_out[i];
 }
 
+__device__ inline std::uint16_t FloatToBf16Bits(float f) {
+  std::uint32_t u = __float_as_uint(f);
+  u += 0x7FFFU + ((u >> 16) & 1U);
+  return static_cast<std::uint16_t>(u >> 16);
+}
+
+__device__ inline float Bf16BitsToFloat(std::uint16_t b) {
+  return __uint_as_float(static_cast<std::uint32_t>(b) << 16);
+}
+
+__global__ void RouterSplitActivationsKernel(const float* __restrict__ x,
+                                             std::uint16_t* __restrict__ dst,
+                                             std::size_t k) {
+  const float* row = x + (static_cast<std::size_t>(blockIdx.x) * k);
+  std::uint16_t* out = dst + (static_cast<std::size_t>(blockIdx.x) * 3 * k);
+  for (std::size_t i = threadIdx.x; i < k; i += blockDim.x) {
+    const std::uint16_t hi = FloatToBf16Bits(row[i]);
+    const std::uint16_t lo = FloatToBf16Bits(row[i] - Bf16BitsToFloat(hi));
+    out[i] = hi;
+    out[k + i] = lo;
+    out[(2 * k) + i] = hi;
+  }
+}
+
+__global__ void RouterSplitWeightsKernel(const void* __restrict__ src,
+                                         bool src_bf16,
+                                         std::uint16_t* __restrict__ dst,
+                                         std::size_t first_row, std::size_t k) {
+  const std::size_t r = blockIdx.x;
+  std::uint16_t* out = dst + ((first_row + r) * 3 * k);
+  for (std::size_t i = threadIdx.x; i < k; i += blockDim.x) {
+    std::uint16_t hi;
+    std::uint16_t lo = 0;
+    if (src_bf16) {
+      hi = static_cast<const std::uint16_t*>(src)[(r * k) + i];
+    } else {
+      const float w = static_cast<const float*>(src)[(r * k) + i];
+      hi = FloatToBf16Bits(w);
+      lo = FloatToBf16Bits(w - Bf16BitsToFloat(hi));
+    }
+    out[i] = hi;
+    out[k + i] = hi;
+    out[(2 * k) + i] = lo;
+  }
+}
+
+__global__ void RouterSplitLogitsKernel(const float* __restrict__ y,
+                                        float* __restrict__ router,
+                                        float* __restrict__ shared,
+                                        std::size_t experts, std::size_t ld) {
+  const float* row = y + (static_cast<std::size_t>(blockIdx.x) * ld);
+  for (std::size_t i = threadIdx.x; i < experts; i += blockDim.x) {
+    router[(static_cast<std::size_t>(blockIdx.x) * experts) + i] = row[i];
+  }
+  if (threadIdx.x == 0) {
+    shared[blockIdx.x] = row[experts];
+  }
+}
+
 }  // namespace
+
+void LaunchRouterSplitActivations(const float* x, std::uint16_t* dst,
+                                  std::size_t rows, std::size_t k,
+                                  hipStream_t stream) {
+  RouterSplitActivationsKernel<<<dim3(rows), 256, 0, stream>>>(x, dst, k);
+}
+
+void LaunchRouterSplitWeights(const void* src, bool src_bf16,
+                              std::uint16_t* dst, std::size_t first_row,
+                              std::size_t rows, std::size_t k,
+                              hipStream_t stream) {
+  RouterSplitWeightsKernel<<<dim3(rows), 256, 0, stream>>>(src, src_bf16, dst,
+                                                           first_row, k);
+}
+
+void LaunchRouterSplitLogits(const float* y, float* router, float* shared,
+                             std::size_t rows, std::size_t experts,
+                             std::size_t ld, hipStream_t stream) {
+  RouterSplitLogitsKernel<<<dim3(rows), 256, 0, stream>>>(y, router, shared,
+                                                          experts, ld);
+}
 
 void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          std::int32_t* expert_ids, float* expert_weights,

@@ -21,6 +21,26 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          std::uint32_t num_used, std::uint32_t rows = 1,
                          hipStream_t stream = nullptr);
 
+/// Rows of the split router weight matrix: experts, the shared-expert gate and
+/// padding to a multiple of eight.
+inline constexpr std::size_t kRouterSplitRows = 264;
+
+/// fp32-accurate router logits through one bf16 GEMM: each fp32 value splits
+/// into a high and a low bf16 half and the K dimension triples to
+/// [hi, lo, hi] against weight rows [hi, hi, lo]. Rows of the weight matrix
+/// are `rows` consecutive source rows written at `first_row` of `dst`.
+void LaunchRouterSplitActivations(const float* x, std::uint16_t* dst,
+                                  std::size_t rows, std::size_t k,
+                                  hipStream_t stream = nullptr);
+void LaunchRouterSplitWeights(const void* src, bool src_bf16,
+                              std::uint16_t* dst, std::size_t first_row,
+                              std::size_t rows, std::size_t k,
+                              hipStream_t stream = nullptr);
+/// y [rows][ld] -> router [rows][experts] and shared [rows].
+void LaunchRouterSplitLogits(const float* y, float* router, float* shared,
+                             std::size_t rows, std::size_t experts,
+                             std::size_t ld, hipStream_t stream = nullptr);
+
 /// Elementwise weighted accumulation: out += scale * add.
 void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
                                std::size_t dim, hipStream_t stream = nullptr);

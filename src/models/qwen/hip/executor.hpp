@@ -118,6 +118,11 @@ public:
   [[nodiscard]] QwenNpuFfn* NpuFfn() const;
   /// Grouped-expert prefill for qwen35moe, or null when unavailable.
   [[nodiscard]] QwenMoePrefill* MoePrefill(std::uint32_t max_tokens) const;
+  /// bf16 [hi, hi, lo] weights of the router and shared-expert gate rows of
+  /// `layer` (kRouterSplitRows rows of 3 * hidden), built on first use; null
+  /// when the layer's gate tensors are not F32 or BF16.
+  [[nodiscard]] const std::uint16_t* RouterSplitWeights(
+      std::uint32_t layer) const;
 
 private:
   // Keep the mapped GGUF storage alive until every registered region is
@@ -131,6 +136,8 @@ private:
   mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
   mutable std::once_flag moe_prefill_once_;
   mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
+  mutable std::vector<std::uint16_t*> router_split_;
+  mutable std::mutex router_split_mutex_;
 };
 
 class QwenGpuSnapshot final {
@@ -303,6 +310,8 @@ struct QwenMoePrefillScratch {
   float* shared_up{nullptr};
   float* shared_act{nullptr};
   float* shared_out{nullptr};
+  std::uint16_t* router_x{nullptr};
+  float* router_y{nullptr};
 };
 
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.

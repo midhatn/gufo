@@ -5,6 +5,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 
 namespace gufo::hip {
@@ -37,12 +38,31 @@ bool QwenGpuExecutor::MoePrefillFfn(const models::QwenLayerWeights& layer,
   // d_scratch_bf16.
   LaunchFloatToFp16(arena_.d_normed, scratch.x_half, batch_size * hidden,
                     stream);
-  LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp.data, false,
-                    arena_.d_normed, scratch.router_logits, batch_size,
-                    config.num_experts, hidden, arena_.d_scratch_bf16, stream);
-  LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp_shexp.data, false,
-                    arena_.d_normed, scratch.shared_logit, batch_size, 1,
-                    hidden, arena_.d_scratch_bf16, stream);
+  const std::uint16_t* split_weights = model_->RouterSplitWeights(layer_index);
+  if (split_weights != nullptr && arena_.hipblaslt_gemm != nullptr) {
+    LaunchRouterSplitActivations(arena_.d_normed, scratch.router_x, batch_size,
+                                 hidden, stream);
+    if (!arena_.hipblaslt_gemm->RunBf16(split_weights, scratch.router_x,
+                                        scratch.router_y, batch_size,
+                                        kRouterSplitRows, 3 * hidden, stream)) {
+      split_weights = nullptr;
+    } else {
+      LaunchRouterSplitLogits(scratch.router_y, scratch.router_logits,
+                              scratch.shared_logit, batch_size,
+                              config.num_experts, kRouterSplitRows, stream);
+    }
+  } else {
+    split_weights = nullptr;
+  }
+  if (split_weights == nullptr) {
+    LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp.data, false,
+                      arena_.d_normed, scratch.router_logits, batch_size,
+                      config.num_experts, hidden, arena_.d_scratch_bf16,
+                      stream);
+    LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp_shexp.data,
+                      false, arena_.d_normed, scratch.shared_logit, batch_size,
+                      1, hidden, arena_.d_scratch_bf16, stream);
+  }
   // Dense shared expert: gate/up projections, SwiGLU, down projection.
   LaunchBatchedQuantGEMM(layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data,
                          arena_.d_scratch_bf16, scratch.shared_gate, batch_size,
