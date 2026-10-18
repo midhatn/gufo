@@ -506,10 +506,24 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                      ssm_inner_size, arena_.stream);
       }
       if (half_prefill) {
-        LaunchBatchedQuantGEMMResidualFp16(
-            layer.ssm_out.type, layer.ssm_out.data, arena_.d_scratch_bf16,
-            arena_.d_hidden, batch_size, hidden_size, ssm_inner_size,
-            arena_.stream);
+        std::uint32_t npu_ssm_out = 0;
+        if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+            npu_ffn->SsmOutColumns(l) != 0 &&
+            npu_ffn->BeginSsmOut(l, arena_.d_scratch_bf16, arena_.stream)) {
+          npu_ssm_out = npu_ffn->SsmOutColumns(l);
+        }
+        if (npu_ssm_out != 0) {
+          LaunchBatchedQuantGEMMResidualFp16Rows(
+              layer.ssm_out.type, layer.ssm_out.data, arena_.d_scratch_bf16,
+              arena_.d_hidden, batch_size, hidden_size, ssm_inner_size,
+              npu_ssm_out, arena_.stream);
+          npu_ffn->FinishSsmOut(l, arena_.d_hidden, hidden_size, arena_.stream);
+        } else {
+          LaunchBatchedQuantGEMMResidualFp16(
+              layer.ssm_out.type, layer.ssm_out.data, arena_.d_scratch_bf16,
+              arena_.d_hidden, batch_size, hidden_size, ssm_inner_size,
+              arena_.stream);
+        }
       } else {
         gemm_weight(layer.ssm_out, arena_.d_scratch_bf16, arena_.d_ssm_out,
                     arena_.d_attn_out, hidden_size, ssm_inner_size,

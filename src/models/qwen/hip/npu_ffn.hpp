@@ -56,6 +56,14 @@ public:
   /// (row pitch `ld`).
   virtual void FinishDown(std::uint32_t layer, float* residual, std::size_t ld,
                           hipStream_t stream) = 0;
+  /// The same for the linear-attention output projection `ssm_out`
+  /// (FP16 activations Tokens() x ssm inner size, added into the residual).
+  [[nodiscard]] virtual std::uint32_t SsmOutColumns(
+      std::uint32_t layer) const noexcept = 0;
+  [[nodiscard]] virtual bool BeginSsmOut(std::uint32_t layer, const void* act,
+                                         hipStream_t stream) = 0;
+  virtual void FinishSsmOut(std::uint32_t layer, float* residual,
+                            std::size_t ld, hipStream_t stream) = 0;
   /// As Begin for those two projections of the normed FP16 activations.
   [[nodiscard]] virtual bool BeginLinear(std::uint32_t layer,
                                          const void* normed,
