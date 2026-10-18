@@ -258,8 +258,11 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     // opt-c173-norm-quant: when every projection reading a norm is Q8_0 the
     // FP32 normed row and the BF16 staging copy are both dead, so the norm can
     // write the tiled Q8_1 activation directly and skip two round trips.
+    const bool npu_q =
+        npu_moe && npu_ffn != nullptr && layer.is_full_attention &&
+        batch_size == npu_ffn->Tokens() && npu_ffn->QkvColumns(l) != 0;
     const bool norm_feeds_q8_only =
-        IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
+        !npu_q && IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
         (layer.is_full_attention
              ? (is_q8(layer.attn_q) && is_q8(layer.attn_k) &&
                 is_q8(layer.attn_v))
@@ -302,13 +305,35 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      arena_.d_scratch_q8_act, batch_size,
                                      hidden_size, arena_.stream);
       }
-      gemm_weight(layer.attn_q, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_qkv, q_projection_size, hidden_size,
-                  arena_.d_scratch_q8_act);
-      gemm_weight(layer.attn_k, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
-      gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_v, kv_size, hidden_size, arena_.d_scratch_q8_act);
+      std::uint32_t npu_q_columns = 0;
+      if (npu_q) {
+        gemm_weight(layer.attn_k, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
+        gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_v, kv_size, hidden_size, arena_.d_scratch_q8_act);
+        LaunchFloatToFp16(arena_.d_normed, arena_.d_scratch_bf16,
+                          batch_size * hidden_size, arena_.stream);
+        if (npu_ffn->BeginLinear(l, bank, arena_.d_scratch_bf16,
+                                 arena_.stream)) {
+          npu_q_columns = npu_ffn->QkvColumns(l);
+        }
+        LaunchBatchedQuantGEMMFp16Rows(
+            layer.attn_q.type, layer.attn_q.data, arena_.d_scratch_bf16,
+            arena_.d_ssm_qkv, batch_size, q_projection_size, hidden_size,
+            npu_q_columns, arena_.stream);
+        if (npu_q_columns != 0) {
+          npu_ffn->FinishLinear(l, bank, arena_.d_ssm_qkv, q_projection_size,
+                                nullptr, 0, arena_.stream);
+        }
+      } else {
+        gemm_weight(layer.attn_q, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_ssm_qkv, q_projection_size, hidden_size,
+                    arena_.d_scratch_q8_act);
+        gemm_weight(layer.attn_k, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
+        gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_v, kv_size, hidden_size, arena_.d_scratch_q8_act);
+      }
 
       LaunchBatchedUnpackQG(arena_.d_ssm_qkv, arena_.d_q, arena_.d_ssm_gate,
                             batch_size, config.num_attention_heads,
@@ -430,12 +455,15 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
         }
       }
 
+      const bool npu_o = npu_moe && npu_ffn != nullptr &&
+                         batch_size == npu_ffn->Tokens() &&
+                         npu_ffn->SsmOutColumns(l) != 0;
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized
       // activation, so the BF16 staging buffer is dead. Quantizing straight
       // from FP32 drops one launch and one round trip (about 75 MB per layer
       // at batch 2048) and keeps the activation's full precision going into the
       // Q8_1 codes instead of rounding to BF16 first.
-      if (half_prefill) {
+      if (half_prefill || npu_o) {
         LaunchFloatToFp16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                           batch_size * attention_size, arena_.stream);
       } else if (reads_q8_act(layer.attn_output)) {
@@ -449,7 +477,22 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      arena_.d_scratch_q8_act, batch_size,
                                      attention_size, arena_.stream);
       }
-      if (half_prefill) {
+      if (npu_o) {
+        std::uint32_t npu_o_columns = 0;
+        if (npu_ffn->BeginSsmOut(l, bank, arena_.d_scratch_bf16,
+                                 arena_.stream)) {
+          npu_o_columns = npu_ffn->SsmOutColumns(l);
+        }
+        LaunchBatchedQuantGEMMResidualFp16Rows(
+            layer.attn_output.type, layer.attn_output.data,
+            arena_.d_scratch_bf16, arena_.d_hidden, batch_size, hidden_size,
+            attention_size, npu_o_columns, arena_.stream);
+        if (npu_o_columns != 0) {
+          npu_ffn->FinishSsmOut(l, bank, arena_.d_hidden, hidden_size,
+                                arena_.stream);
+        }
+        attn_in_hidden = true;
+      } else if (half_prefill) {
         LaunchBatchedQuantGEMMResidualFp16(
             layer.attn_output.type, layer.attn_output.data,
             arena_.d_scratch_bf16, arena_.d_hidden, batch_size, hidden_size,

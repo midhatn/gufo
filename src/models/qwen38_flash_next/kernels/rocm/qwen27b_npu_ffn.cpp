@@ -27,6 +27,8 @@ constexpr std::uint32_t kMoeSsmInner = 4096;
 constexpr std::uint32_t kMoeQkvSlices = 6;
 constexpr std::uint32_t kMoeGateSlices = 2;
 constexpr std::uint32_t kMoeSsmOutSlices = 1;
+constexpr std::uint32_t kMoeAttnQSlices = 3;
+constexpr std::uint32_t kMoeAttnOSlices = 1;
 constexpr std::uint32_t kSliceColumns = 1024;
 constexpr std::uint32_t kDefaultSlices = 7;
 constexpr std::uint32_t kIntermediateK = kIntermediate;
@@ -87,6 +89,18 @@ public:
     if (slices == 0 &&
         qkv_slices + gate_slices + down_slices + ssm_out_slices == 0) {
       return nullptr;
+    }
+    const char* attn_env = std::getenv("GUFO_QWEN_NPU_ATTN");
+    const bool attn_enabled = attn_env == nullptr || attn_env[0] != '0';
+    std::uint32_t attn_q_slices = kMoeAttnQSlices;
+    std::uint32_t attn_o_slices = kMoeAttnOSlices;
+    if (const char* v = std::getenv("GUFO_QWEN_NPU_ATTN_Q_SLICES")) {
+      attn_q_slices =
+          static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 8));
+    }
+    if (const char* v = std::getenv("GUFO_QWEN_NPU_ATTN_O_SLICES")) {
+      attn_o_slices =
+          static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 2));
     }
     NpuGemm::Config cfg;
     cfg.xclbin =
@@ -207,6 +221,17 @@ public:
         }
       }
       std::vector<int> lin;
+      if (ok && moe35b && layer.is_full_attention && attn_enabled &&
+          attn_q_slices != 0 && EncodableType(layer.attn_q.type) &&
+          layer.attn_q.num_elements ==
+              std::size_t{2} * config.AttentionSize() * hidden) {
+        const std::uint32_t q_slices =
+            std::min(attn_q_slices, 2 * config.AttentionSize() / kSliceColumns);
+        ok = encode(layer.attn_q, q_slices, lin, hidden);
+        if (ok) {
+          ffn->qkv_columns_[l] = q_slices * kSliceColumns;
+        }
+      }
       if (ok && !layer.is_full_attention && qkv_slices + gate_slices != 0 &&
           EncodableType(layer.attn_qkv.type) &&
           EncodableType(layer.attn_gate.type) &&
@@ -221,6 +246,14 @@ public:
         }
       }
       std::vector<int> ssm_out;
+      if (ok && moe35b && layer.is_full_attention && attn_enabled &&
+          attn_o_slices != 0 && EncodableType(layer.attn_output.type) &&
+          layer.attn_output.num_elements == std::size_t{hidden} * ssm_inner) {
+        ok = encode(layer.attn_output, attn_o_slices, ssm_out, ssm_inner);
+        if (ok) {
+          ffn->ssm_out_columns_[l] = attn_o_slices * kSliceColumns;
+        }
+      }
       if (ok && !layer.is_full_attention && ssm_out_slices != 0 &&
           EncodableType(layer.ssm_out.type) &&
           layer.ssm_out.num_elements == std::size_t{hidden} * ssm_inner) {
