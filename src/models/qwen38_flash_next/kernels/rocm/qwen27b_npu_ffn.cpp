@@ -22,21 +22,25 @@ namespace {
 constexpr std::uint32_t kTokens = 4096;
 constexpr std::uint32_t kHidden = 5120;
 constexpr std::uint32_t kIntermediate = 17408;
+constexpr std::uint32_t kMoeHidden = 2048;
+constexpr std::uint32_t kMoeSsmInner = 4096;
+constexpr std::uint32_t kMoeQkvSlices = 6;
+constexpr std::uint32_t kMoeGateSlices = 2;
+constexpr std::uint32_t kMoeSsmOutSlices = 1;
 constexpr std::uint32_t kSliceColumns = 1024;
 constexpr std::uint32_t kDefaultSlices = 7;
 constexpr std::uint32_t kIntermediateK = kIntermediate;
 constexpr std::uint32_t kDefaultDownSlices = 1;
-constexpr std::uint32_t kSsmInner = 6144;
 constexpr std::uint32_t kDefaultSsmOutSlices = 2;
 constexpr std::uint32_t kDefaultQkvSlices = 4;
 constexpr std::uint32_t kDefaultGateSlices = 2;
 constexpr std::uint32_t kMaxSlices = 16;
 
 bool EncodableType(core::GgmlType type) {
-  return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K ||
-         type == core::GgmlType::kQ6_K || type == core::GgmlType::kQ3_K ||
-         type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kIQ4_XS ||
-         type == core::GgmlType::kIQ3_S;
+  return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ4_K ||
+         type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
+         type == core::GgmlType::kQ3_K || type == core::GgmlType::kIQ4_NL ||
+         type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
 }
 
 class Qwen27bNpuFfn final : public hip::QwenNpuFfn {
@@ -44,32 +48,38 @@ public:
   static std::unique_ptr<hip::QwenNpuFfn> Create(
       const QwenModelWeights& weights, std::string* error) {
     const auto& config = weights.config;
-    if (config.hidden_size != kHidden ||
-        config.intermediate_size != kIntermediate) {
+    const bool dense27b = config.hidden_size == kHidden &&
+                          config.intermediate_size == kIntermediate;
+    const bool moe35b = config.IsMoe() && config.hidden_size == kMoeHidden &&
+                        config.ssm_inner_size == kMoeSsmInner;
+    if (!dense27b && !moe35b) {
       return nullptr;
     }
+    const std::uint32_t hidden = config.hidden_size;
+    const std::uint32_t ssm_inner = config.ssm_inner_size;
     const char* dir = std::getenv("GUFO_NPU_DIR");
     if (dir == nullptr) {
       return nullptr;
     }
-    std::uint32_t slices = kDefaultSlices;
+    std::uint32_t slices = dense27b ? kDefaultSlices : 0;
     if (const char* v = std::getenv("GUFO_QWEN_NPU_FFN_SLICES")) {
       slices = static_cast<std::uint32_t>(
           std::clamp(std::atoi(v), 0, static_cast<int>(kMaxSlices)));
     }
-    std::uint32_t qkv_slices = kDefaultQkvSlices;
-    std::uint32_t gate_slices = kDefaultGateSlices;
+    std::uint32_t qkv_slices = dense27b ? kDefaultQkvSlices : kMoeQkvSlices;
+    std::uint32_t gate_slices = dense27b ? kDefaultGateSlices : kMoeGateSlices;
     if (const char* v = std::getenv("GUFO_QWEN_NPU_QKV_SLICES")) {
       qkv_slices = static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 10));
     }
     if (const char* v = std::getenv("GUFO_QWEN_NPU_GATE_SLICES")) {
       gate_slices = static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 6));
     }
-    std::uint32_t down_slices = kDefaultDownSlices;
+    std::uint32_t down_slices = dense27b ? kDefaultDownSlices : 0;
     if (const char* v = std::getenv("GUFO_QWEN_NPU_DOWN_SLICES")) {
       down_slices = static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 5));
     }
-    std::uint32_t ssm_out_slices = kDefaultSsmOutSlices;
+    std::uint32_t ssm_out_slices =
+        dense27b ? kDefaultSsmOutSlices : kMoeSsmOutSlices;
     if (const char* v = std::getenv("GUFO_QWEN_NPU_SSM_OUT_SLICES")) {
       ssm_out_slices =
           static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 5));
@@ -81,16 +91,18 @@ public:
     NpuGemm::Config cfg;
     cfg.xclbin =
         std::string(dir) + "/runtime_k/final_4096xKx1024_128x64x128.xclbin";
-    cfg.insts =
-        std::string(dir) + "/runtime_k/insts_4096x5120x1024_128x64x128.txt";
+    cfg.insts = std::string(dir) + "/runtime_k/insts_4096x" +
+                std::to_string(hidden) + "x1024_128x64x128.txt";
     cfg.tokens = kTokens;
-    cfg.k = kHidden;
+    cfg.k = hidden;
     cfg.n = kSliceColumns;
     auto npu = NpuGemm::Create(cfg, error);
     if (npu == nullptr) {
       return nullptr;
     }
     auto ffn = std::unique_ptr<Qwen27bNpuFfn>(new Qwen27bNpuFfn());
+    ffn->hidden_ = hidden;
+    ffn->ssm_inner_ = ssm_inner;
     ffn->slices_ = slices;
     ffn->qkv_slices_ = qkv_slices;
     ffn->gate_slices_ = gate_slices;
@@ -98,13 +110,14 @@ public:
     ffn->ssm_out_slices_ = ssm_out_slices;
     if (ssm_out_slices != 0) {
       ffn->ssm_out_program_ = npu->AddProgram(
-          std::string(dir) + "/runtime_k/insts_4096x6144x1024_128x64x128.txt",
+          std::string(dir) + "/runtime_k/insts_4096x" +
+              std::to_string(ssm_inner) + "x1024_128x64x128.txt",
           error);
       if (ffn->ssm_out_program_ < 0) {
         return nullptr;
       }
       for (auto& slot : ffn->slots_) {
-        slot.a_ssm_out = npu->NewBuffer(npu->ABytes(kSsmInner), error);
+        slot.a_ssm_out = npu->NewBuffer(npu->ABytes(ssm_inner), error);
         if (slot.a_ssm_out < 0) {
           return nullptr;
         }
@@ -161,15 +174,20 @@ public:
     ffn->qkv_columns_.assign(weights.layers.size(), 0);
     ffn->gate_columns_.assign(weights.layers.size(), 0);
     const auto encode = [&](const QwenTensorRef& w, std::uint32_t count,
-                            std::vector<int>& ids, std::uint32_t k = kHidden) {
+                            std::vector<int>& ids, std::uint32_t k) {
       for (std::uint32_t i = 0; i < count; ++i) {
         const int id = npu->NewBuffer(npu->BBytes(k), error);
         if (id < 0) {
           return false;
         }
-        NpuEncodeWeightsQuant(w.data, static_cast<std::uint32_t>(w.type), k,
-                              i * kSliceColumns, kSliceColumns, k, 0, k,
-                              npu->Device(id), stream);
+        if (w.type == core::GgmlType::kQ8_0) {
+          NpuEncodeWeights(w.data, k, i * kSliceColumns, kSliceColumns, k, 0, k,
+                           npu->Device(id), stream);
+        } else {
+          NpuEncodeWeightsQuant(w.data, static_cast<std::uint32_t>(w.type), k,
+                                i * kSliceColumns, kSliceColumns, k, 0, k,
+                                npu->Device(id), stream);
+        }
         ids.push_back(id);
         staged += npu->BBytes(k);
       }
@@ -181,8 +199,8 @@ public:
       bool ok = true;
       if (slices != 0 && EncodableType(layer.ffn_gate.type) &&
           EncodableType(layer.ffn_up.type)) {
-        ok = encode(layer.ffn_gate, slices, ids) &&
-             encode(layer.ffn_up, slices, ids);
+        ok = encode(layer.ffn_gate, slices, ids, hidden) &&
+             encode(layer.ffn_up, slices, ids, hidden);
         if (ok) {
           ffn->columns_[l] = slices * kSliceColumns;
           ++layers_on_npu;
@@ -192,10 +210,11 @@ public:
       if (ok && !layer.is_full_attention && qkv_slices + gate_slices != 0 &&
           EncodableType(layer.attn_qkv.type) &&
           EncodableType(layer.attn_gate.type) &&
-          layer.attn_qkv.num_elements == std::size_t{10240} * kHidden &&
-          layer.attn_gate.num_elements == std::size_t{6144} * kHidden) {
-        ok = encode(layer.attn_qkv, qkv_slices, lin) &&
-             encode(layer.attn_gate, gate_slices, lin);
+          layer.attn_qkv.num_elements ==
+              std::size_t{config.SsmQkvSize()} * hidden &&
+          layer.attn_gate.num_elements == std::size_t{ssm_inner} * hidden) {
+        ok = encode(layer.attn_qkv, qkv_slices, lin, hidden) &&
+             encode(layer.attn_gate, gate_slices, lin, hidden);
         if (ok) {
           ffn->qkv_columns_[l] = qkv_slices * kSliceColumns;
           ffn->gate_columns_[l] = gate_slices * kSliceColumns;
@@ -204,16 +223,16 @@ public:
       std::vector<int> ssm_out;
       if (ok && !layer.is_full_attention && ssm_out_slices != 0 &&
           EncodableType(layer.ssm_out.type) &&
-          layer.ssm_out.num_elements == std::size_t{kHidden} * kSsmInner) {
-        ok = encode(layer.ssm_out, ssm_out_slices, ssm_out, kSsmInner);
+          layer.ssm_out.num_elements == std::size_t{hidden} * ssm_inner) {
+        ok = encode(layer.ssm_out, ssm_out_slices, ssm_out, ssm_inner);
         if (ok) {
           ffn->ssm_out_columns_[l] = ssm_out_slices * kSliceColumns;
         }
       }
       std::vector<int> down;
-      if (ok && down_slices != 0 && EncodableType(layer.ffn_down.type) &&
-          layer.ffn_down.num_elements ==
-              std::size_t{kHidden} * kIntermediateK) {
+      if (ok && down_slices != 0 && dense27b &&
+          EncodableType(layer.ffn_down.type) &&
+          layer.ffn_down.num_elements == std::size_t{hidden} * kIntermediateK) {
         ok = encode(layer.ffn_down, down_slices, down, kIntermediateK);
         if (ok) {
           ffn->down_columns_[l] = down_slices * kSliceColumns;
@@ -264,8 +283,8 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(normed), kHidden, kTokens,
-                         kHidden, 0, kHidden, npu_->Device(slot.a), stream);
+    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, kTokens,
+                         hidden_, 0, hidden_, npu_->Device(slot.a), stream);
     const auto& b = b_[layer];
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
@@ -303,9 +322,9 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(act), kSsmInner, kTokens,
-                         kSsmInner, 0, kSsmInner, npu_->Device(slot.a_ssm_out),
-                         stream);
+    NpuEncodeActivations(static_cast<const __half*>(act), ssm_inner_, kTokens,
+                         ssm_inner_, 0, ssm_inner_,
+                         npu_->Device(slot.a_ssm_out), stream);
     const auto& b = ssm_out_b_[layer];
     if (!npu_->Submit(stream, slot.a_ssm_out, b.data(), slot.c.data(),
                       static_cast<int>(b.size()), ssm_out_program_)) {
@@ -380,8 +399,8 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(normed), kHidden, kTokens,
-                         kHidden, 0, kHidden, npu_->Device(slot.a), stream);
+    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, kTokens,
+                         hidden_, 0, hidden_, npu_->Device(slot.a), stream);
     const auto& b = lin_b_[layer];
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
@@ -435,6 +454,8 @@ private:
   }
 
   std::unique_ptr<NpuGemm> npu_;
+  std::uint32_t hidden_{0};
+  std::uint32_t ssm_inner_{0};
   std::uint32_t slices_{0};
   std::uint32_t down_slices_{0};
   std::uint32_t ssm_out_slices_{0};
