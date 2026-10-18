@@ -34,10 +34,9 @@ int main(int argc, char** argv) {
   for (std::uint32_t id; in >> id;)
     ids.push_back(id);
   const auto& c = weights->config;
-  gufo::models::QwenKvCache kv(c.FullAttentionLayerCount(),
-                               c.num_key_value_heads,
-                               static_cast<std::uint32_t>(ids.size() + 1),
-                               c.head_dim);
+  gufo::models::QwenKvCache kv(
+      c.FullAttentionLayerCount(), c.num_key_value_heads,
+      static_cast<std::uint32_t>(ids.size() + 1), c.head_dim);
   gufo::models::QwenSsmCache ssm(c.num_layers, c.SsmQkvSize(),
                                  c.ssm_conv_kernel, c.ssm_time_step_rank,
                                  c.ssm_state_size, c.SsmValueSize());

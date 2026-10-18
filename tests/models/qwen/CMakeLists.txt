@@ -131,4 +131,11 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_l2_gpu_integration_test
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
+
+  if (GUFO_BUILD_TOOLS)
+    add_executable(qwen35moe_gpu_logits_tool
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)
+    target_link_libraries(qwen35moe_gpu_logits_tool PRIVATE
+      gufo_core hip::host roc::hipblas roc::rocblas)
+  endif()
 endif()

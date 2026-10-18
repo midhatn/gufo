@@ -8,6 +8,7 @@
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 
@@ -516,103 +517,120 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                            hidden_size, eps, arena_.stream);
     }
 
-    // Which buffer holds the Q8_1 form of the SwiGLU output ffn_down consumes.
-    // The fused epilogue below moves it out of the shared activation scratch.
-    const void* ffn_down_q8_act = arena_.d_scratch_q8_act;
-    const void* ffn_down_input = arena_.d_scratch_bf16;
-
-    {
-      if (!half_prefill && !ffn_feeds_q8_only) {
-        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                     arena_.d_scratch_q8_act, batch_size,
-                                     hidden_size, arena_.stream);
+    if (config.IsMoe()) {
+      // Simple correctness-first MoE prefill: the FFN RMSNorm above wrote the
+      // FP32 normalized activations into d_normed, and d_hidden holds the
+      // post-attention residual. Route and run each token through the same
+      // single-token MoE path used by decode, then take the residual step.
+      for (std::uint32_t t = 0; t < batch_size; ++t) {
+        MoeFfnForwardSingleToken(
+            layer, config, arena_.d_normed + t * hidden_size,
+            arena_.d_ffn_out + t * hidden_size, arena_.stream);
       }
-      // opt-c192-swiglu-epilogue: when ffn_down also reads the Q8_1 activation,
-      // the whole gate -> up -> SwiGLU -> quantize chain collapses into the two
-      // projections, because the up projection can apply SwiGLU against the
-      // already-written gate and emit the quantized activation from its own
-      // accumulator. The FP32 up intermediate is then dead, so its allocation
-      // is where the Q8_1 result goes -- reusing it keeps resident memory flat
-      // and avoids writing the [batch, k] activation the same kernel is
-      // reading.
-      const bool fused_dual_swiglu =
-          reads_q8_act(layer.ffn_gate) && reads_q8_act(layer.ffn_up) &&
-          layer.ffn_gate.type == layer.ffn_up.type &&
-          reads_q8_act(layer.ffn_down) &&
-          IsFusedSwiGluGemmEpilogueSupported(
-              layer.ffn_gate.type, batch_size, intermediate_size,
-              batch_size * intermediate_size * sizeof(float));
-      if (half_prefill) {
-        const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
-            layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
-            layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
-            batch_size, intermediate_size, hidden_size, arena_.stream);
-        if (!paired) {
-          gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
-                      arena_.d_ffn_gate, intermediate_size, hidden_size);
-          LaunchBatchedQuantGEMMSwiGLUFp16(
-              layer.ffn_up.type, layer.ffn_up.data, arena_.d_scratch_bf16,
-              arena_.d_ffn_gate, arena_.d_ffn_up, batch_size, intermediate_size,
-              hidden_size, arena_.stream);
-        }
-        ffn_down_input = arena_.d_ffn_up;
-      } else if (fused_dual_swiglu) {
-        LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
-            layer.ffn_gate.type, layer.ffn_gate.data, layer.ffn_up.data,
-            arena_.d_scratch_q8_act, arena_.d_ffn_gate, arena_.d_ffn_up,
-            batch_size, intermediate_size, hidden_size, arena_.stream);
-        ffn_down_q8_act = arena_.d_ffn_up;
-      } else if (reads_q8_act(layer.ffn_gate) && reads_q8_act(layer.ffn_up) &&
-                 layer.ffn_gate.type == layer.ffn_up.type) {
-        LaunchBatchedDualQuantGEMMPreQuantized(
-            layer.ffn_gate.type, layer.ffn_gate.data, layer.ffn_up.data,
-            arena_.d_scratch_q8_act, arena_.d_ffn_gate, arena_.d_ffn_up,
-            batch_size, intermediate_size, hidden_size, arena_.stream);
-      } else {
-        gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
-                    arena_.d_ffn_gate, intermediate_size, hidden_size,
-                    arena_.d_scratch_q8_act);
-
-        gemm_weight(layer.ffn_up, arena_.d_scratch_bf16, arena_.d_normed,
-                    arena_.d_ffn_up, intermediate_size, hidden_size,
-                    arena_.d_scratch_q8_act);
-      }
-
-      // opt-c164-swiglu-quant: when ffn_down reads Q8_0 the only consumer of
-      // the activation is the quantized buffer, so SwiGLU can write it
-      // directly. That drops the FP32 activation and BF16 scratch round trips
-      // (about 500 MB per layer at batch 2048) and one kernel launch. Other
-      // ffn_down formats still need the FP32/BF16 forms, so they keep the
-      // unfused chain.
-      if (half_prefill || fused_dual_swiglu) {
-        // The up projection's epilogue already wrote the quantized activation.
-      } else if (reads_q8_act(layer.ffn_down)) {
-        LaunchBatchedFusedSwiGLUQuantizeQ8_1(
-            arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_scratch_q8_act,
-            batch_size, intermediate_size, arena_.stream);
-      } else {
-        LaunchBatchedSwiGLUActivation(arena_.d_ffn_gate, arena_.d_ffn_up,
-                                      arena_.d_ffn_act, arena_.d_scratch_bf16,
-                                      batch_size * intermediate_size,
-                                      arena_.stream);
-        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                     arena_.d_scratch_q8_act, batch_size,
-                                     intermediate_size, arena_.stream);
-      }
-    }
-
-    if (half_prefill) {
-      LaunchBatchedQuantGEMMResidualFp16(
-          layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
-          arena_.d_hidden, batch_size, hidden_size, intermediate_size,
-          arena_.stream);
-    } else {
-      gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
-                  arena_.d_ffn_out, hidden_size, intermediate_size,
-                  ffn_down_q8_act);
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);
+    } else {
+      // Which buffer holds the Q8_1 form of the SwiGLU output ffn_down
+      // consumes. The fused epilogue below moves it out of the shared
+      // activation scratch.
+      const void* ffn_down_q8_act = arena_.d_scratch_q8_act;
+      const void* ffn_down_input = arena_.d_scratch_bf16;
+
+      {
+        if (!half_prefill && !ffn_feeds_q8_only) {
+          LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                       arena_.d_scratch_q8_act, batch_size,
+                                       hidden_size, arena_.stream);
+        }
+        // opt-c192-swiglu-epilogue: when ffn_down also reads the Q8_1
+        // activation, the whole gate -> up -> SwiGLU -> quantize chain
+        // collapses into the two projections, because the up projection can
+        // apply SwiGLU against the already-written gate and emit the quantized
+        // activation from its own accumulator. The FP32 up intermediate is then
+        // dead, so its allocation is where the Q8_1 result goes -- reusing it
+        // keeps resident memory flat and avoids writing the [batch, k]
+        // activation the same kernel is reading.
+        const bool fused_dual_swiglu =
+            reads_q8_act(layer.ffn_gate) && reads_q8_act(layer.ffn_up) &&
+            layer.ffn_gate.type == layer.ffn_up.type &&
+            reads_q8_act(layer.ffn_down) &&
+            IsFusedSwiGluGemmEpilogueSupported(
+                layer.ffn_gate.type, batch_size, intermediate_size,
+                batch_size * intermediate_size * sizeof(float));
+        if (half_prefill) {
+          const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
+              layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
+              layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
+              batch_size, intermediate_size, hidden_size, arena_.stream);
+          if (!paired) {
+            gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
+                        arena_.d_ffn_gate, intermediate_size, hidden_size);
+            LaunchBatchedQuantGEMMSwiGLUFp16(
+                layer.ffn_up.type, layer.ffn_up.data, arena_.d_scratch_bf16,
+                arena_.d_ffn_gate, arena_.d_ffn_up, batch_size,
+                intermediate_size, hidden_size, arena_.stream);
+          }
+          ffn_down_input = arena_.d_ffn_up;
+        } else if (fused_dual_swiglu) {
+          LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+              layer.ffn_gate.type, layer.ffn_gate.data, layer.ffn_up.data,
+              arena_.d_scratch_q8_act, arena_.d_ffn_gate, arena_.d_ffn_up,
+              batch_size, intermediate_size, hidden_size, arena_.stream);
+          ffn_down_q8_act = arena_.d_ffn_up;
+        } else if (reads_q8_act(layer.ffn_gate) && reads_q8_act(layer.ffn_up) &&
+                   layer.ffn_gate.type == layer.ffn_up.type) {
+          LaunchBatchedDualQuantGEMMPreQuantized(
+              layer.ffn_gate.type, layer.ffn_gate.data, layer.ffn_up.data,
+              arena_.d_scratch_q8_act, arena_.d_ffn_gate, arena_.d_ffn_up,
+              batch_size, intermediate_size, hidden_size, arena_.stream);
+        } else {
+          gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
+                      arena_.d_ffn_gate, intermediate_size, hidden_size,
+                      arena_.d_scratch_q8_act);
+
+          gemm_weight(layer.ffn_up, arena_.d_scratch_bf16, arena_.d_normed,
+                      arena_.d_ffn_up, intermediate_size, hidden_size,
+                      arena_.d_scratch_q8_act);
+        }
+
+        // opt-c164-swiglu-quant: when ffn_down reads Q8_0 the only consumer of
+        // the activation is the quantized buffer, so SwiGLU can write it
+        // directly. That drops the FP32 activation and BF16 scratch round trips
+        // (about 500 MB per layer at batch 2048) and one kernel launch. Other
+        // ffn_down formats still need the FP32/BF16 forms, so they keep the
+        // unfused chain.
+        if (half_prefill || fused_dual_swiglu) {
+          // The up projection's epilogue already wrote the quantized
+          // activation.
+        } else if (reads_q8_act(layer.ffn_down)) {
+          LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+              arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_scratch_q8_act,
+              batch_size, intermediate_size, arena_.stream);
+        } else {
+          LaunchBatchedSwiGLUActivation(arena_.d_ffn_gate, arena_.d_ffn_up,
+                                        arena_.d_ffn_act, arena_.d_scratch_bf16,
+                                        batch_size * intermediate_size,
+                                        arena_.stream);
+          LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                       arena_.d_scratch_q8_act, batch_size,
+                                       intermediate_size, arena_.stream);
+        }
+      }
+
+      if (half_prefill) {
+        LaunchBatchedQuantGEMMResidualFp16(
+            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
+            arena_.d_hidden, batch_size, hidden_size, intermediate_size,
+            arena_.stream);
+      } else {
+        gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
+                    arena_.d_ffn_out, hidden_size, intermediate_size,
+                    ffn_down_q8_act);
+        LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
+                                 arena_.d_hidden, batch_size, hidden_size,
+                                 arena_.stream);
+      }
     }
 
     if (capture_prompt_hidden_) {
