@@ -67,6 +67,7 @@ struct Call {
   std::vector<int> b_ids;
   std::vector<int> c_ids;
   std::uint64_t ticket;
+  int program{0};
 };
 
 class CopyPool {
@@ -173,6 +174,13 @@ struct NpuGemm::Impl {
   xrt::bo instructions;
   std::size_t instruction_words{0};
   int group_a{0};
+  /// Further instruction streams for the same kernel (other reduction lengths
+  /// of a runtime-K program). Index 0 of a call's `program` is the one above.
+  struct Program {
+    xrt::bo instructions;
+    std::size_t words{0};
+  };
+  std::vector<Program> extra_programs;
 
   struct Buffer {
     void* host{nullptr};    // GPU-visible pinned memory
@@ -419,8 +427,14 @@ struct NpuGemm::Impl {
           ReapOldest();
         }
         const auto t_launch = std::chrono::steady_clock::now();
+        const auto& program_bo =
+            call.program == 0 ? instructions
+                              : extra_programs[call.program - 1].instructions;
+        const std::size_t program_words =
+            call.program == 0 ? instruction_words
+                              : extra_programs[call.program - 1].words;
         pending.emplace_back(
-            kernel(kOpcode, instructions, instruction_words, NpuBo(call.a_id),
+            kernel(kOpcode, program_bo, program_words, NpuBo(call.a_id),
                    NpuBo(call.b_ids[i]), NpuBo(call.c_ids[i])),
             call.c_ids[i]);
         launch_us += Since(t_launch);
@@ -614,14 +628,51 @@ void NpuGemm::FinalizeWeights(int id) {
   impl_->CopyToNpu(id);
 }
 
+int NpuGemm::AddProgram(const std::string& insts, std::string* error) {
+  try {
+    std::ifstream file(insts, std::ios::binary | std::ios::ate);
+    if (!file) {
+      if (error != nullptr) {
+        *error = "NPU instruction file not readable: " + insts;
+      }
+      return -1;
+    }
+    const auto size = static_cast<std::size_t>(file.tellg());
+    file.seekg(0);
+    std::vector<char> words(size);
+    file.read(words.data(), static_cast<std::streamsize>(size));
+    Impl::Program program;
+    program.words = size / sizeof(int);
+    program.instructions = xrt::bo(impl_->device, size, XCL_BO_FLAGS_CACHEABLE,
+                                   impl_->kernel.group_id(1));
+    std::memcpy(program.instructions.map<void*>(), words.data(), size);
+    program.instructions.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    impl_->extra_programs.push_back(std::move(program));
+    return static_cast<int>(impl_->extra_programs.size());
+  } catch (const std::exception& e) {
+    if (error != nullptr) {
+      *error = std::string("NPU program setup failed: ") + e.what();
+    }
+    return -1;
+  }
+}
+
+std::size_t NpuGemm::ABytes(std::uint32_t k) const noexcept {
+  return std::size_t{impl_->config.tokens} * k / 8 * kBytesPer8;
+}
+std::size_t NpuGemm::BBytes(std::uint32_t k) const noexcept {
+  return std::size_t{k} * impl_->config.n / 8 * kBytesPer8;
+}
+
 bool NpuGemm::Submit(hipStream_t stream, int a_id, const int* b_ids,
-                     const int* c_ids, int count) {
+                     const int* c_ids, int count, int program) {
   Trace("submit_host", a_id, count);
   auto* call = new Call{impl_.get(),
                         a_id,
                         {b_ids, b_ids + count},
                         {c_ids, c_ids + count},
-                        ++impl_->submitted};
+                        ++impl_->submitted,
+                        program};
   const hipError_t status = hipLaunchHostFunc(
       stream,
       [](void* data) {

@@ -38,6 +38,11 @@ void LaunchBatchedQuantGEMMResidualFp16(core::GgmlType type,
                                         float* residual, std::size_t batch,
                                         std::size_t m, std::size_t k,
                                         hipStream_t stream);
+// The residual projection restricted to output rows [row_begin, rows_total).
+void LaunchBatchedQuantGEMMResidualFp16Rows(
+    core::GgmlType type, const void* weights, const void* input,
+    float* residual, std::size_t batch, std::size_t rows_total, std::size_t k,
+    std::size_t row_begin, hipStream_t stream);
 // The same projection restricted to output rows [row_begin, rows_total): the
 // FP32 result keeps its full rows_total pitch.
 void LaunchBatchedQuantGEMMFp16Rows(core::GgmlType type, const void* weights,

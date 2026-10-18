@@ -831,6 +831,17 @@ void LaunchBatchedQuantGEMMResidualFp16(gufo::core::GgmlType type,
                                       nullptr, stream);
 }
 
+void LaunchBatchedQuantGEMMResidualFp16Rows(
+    gufo::core::GgmlType type, const void* w, const void* x, float* residual,
+    std::size_t batch, std::size_t rows_total, std::size_t k,
+    std::size_t row_begin, hipStream_t stream) {
+  DirectGemm<HalfEpilogue::kResidual>(
+      type, static_cast<const std::uint8_t*>(w) +
+                row_begin * gufo::quant::QuantizedRowBytes(type, k),
+      x, residual + row_begin, batch, rows_total - row_begin, k, nullptr,
+      stream, rows_total);
+}
+
 bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     gufo::core::GgmlType gate_type, gufo::core::GgmlType up_type,
     const void* gate_weights, const void* up_weights, const void* x, void* y,

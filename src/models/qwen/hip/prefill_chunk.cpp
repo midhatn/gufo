@@ -645,10 +645,24 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
 
     if (half_prefill) {
-      LaunchBatchedQuantGEMMResidualFp16(
-          layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
-          arena_.d_hidden, batch_size, hidden_size, intermediate_size,
-          arena_.stream);
+      std::uint32_t npu_down = 0;
+      if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+          npu_ffn->DownColumns(l) != 0 &&
+          npu_ffn->BeginDown(l, ffn_down_input, arena_.stream)) {
+        npu_down = npu_ffn->DownColumns(l);
+      }
+      if (npu_down != 0) {
+        LaunchBatchedQuantGEMMResidualFp16Rows(
+            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
+            arena_.d_hidden, batch_size, hidden_size, intermediate_size,
+            npu_down, arena_.stream);
+        npu_ffn->FinishDown(l, arena_.d_hidden, hidden_size, arena_.stream);
+      } else {
+        LaunchBatchedQuantGEMMResidualFp16(
+            layer.ffn_down.type, layer.ffn_down.data, ffn_down_input,
+            arena_.d_hidden, batch_size, hidden_size, intermediate_size,
+            arena_.stream);
+      }
     } else {
       gemm_weight(layer.ffn_down, ffn_down_input, arena_.d_ffn_act,
                   arena_.d_ffn_out, hidden_size, intermediate_size,

@@ -45,6 +45,17 @@ public:
       std::uint32_t layer) const noexcept = 0;
   [[nodiscard]] virtual std::uint32_t GateColumns(
       std::uint32_t layer) const noexcept = 0;
+  /// Leading output columns of `ffn_down` the NPU computes for `layer`.
+  [[nodiscard]] virtual std::uint32_t DownColumns(
+      std::uint32_t layer) const noexcept = 0;
+  /// Encodes the FP16 SwiGLU output (Tokens() x intermediate) and queues the
+  /// down-projection runs; false leaves everything to the GPU.
+  [[nodiscard]] virtual bool BeginDown(std::uint32_t layer, const void* act,
+                                       hipStream_t stream) = 0;
+  /// Waits for the NPU and adds the leading columns into the FP32 residual
+  /// (row pitch `ld`).
+  virtual void FinishDown(std::uint32_t layer, float* residual, std::size_t ld,
+                          hipStream_t stream) = 0;
   /// As Begin for those two projections of the normed FP16 activations.
   [[nodiscard]] virtual bool BeginLinear(std::uint32_t layer,
                                          const void* normed,
