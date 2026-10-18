@@ -348,6 +348,13 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
                       hipStream_t stream);
+/// Weights from a quantized GGUF tensor of `type` (a core::GgmlType value) with
+/// rows of k_total elements; otherwise as NpuEncodeWeights.
+void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
+                           std::uint32_t k_total, std::uint32_t row0,
+                           std::uint32_t cols, std::uint32_t k_slice,
+                           std::uint32_t k_offset, std::uint32_t k_valid,
+                           void* dst, hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
                std::uint32_t cols, std::uint32_t valid_cols,
