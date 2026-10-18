@@ -122,7 +122,7 @@ void MoeFfnForwardSingleToken(const models::QwenLayerWeights& layer,
                       scratch.d_expert_ids, scratch.d_expert_weights,
                       scratch.d_shared_weight,
                       static_cast<std::uint32_t>(experts),
-                      static_cast<std::uint32_t>(used), stream);
+                      static_cast<std::uint32_t>(used), 1, stream);
 
   HIP_CHECK(hipMemcpyAsync(scratch.h_expert_ids.data(), scratch.d_expert_ids,
                            used * sizeof(std::int32_t), hipMemcpyDeviceToHost,
@@ -178,7 +178,7 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
   LaunchMoeRouterTopK(scratch.router_logits, scratch.shared_logit, scratch.ids,
                       scratch.weights, scratch.shared_weight,
                       static_cast<std::uint32_t>(experts),
-                      static_cast<std::uint32_t>(used), stream);
+                      static_cast<std::uint32_t>(used), 1, stream);
   // activation[s] = SiLU(gate_e x) * (up_e x) for the selected experts e.
   if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
                             layer.ffn_gate_exps.data, layer.ffn_up_exps.data, x,
@@ -201,7 +201,7 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
              scratch.shared_act, scratch.shared_out, hidden, shared_ff, stream);
   LaunchMoeCombine(out, scratch.down_out, scratch.weights, scratch.shared_out,
                    scratch.shared_weight, static_cast<std::uint32_t>(used),
-                   static_cast<std::uint32_t>(hidden), stream);
+                   static_cast<std::uint32_t>(hidden), 1, stream);
 }
 
 void WarmMoeDecode(const models::QwenModelWeights& weights,

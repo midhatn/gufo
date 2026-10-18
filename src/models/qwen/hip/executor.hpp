@@ -288,6 +288,8 @@ struct QwenMoeScratch {
   float* shared_weight{nullptr};
   float* act{nullptr};
   float* down_out{nullptr};
+  float* shared_gate{nullptr};
+  float* shared_up{nullptr};
   float* shared_act{nullptr};
   float* shared_out{nullptr};
 };

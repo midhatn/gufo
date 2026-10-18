@@ -12,6 +12,8 @@
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_vec.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -92,6 +94,63 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
   LaunchBatchedSwiGLUActivation(scratch.ffn.gate.data(), scratch.ffn.up.data(),
                                 scratch.ffn.activation.data(), nullptr,
                                 batch_size * intermediate_size, stream);
+}
+
+// qwen35moe feed-forward for `rows` independent token rows: batched router,
+// device top-k, the expert vector kernels in chunks of eight rows, the shared
+// expert through the exact shared projections, and one combine pass.
+void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
+                      const core::ModelConfig& config, QwenGpuArena& arena,
+                      const float* x, float* out, std::size_t rows) {
+  constexpr std::size_t kChunkRows = 8;
+  const auto& s = arena.moe;
+  const int experts = static_cast<int>(config.num_experts);
+  const int used = static_cast<int>(config.num_experts_used);
+  const int ff = static_cast<int>(config.expert_ff);
+  const int hidden = static_cast<int>(config.hidden_size);
+  const std::size_t shared_ff = config.shared_expert_ff;
+  hipStream_t stream = arena.stream;
+  // The same GEMV kernel as single-token decode, so a row routes exactly as it
+  // would alone.
+  for (std::size_t row = 0; row < rows; ++row) {
+    const float* row_x = x + (row * hidden);
+    LaunchGEMV(layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type,
+               row_x, s.shared_logit + row, 1, hidden, stream);
+    LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, row_x,
+               s.router_logits + (row * experts), experts, hidden, stream);
+  }
+  LaunchMoeRouterTopK(s.router_logits, s.shared_logit, s.ids, s.weights,
+                      s.shared_weight, static_cast<std::uint32_t>(experts),
+                      static_cast<std::uint32_t>(used),
+                      static_cast<std::uint32_t>(rows), stream);
+  for (std::size_t first = 0; first < rows; first += kChunkRows) {
+    const int n = static_cast<int>(std::min(kChunkRows, rows - first));
+    const float* chunk_x = x + (first * hidden);
+    const std::int32_t* chunk_ids = s.ids + (first * used);
+    float* chunk_act = s.act + (first * used * ff);
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
+                              layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
+                              chunk_x, chunk_ids, chunk_act, ff, hidden, n,
+                              experts, used, stream) != 0 ||
+        qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
+                        layer.ffn_down_exps.data, chunk_act, chunk_ids,
+                        s.down_out + (first * used * hidden), hidden, ff,
+                        n * used, experts, 1, stream, nullptr, nullptr) != 0) {
+      throw std::runtime_error("qwen35moe expert projection failed");
+    }
+  }
+  LaunchProjection(layer.ffn_gate_shexp, x, s.shared_gate, rows, shared_ff,
+                   hidden, stream);
+  LaunchProjection(layer.ffn_up_shexp, x, s.shared_up, rows, shared_ff, hidden,
+                   stream);
+  LaunchBatchedSwiGLUActivation(s.shared_gate, s.shared_up, s.shared_act,
+                                nullptr, rows * shared_ff, stream);
+  LaunchProjection(layer.ffn_down_shexp, s.shared_act, s.shared_out, rows,
+                   hidden, shared_ff, stream);
+  LaunchMoeCombine(out, s.down_out, s.weights, s.shared_out, s.shared_weight,
+                   static_cast<std::uint32_t>(used),
+                   static_cast<std::uint32_t>(hidden),
+                   static_cast<std::uint32_t>(rows), stream);
 }
 
 struct SsmControls {
@@ -354,11 +413,16 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena.stream);
+    if (config.IsMoe()) {
+      LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
+                       scratch.ffn.out.data(), batch_size);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -732,11 +796,16 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena_.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena_.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena_.stream);
+    if (config.IsMoe()) {
+      LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
+                       scratch.ffn.out.data(), batch_size);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena_.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena_.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);

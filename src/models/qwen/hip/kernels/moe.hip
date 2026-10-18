@@ -20,6 +20,12 @@ __global__ void MoeRouterTopKKernel(const float* __restrict__ router_logits,
                                     float* __restrict__ shared_weight,
                                     std::uint32_t num_experts,
                                     std::uint32_t num_used) {
+  // One block per token row.
+  router_logits += static_cast<std::size_t>(blockIdx.x) * num_experts;
+  shared_logit += blockIdx.x;
+  expert_ids += static_cast<std::size_t>(blockIdx.x) * num_used;
+  expert_weights += static_cast<std::size_t>(blockIdx.x) * num_used;
+  shared_weight += blockIdx.x;
   extern __shared__ float probs[];
   __shared__ float s_max[8];
   __shared__ float s_sum[8];
@@ -160,6 +166,12 @@ __global__ void MoeCombineKernel(float* __restrict__ out,
   if (i >= hidden) {
     return;
   }
+  const std::size_t row = blockIdx.y;
+  out += row * hidden;
+  slot_out += row * used * hidden;
+  slot_weight += row * used;
+  shared_out += row * hidden;
+  shared_weight += row;
   float sum = 0.0F;
   for (std::uint32_t s = 0; s < used; ++s) {
     sum += slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
@@ -172,10 +184,11 @@ __global__ void MoeCombineKernel(float* __restrict__ out,
 void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          std::int32_t* expert_ids, float* expert_weights,
                          float* shared_weight, std::uint32_t num_experts,
-                         std::uint32_t num_used, hipStream_t stream) {
+                         std::uint32_t num_used, std::uint32_t rows,
+                         hipStream_t stream) {
   const std::size_t shared_bytes =
       static_cast<std::size_t>(num_experts) * sizeof(float);
-  MoeRouterTopKKernel<<<1, kMoeRouterThreads, shared_bytes, stream>>>(
+  MoeRouterTopKKernel<<<rows, kMoeRouterThreads, shared_bytes, stream>>>(
       router_logits, shared_logit, expert_ids, expert_weights, shared_weight,
       num_experts, num_used);
 }
@@ -191,8 +204,9 @@ void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
 void LaunchMoeCombine(float* out, const float* slot_out,
                       const float* slot_weight, const float* shared_out,
                       const float* shared_weight, std::uint32_t used,
-                      std::uint32_t hidden, hipStream_t stream) {
-  MoeCombineKernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
+                      std::uint32_t hidden, std::uint32_t rows,
+                      hipStream_t stream) {
+  MoeCombineKernel<<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
       out, slot_out, slot_weight, shared_out, shared_weight, used, hidden);
 }
 

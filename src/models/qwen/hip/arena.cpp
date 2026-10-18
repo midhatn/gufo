@@ -18,7 +18,7 @@ namespace gufo::hip {
 namespace {
 
 constexpr std::uint32_t kMaxPromptBatch = 4096;
-constexpr std::size_t kMaxTargetLayerTaps = 5;
+constexpr std::size_t kMaxTargetLayerTaps = 8;
 constexpr std::array<std::uint8_t, 8> kCompactSnapshotMagic = {
     'G', 'Q', 'K', 'V', 'S', 'N', 'P', '1'};
 constexpr std::uint32_t kCompactSnapshotVersion = 1;
@@ -731,16 +731,20 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_prompt_tokens, std::max<std::size_t>(batch, 2) *
                                               sizeof(std::uint32_t)));
-    HIP_CHECK(
-        hipMalloc(&d_target_layer_features, 5 * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_target_layer_features,
+                        kMaxTargetLayerTaps * hidden_size * sizeof(float)));
 
     if (config_.IsMoe()) {
       const std::size_t experts = config_.num_experts;
       const std::size_t used = config_.num_experts_used;
       const std::size_t ff = config_.expert_ff;
       const std::size_t shared_ff = config_.shared_expert_ff;
-      const std::size_t total = experts + 4 + used + used + 4 + (used * ff) +
-                                (used * hidden_size) + shared_ff + hidden_size;
+      // Room for 64 rows: eight sessions each verifying eight draft tokens.
+      constexpr std::size_t kRows = 64;
+      const std::size_t total =
+          kRows * (experts + 1 + used + used + 1 + (used * ff) +
+                   (used * hidden_size) + (3 * shared_ff) + hidden_size) +
+          8;
       HIP_CHECK(hipMalloc(&d_moe_buf_, total * sizeof(float)));
       float* cursor = d_moe_buf_;
       const auto take = [&cursor](std::size_t count) {
@@ -748,15 +752,17 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
         cursor += count;
         return start;
       };
-      moe.router_logits = take(experts);
-      moe.shared_logit = take(4);
-      moe.ids = reinterpret_cast<std::int32_t*>(take(used));
-      moe.weights = take(used);
-      moe.shared_weight = take(4);
-      moe.act = take(used * ff);
-      moe.down_out = take(used * hidden_size);
-      moe.shared_act = take(shared_ff);
-      moe.shared_out = take(hidden_size);
+      moe.router_logits = take(kRows * experts);
+      moe.shared_logit = take(kRows);
+      moe.ids = reinterpret_cast<std::int32_t*>(take(kRows * used));
+      moe.weights = take(kRows * used);
+      moe.shared_weight = take(kRows);
+      moe.act = take(kRows * used * ff);
+      moe.down_out = take(kRows * used * hidden_size);
+      moe.shared_gate = take(kRows * shared_ff);
+      moe.shared_up = take(kRows * shared_ff);
+      moe.shared_act = take(kRows * shared_ff);
+      moe.shared_out = take(kRows * hidden_size);
 
       const std::size_t rows = batch;
       const std::size_t sff = shared_ff;
