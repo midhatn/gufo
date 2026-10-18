@@ -8060,7 +8060,8 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
                                 const std::uint8_t* __restrict__ gate_lo,
                                 const std::uint8_t* __restrict__ up_lo,
                                 __half* __restrict__ out, std::uint32_t tokens,
-                                std::uint32_t cols, std::uint32_t valid_cols) {
+                                std::uint32_t cols, std::uint32_t valid_cols,
+                                std::size_t out_pitch, std::uint32_t out_col0) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
   if (g >= std::size_t{tokens} * cols / 8) {
     return;
@@ -8105,21 +8106,22 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
     }
     packed[i / 2] = __floats2half2_rn(SiluF(g0) * u0, SiluF(g1) * u1);
   }
-  *reinterpret_cast<uint4*>(out + row * valid_cols + col) =
+  *reinterpret_cast<uint4*>(
+      out + row * (out_pitch != 0 ? out_pitch : valid_cols) + out_col0 + col) =
       *reinterpret_cast<const uint4*>(packed);
 }
 
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
-               std::uint32_t cols, std::uint32_t valid_cols,
-               hipStream_t stream) {
+               std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
+               std::size_t out_pitch, std::uint32_t out_col0) {
   const std::size_t groups = std::size_t{tokens} * cols / 8;
   hipLaunchKernelGGL(NpuSwigluKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
                      stream, static_cast<const std::uint8_t*>(gate),
                      static_cast<const std::uint8_t*>(up),
                      static_cast<const std::uint8_t*>(gate_lo),
                      static_cast<const std::uint8_t*>(up_lo), out, tokens, cols,
-                     valid_cols);
+                     valid_cols, out_pitch, out_col0);
 }
 
 void NpuEncodeActivations(const __half* x, std::size_t ldx,

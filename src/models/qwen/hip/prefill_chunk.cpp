@@ -8,6 +8,7 @@
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 
@@ -99,6 +100,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                        hidden_size, 1, arena_.stream);
 
   const bool half_prefill = UseQwen27bFp16Prefill(weights_, batch_size);
+  QwenNpuFfn* const npu_ffn = half_prefill ? model_->NpuFfn() : nullptr;
   const auto gemm_weight = [&](const models::QwenTensorRef& w,
                                const void* bf16_input, const float* fp32_input,
                                float* output, std::size_t m, std::size_t k,
@@ -543,10 +545,27 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
               layer.ffn_gate.type, batch_size, intermediate_size,
               batch_size * intermediate_size * sizeof(float));
       if (half_prefill) {
+        // The NPU takes the leading columns of a full 4096-token chunk when the
+        // pair kernel can compute the remainder; its runs are queued before the
+        // GPU kernel so the two overlap.
+        std::uint32_t npu_columns = 0;
+        if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+            npu_ffn->Columns(l) != 0 &&
+            TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
+                layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
+                layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
+                batch_size, intermediate_size, hidden_size, arena_.stream, 0, 0,
+                /*dry_run=*/true) &&
+            npu_ffn->Begin(l, arena_.d_scratch_bf16, arena_.stream)) {
+          npu_columns = npu_ffn->Columns(l);
+        }
         const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
             layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
             layer.ffn_up.data, arena_.d_scratch_bf16, arena_.d_ffn_up,
-            batch_size, intermediate_size, hidden_size, arena_.stream);
+            batch_size, intermediate_size, hidden_size, arena_.stream,
+            npu_columns, npu_columns != 0 ? intermediate_size : 0);
+        if (npu_columns != 0)
+          npu_ffn->Finish(l, arena_.d_ffn_up, intermediate_size, arena_.stream);
         if (!paired) {
           gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
                       arena_.d_ffn_gate, intermediate_size, hidden_size);

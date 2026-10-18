@@ -83,4 +83,7 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+/// Hands the qwen executor the factory for the Qwen3.8-27B FFN NPU offload.
+void RegisterQwenNpuFfn();
+
 }  // namespace gufo::models::qwen38_flash_next::rocm

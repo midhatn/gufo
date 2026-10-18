@@ -39,12 +39,16 @@ void LaunchBatchedQuantGEMMResidualFp16(core::GgmlType type,
                                         std::size_t m, std::size_t k,
                                         hipStream_t stream);
 // Qualified gate/up weight pairs share a kernel that emits FP16 SwiGLU
-// directly. Returns false without launching for other pairs.
+// directly. Returns false without launching for other pairs. With `row_begin`
+// and `rows_total` only output columns [row_begin, rows_total) are computed and
+// written at the full pitch; `dry_run` only reports whether the pair is
+// supported.
 // All buffers are disjoint; the output may reuse the dead FP32 up allocation.
 bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     core::GgmlType gate_type, core::GgmlType up_type, const void* gate_weights,
     const void* up_weights, const void* input, void* output, std::size_t batch,
-    std::size_t m, std::size_t k, hipStream_t stream);
+    std::size_t m, std::size_t k, hipStream_t stream, std::size_t row_begin = 0,
+    std::size_t rows_total = 0, bool dry_run = false);
 }  // namespace gufo::hip
 #endif
 #endif

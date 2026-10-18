@@ -7,6 +7,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -26,6 +27,7 @@
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -110,6 +112,8 @@ public:
     return weight_regions_.size();
   }
   [[nodiscard]] std::size_t GetResidentBytes() const noexcept;
+  /// NPU offload of the FFN gate/up projections, or null when it is off.
+  [[nodiscard]] QwenNpuFfn* NpuFfn() const;
 
 private:
   // Keep the mapped GGUF storage alive until every registered region is
@@ -119,6 +123,8 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
+  mutable std::once_flag npu_once_;
+  mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
 };
 
 class QwenGpuSnapshot final {

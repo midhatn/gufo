@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <stdexcept>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 namespace gufo::hip {
@@ -226,7 +227,8 @@ __launch_bounds__(WM * WN * 32) __global__
                                const short* __restrict__ x,
                                float* __restrict__ y, int batch, int m, int k,
                                const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr) {
+                               const void* __restrict__ up = nullptr,
+                               int ldy = 0, int y_row0 = 0) {
   constexpr bool Paired = Epilogue == HalfEpilogue::kGateUp;
   constexpr bool Mixed = Paired && Type != UpType;
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
@@ -572,7 +574,9 @@ __launch_bounds__(WM * WN * 32) __global__
           if (Complete || (row < m && token < batch)) {
             const float g = acc[i][j][l], u = acc[i + 1][j][l];
             const float sig = 1.0F / (1.0F + expf(-g));
-            reinterpret_cast<__half*>(y)[std::size_t(token) * m + row] =
+            reinterpret_cast<__half*>(y)[std::size_t(token) *
+                                             (ldy != 0 ? ldy : m) +
+                                         y_row0 + row] =
                 RoundActivation(__fmul_rn(g * sig, u));
           }
         }
@@ -814,15 +818,31 @@ void LaunchBatchedQuantGEMMResidualFp16(gufo::core::GgmlType type,
 bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     gufo::core::GgmlType gate_type, gufo::core::GgmlType up_type,
     const void* gate_weights, const void* up_weights, const void* x, void* y,
-    std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream) {
+    std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream,
+    std::size_t row_begin, std::size_t rows_total, bool dry_run) {
+  // A row range computes output columns [row_begin, m) of a rows_total-wide
+  // result; the weights are offset to the first row and y keeps its full pitch.
+  int ldy = 0, y_row0 = 0;
+  if (rows_total != 0) {
+    gate_weights = static_cast<const std::uint8_t*>(gate_weights) +
+                   row_begin * gufo::quant::QuantizedRowBytes(gate_type, k);
+    up_weights = static_cast<const std::uint8_t*>(up_weights) +
+                 row_begin * gufo::quant::QuantizedRowBytes(up_type, k);
+    ldy = static_cast<int>(rows_total);
+    y_row0 = static_cast<int>(row_begin);
+    m = rows_total - row_begin;
+  }
   const auto launch = [&]<gufo::core::GgmlType Type,
                           gufo::core::GgmlType UpType = Type>() {
+    if (dry_run)
+      return;
     const auto tile = [&]<bool Full>() {
       HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp, Full,
                             UpType>
           <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
               gate_weights, static_cast<const short*>(x),
-              static_cast<float*>(y), batch, m, k, nullptr, up_weights);
+              static_cast<float*>(y), batch, m, k, nullptr, up_weights, ldy,
+              y_row0);
     };
     if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
                    Type == gufo::core::GgmlType::kQ5_K) &&

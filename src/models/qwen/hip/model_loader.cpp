@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -247,6 +249,18 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
       std::move(weight_regions), std::move(vision));
+}
+
+QwenNpuFfn* QwenGpuModel::NpuFfn() const {
+  std::call_once(npu_once_, [this] {
+    if (std::getenv("GUFO_NPU_DIR") == nullptr)
+      return;
+    std::string error;
+    npu_ffn_ = CreateQwenNpuFfn(weights_, &error);
+    if (npu_ffn_ == nullptr && !error.empty())
+      std::fprintf(stderr, "NPU off: %s\n", error.c_str());
+  });
+  return npu_ffn_.get();
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

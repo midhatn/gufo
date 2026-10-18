@@ -357,8 +357,8 @@ void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
                            void* dst, hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
-               std::uint32_t cols, std::uint32_t valid_cols,
-               hipStream_t stream);
+               std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
+               std::size_t out_pitch = 0, std::uint32_t out_col0 = 0);
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,

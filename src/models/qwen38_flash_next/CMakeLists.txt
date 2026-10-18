@@ -72,7 +72,8 @@ if (ENGINE_ENABLE_HIP)
     if (NOT EXISTS "${GUFO_XRT_INCLUDE_DIR}/xrt/xrt_bo.h")
       message(FATAL_ERROR "GUFO_ENABLE_NPU needs GUFO_XRT_INCLUDE_DIR with xrt/xrt_bo.h")
     endif()
-    target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_ROCM_DIR}/npu_gemm.cpp)
+    target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_ROCM_DIR}/npu_gemm.cpp
+      ${QFN_ROCM_DIR}/qwen27b_npu_ffn.cpp)
     target_include_directories(gufo_qwen38_flash_next PRIVATE ${GUFO_XRT_INCLUDE_DIR})
     target_compile_definitions(gufo_qwen38_flash_next PUBLIC GUFO_NPU=1)
     target_link_libraries(gufo_qwen38_flash_next PUBLIC
