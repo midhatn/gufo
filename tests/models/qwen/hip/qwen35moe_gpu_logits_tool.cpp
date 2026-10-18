@@ -17,6 +17,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 int main(int argc, char** argv) {
   if (argc != 4 && argc != 5) {
@@ -24,6 +25,7 @@ int main(int argc, char** argv) {
               << " model.gguf ids.txt out.bin [n_gen]\n";
     return 2;
   }
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenMoePrefill();
   const bool generate = argc == 5;
   std::string error;
   auto reader_owner = gufo::core::GgufReader::OpenFile(argv[1], &error);

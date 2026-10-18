@@ -194,6 +194,7 @@ int main(int argc, char* argv[]) {
   }
 #if defined(ENGINE_ENABLE_HIP)
   gufo::models::qwen38_flash_next::rocm::RegisterQwenNpuFfn();
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenMoePrefill();
 #endif
   const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
   return run(args);

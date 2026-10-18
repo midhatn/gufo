@@ -757,6 +757,28 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       moe.down_out = take(used * hidden_size);
       moe.shared_act = take(shared_ff);
       moe.shared_out = take(hidden_size);
+
+      const std::size_t rows = batch;
+      const std::size_t sff = shared_ff;
+      const std::size_t half_bytes = rows * hidden_size * sizeof(__half);
+      const std::size_t float_count =
+          (rows * experts) + rows + (3 * rows * sff) + (rows * hidden_size);
+      HIP_CHECK(hipMalloc(&d_moe_prefill_buf_,
+                          half_bytes + float_count * sizeof(float)));
+      auto* base = static_cast<std::uint8_t*>(d_moe_prefill_buf_);
+      moe_prefill.x_half = reinterpret_cast<__half*>(base);
+      float* floats = reinterpret_cast<float*>(base + half_bytes);
+      moe_prefill.router_logits = floats;
+      floats += rows * experts;
+      moe_prefill.shared_logit = floats;
+      floats += rows;
+      moe_prefill.shared_gate = floats;
+      floats += rows * sff;
+      moe_prefill.shared_up = floats;
+      floats += rows * sff;
+      moe_prefill.shared_act = floats;
+      floats += rows * sff;
+      moe_prefill.shared_out = floats;
     }
 
     const std::size_t scratch_elements =
@@ -1079,6 +1101,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_target_layer_features = other.d_target_layer_features;
   moe = other.moe;
   d_moe_buf_ = other.d_moe_buf_;
+  moe_prefill = other.moe_prefill;
+  d_moe_prefill_buf_ = other.d_moe_prefill_buf_;
   stream = other.stream;
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
@@ -1125,6 +1149,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_target_layer_features = nullptr;
   other.moe = {};
   other.d_moe_buf_ = nullptr;
+  other.moe_prefill = {};
+  other.d_moe_prefill_buf_ = nullptr;
   other.stream = nullptr;
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
@@ -1352,6 +1378,11 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_moe_buf_));
     d_moe_buf_ = nullptr;
     moe = {};
+  }
+  if (d_moe_prefill_buf_ != nullptr) {
+    LogCleanupError(hipFree(d_moe_prefill_buf_));
+    d_moe_prefill_buf_ = nullptr;
+    moe_prefill = {};
   }
   if (d_kv_cache != nullptr)
     LogCleanupError(hipFree(d_kv_cache));

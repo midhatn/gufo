@@ -68,12 +68,14 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/dflash_kernels.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/arena.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/npu_ffn.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_prefill.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_ffn.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_prefill_ffn.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill_chunk.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/ssm_replay.cpp

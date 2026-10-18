@@ -73,6 +73,19 @@ struct AttentionSupportParams {
          (static_cast<std::size_t>(head_dim) + 2);
 }
 
+/// The WMMA prefill attention is instantiated for two head geometries: 24 query
+/// heads over 4 KV heads (Qwen3.8-27B) and 16 over 2 (Qwen3.6-35B-A3B).
+[[nodiscard]] constexpr bool IsWmmaAttentionSupported(
+    const AttentionSupportParams& params) noexcept {
+  const bool geometry = (params.num_heads == 24 && params.num_kv_heads == 4) ||
+                        (params.num_heads == 16 && params.num_kv_heads == 2);
+  return params.batch_size != 0 && geometry &&
+         params.head_dim == kTiledAttentionHeadDim &&
+         static_cast<std::size_t>(params.start_pos) + params.batch_size <=
+             params.max_context &&
+         params.has_k_cache_f16 && params.has_v_cache_f16;
+}
+
 [[nodiscard]] constexpr bool IsTiledAttentionSupported(
     const AttentionSupportParams& params) noexcept {
   return params.batch_size != 0 &&

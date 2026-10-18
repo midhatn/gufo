@@ -267,6 +267,18 @@ QwenNpuFfn* QwenGpuModel::NpuFfn() const {
   return npu_ffn_.get();
 }
 
+QwenMoePrefill* QwenGpuModel::MoePrefill(std::uint32_t max_tokens) const {
+  std::call_once(moe_prefill_once_, [this, max_tokens] {
+    if (!weights_.config.IsMoe())
+      return;
+    std::string error;
+    moe_prefill_ = CreateQwenMoePrefill(weights_, max_tokens, &error);
+    if (moe_prefill_ == nullptr && !error.empty())
+      std::fprintf(stderr, "MoE prefill off: %s\n", error.c_str());
+  });
+  return moe_prefill_.get();
+}
+
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
     std::shared_ptr<const QwenGpuModel> model, std::string* error_msg,
     std::uint32_t max_context, QwenExecutionPolicy policy) {

@@ -92,5 +92,7 @@ private:
 
 /// Hands the qwen executor the factory for the Qwen3.8-27B FFN NPU offload.
 void RegisterQwenNpuFfn();
+/// Hands the qwen executor the grouped-expert prefill for qwen35moe.
+void RegisterQwenMoePrefill();
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

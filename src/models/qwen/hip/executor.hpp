@@ -28,6 +28,7 @@
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/models/qwen/hip/detail/prefill_task.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/models/qwen/hip/moe_prefill.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -115,6 +116,8 @@ public:
   [[nodiscard]] std::size_t GetResidentBytes() const noexcept;
   /// NPU offload of the FFN gate/up projections, or null when it is off.
   [[nodiscard]] QwenNpuFfn* NpuFfn() const;
+  /// Grouped-expert prefill for qwen35moe, or null when unavailable.
+  [[nodiscard]] QwenMoePrefill* MoePrefill(std::uint32_t max_tokens) const;
 
 private:
   // Keep the mapped GGUF storage alive until every registered region is
@@ -126,6 +129,8 @@ private:
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
   mutable std::once_flag npu_once_;
   mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
+  mutable std::once_flag moe_prefill_once_;
+  mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
 };
 
 class QwenGpuSnapshot final {
@@ -287,6 +292,17 @@ struct QwenMoeScratch {
   float* shared_out{nullptr};
 };
 
+/// Device scratch of the batched qwen35moe prefill feed-forward.
+struct QwenMoePrefillScratch {
+  __half* x_half{nullptr};
+  float* router_logits{nullptr};
+  float* shared_logit{nullptr};
+  float* shared_gate{nullptr};
+  float* shared_up{nullptr};
+  float* shared_act{nullptr};
+  float* shared_out{nullptr};
+};
+
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
@@ -353,6 +369,7 @@ public:
   std::uint32_t* d_prompt_tokens{nullptr};
   float* d_target_layer_features{nullptr};
   QwenMoeScratch moe;
+  QwenMoePrefillScratch moe_prefill;
 
   hipStream_t stream{nullptr};
   hipblasHandle_t hipblas_handle{nullptr};
@@ -422,6 +439,7 @@ private:
   bool replay_capture_active_{false};
   std::unique_ptr<QwenPrefillBank> second_bank_;
   float* d_moe_buf_{nullptr};
+  void* d_moe_prefill_buf_{nullptr};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -625,6 +643,11 @@ private:
       std::span<const tokenization::TokenId> first_tokens,
       std::span<const tokenization::TokenId> second_tokens,
       std::uint32_t start_pos, bool compute_logits);
+  /// Batched routed-expert feed-forward of a qwen35moe layer; false leaves the
+  /// per-token path to run.
+  [[nodiscard]] bool MoePrefillFfn(const models::QwenLayerWeights& layer,
+                                   std::uint32_t layer_index,
+                                   std::size_t batch_size);
   [[nodiscard]] detail::PrefillTask PrefillChunkTask(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t start_pos, bool compute_logits, int bank);

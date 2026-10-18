@@ -623,10 +623,12 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // FP32 normalized activations into d_normed, and d_hidden holds the
       // post-attention residual. Route and run each token through the same
       // single-token MoE path used by decode, then take the residual step.
-      for (std::uint32_t t = 0; t < batch_size; ++t) {
-        MoeFfnForwardSingleToken(
-            layer, config, arena_.d_normed + t * hidden_size,
-            arena_.d_ffn_out + t * hidden_size, arena_.stream);
+      if (!MoePrefillFfn(layer, l, batch_size)) {
+        for (std::uint32_t t = 0; t < batch_size; ++t) {
+          MoeFfnForwardSingleToken(
+              layer, config, arena_.d_normed + t * hidden_size,
+              arena_.d_ffn_out + t * hidden_size, arena_.stream);
+        }
       }
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,

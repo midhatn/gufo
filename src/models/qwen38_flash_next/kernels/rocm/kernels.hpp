@@ -355,6 +355,10 @@ void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
                            std::uint32_t cols, std::uint32_t k_slice,
                            std::uint32_t k_offset, std::uint32_t k_valid,
                            void* dst, hipStream_t stream);
+/// Re-encodes `rows` rows of k weights (any K-quant or IQ `type`, a
+/// core::GgmlType value) as Q8_0 into dst (rows * k / 32 * 34 bytes).
+void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
+                   std::size_t rows, void* dst, hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
                std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
