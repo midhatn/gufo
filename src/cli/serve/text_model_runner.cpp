@@ -693,6 +693,8 @@ TextModelRunner::BindConstraint(
       return binding;
   if (!constraint_vocabulary_)
     constraint_vocabulary_ = BuildConstraintVocabulary();
+  if (!constraint_vocabulary_)
+    throw std::invalid_argument("model does not support structured output");
   auto binding = std::make_shared<sampling::TokenConstraint>();
   binding->grammar = std::move(grammar);
   binding->vocabulary = constraint_vocabulary_;
@@ -700,6 +702,13 @@ TextModelRunner::BindConstraint(
     constraints_.erase(constraints_.begin());
   constraints_.push_back(binding);
   return binding;
+}
+
+std::size_t TextModelRunner::PrepareConstraintVocabulary() const {
+  const std::lock_guard lock(constraint_mutex_);
+  if (!constraint_vocabulary_)
+    constraint_vocabulary_ = BuildConstraintVocabulary();
+  return constraint_vocabulary_ ? constraint_vocabulary_->size() : 0;
 }
 
 std::shared_ptr<const sampling::ReasoningBudget>
