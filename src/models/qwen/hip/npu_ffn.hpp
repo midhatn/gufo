@@ -38,6 +38,22 @@ public:
   /// into columns [0, Columns(layer)) of `out` (FP16, row pitch `ld`).
   virtual void Finish(std::uint32_t layer, void* out, std::size_t ld,
                       hipStream_t stream) = 0;
+
+  /// Leading output columns of the linear-attention `attn_qkv` and `attn_gate`
+  /// projections the NPU computes for `layer`; 0 when they stay on the GPU.
+  [[nodiscard]] virtual std::uint32_t QkvColumns(
+      std::uint32_t layer) const noexcept = 0;
+  [[nodiscard]] virtual std::uint32_t GateColumns(
+      std::uint32_t layer) const noexcept = 0;
+  /// As Begin for those two projections of the normed FP16 activations.
+  [[nodiscard]] virtual bool BeginLinear(std::uint32_t layer,
+                                         const void* normed,
+                                         hipStream_t stream) = 0;
+  /// Waits for the NPU and decodes the leading columns into the FP32 outputs
+  /// (row pitches `qkv_ld` and `gate_ld`).
+  virtual void FinishLinear(std::uint32_t layer, float* qkv, std::size_t qkv_ld,
+                            float* gate, std::size_t gate_ld,
+                            hipStream_t stream) = 0;
 };
 
 using QwenNpuFfnFactory = std::function<std::unique_ptr<QwenNpuFfn>(

@@ -23,6 +23,8 @@ constexpr std::uint32_t kHidden = 5120;
 constexpr std::uint32_t kIntermediate = 17408;
 constexpr std::uint32_t kSliceColumns = 1024;
 constexpr std::uint32_t kDefaultSlices = 6;
+constexpr std::uint32_t kDefaultQkvSlices = 4;
+constexpr std::uint32_t kDefaultGateSlices = 2;
 constexpr std::uint32_t kMaxSlices = 16;
 
 bool EncodableType(core::GgmlType type) {
@@ -50,7 +52,15 @@ public:
       slices = static_cast<std::uint32_t>(
           std::clamp(std::atoi(v), 0, static_cast<int>(kMaxSlices)));
     }
-    if (slices == 0) {
+    std::uint32_t qkv_slices = kDefaultQkvSlices;
+    std::uint32_t gate_slices = kDefaultGateSlices;
+    if (const char* v = std::getenv("GUFO_QWEN_NPU_QKV_SLICES")) {
+      qkv_slices = static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 10));
+    }
+    if (const char* v = std::getenv("GUFO_QWEN_NPU_GATE_SLICES")) {
+      gate_slices = static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 6));
+    }
+    if (slices == 0 && qkv_slices + gate_slices == 0) {
       return nullptr;
     }
     NpuGemm::Config cfg;
@@ -67,11 +77,14 @@ public:
     }
     auto ffn = std::unique_ptr<Qwen27bNpuFfn>(new Qwen27bNpuFfn());
     ffn->slices_ = slices;
+    ffn->qkv_slices_ = qkv_slices;
+    ffn->gate_slices_ = gate_slices;
     ffn->a_ = npu->NewBuffer(npu->ABytes(), error);
     if (ffn->a_ < 0) {
       return nullptr;
     }
-    for (std::uint32_t i = 0; i < 2 * slices; ++i) {
+    for (std::uint32_t i = 0;
+         i < std::max(2 * slices, qkv_slices + gate_slices); ++i) {
       const int id = npu->NewBuffer(npu->CBytes(), error);
       if (id < 0) {
         return nullptr;
@@ -86,26 +99,48 @@ public:
     std::uint32_t layers_on_npu = 0;
     ffn->b_.resize(weights.layers.size());
     ffn->columns_.assign(weights.layers.size(), 0);
+    ffn->lin_b_.resize(weights.layers.size());
+    ffn->qkv_columns_.assign(weights.layers.size(), 0);
+    ffn->gate_columns_.assign(weights.layers.size(), 0);
+    const auto encode = [&](const QwenTensorRef& w, std::uint32_t count,
+                            std::vector<int>& ids) {
+      for (std::uint32_t i = 0; i < count; ++i) {
+        const int id = npu->NewBuffer(npu->BBytes(), error);
+        if (id < 0) {
+          return false;
+        }
+        NpuEncodeWeightsQuant(w.data, static_cast<std::uint32_t>(w.type),
+                              kHidden, i * kSliceColumns, kSliceColumns,
+                              kHidden, 0, kHidden, npu->Device(id), stream);
+        ids.push_back(id);
+        staged += npu->BBytes();
+      }
+      return true;
+    };
     for (std::size_t l = 0; l < weights.layers.size(); ++l) {
       const auto& layer = weights.layers[l];
-      if (!EncodableType(layer.ffn_gate.type) ||
-          !EncodableType(layer.ffn_up.type)) {
-        continue;
-      }
       std::vector<int> ids;
       bool ok = true;
-      for (const auto* w : {&layer.ffn_gate, &layer.ffn_up}) {
-        for (std::uint32_t i = 0; i < slices && ok; ++i) {
-          const int id = npu->NewBuffer(npu->BBytes(), error);
-          if (id < 0) {
-            ok = false;
-            break;
-          }
-          NpuEncodeWeightsQuant(w->data, static_cast<std::uint32_t>(w->type),
-                                kHidden, i * kSliceColumns, kSliceColumns,
-                                kHidden, 0, kHidden, npu->Device(id), stream);
-          ids.push_back(id);
-          staged += npu->BBytes();
+      if (slices != 0 && EncodableType(layer.ffn_gate.type) &&
+          EncodableType(layer.ffn_up.type)) {
+        ok = encode(layer.ffn_gate, slices, ids) &&
+             encode(layer.ffn_up, slices, ids);
+        if (ok) {
+          ffn->columns_[l] = slices * kSliceColumns;
+          ++layers_on_npu;
+        }
+      }
+      std::vector<int> lin;
+      if (ok && !layer.is_full_attention && qkv_slices + gate_slices != 0 &&
+          EncodableType(layer.attn_qkv.type) &&
+          EncodableType(layer.attn_gate.type) &&
+          layer.attn_qkv.num_elements == std::size_t{10240} * kHidden &&
+          layer.attn_gate.num_elements == std::size_t{6144} * kHidden) {
+        ok = encode(layer.attn_qkv, qkv_slices, lin) &&
+             encode(layer.attn_gate, gate_slices, lin);
+        if (ok) {
+          ffn->qkv_columns_[l] = qkv_slices * kSliceColumns;
+          ffn->gate_columns_[l] = gate_slices * kSliceColumns;
         }
       }
       if (!ok) {
@@ -116,15 +151,18 @@ public:
       for (const int id : ids) {
         npu->FinalizeWeights(id);
       }
+      for (const int id : lin) {
+        npu->FinalizeWeights(id);
+      }
       ffn->b_[l] = std::move(ids);
-      ffn->columns_[l] = slices * kSliceColumns;
-      ++layers_on_npu;
+      ffn->lin_b_[l] = std::move(lin);
     }
     hipStreamDestroy(stream);
     std::fprintf(stderr,
-                 "NPU: FFN gate/up first %u columns of %u layers, %.2f GiB "
-                 "staged\n",
+                 "NPU: FFN gate/up first %u columns of %u layers, linear qkv "
+                 "%u gate %u columns, %.2f GiB staged\n",
                  slices * kSliceColumns, layers_on_npu,
+                 qkv_slices * kSliceColumns, gate_slices * kSliceColumns,
                  static_cast<double>(staged) / (1024.0 * 1024.0 * 1024.0));
     ffn->npu_ = std::move(npu);
     return ffn;
@@ -167,6 +205,48 @@ public:
         this);
   }
 
+  std::uint32_t QkvColumns(std::uint32_t layer) const noexcept override {
+    return layer < qkv_columns_.size() ? qkv_columns_[layer] : 0;
+  }
+  std::uint32_t GateColumns(std::uint32_t layer) const noexcept override {
+    return layer < gate_columns_.size() ? gate_columns_[layer] : 0;
+  }
+
+  bool BeginLinear(std::uint32_t layer, const void* normed,
+                   hipStream_t stream) override {
+    if (!npu_->Healthy() || !Acquire(stream)) {
+      return false;
+    }
+    NpuEncodeActivations(static_cast<const __half*>(normed), kHidden, kTokens,
+                         kHidden, 0, kHidden, npu_->Device(a_), stream);
+    const auto& b = lin_b_[layer];
+    if (!npu_->Submit(stream, a_, b.data(), c_.data(),
+                      static_cast<int>(b.size()))) {
+      Release(this);
+      return false;
+    }
+    return true;
+  }
+
+  void FinishLinear(std::uint32_t layer, float* qkv, std::size_t qkv_ld,
+                    float* gate, std::size_t gate_ld,
+                    hipStream_t stream) override {
+    npu_->Wait(stream);
+    const std::uint32_t qkv_count = qkv_columns_[layer] / kSliceColumns;
+    const std::uint32_t gate_count = gate_columns_[layer] / kSliceColumns;
+    for (std::uint32_t i = 0; i < qkv_count; ++i) {
+      NpuDecodeOutput(npu_->Staged(stream, c_[i]), qkv, kTokens, kSliceColumns,
+                      qkv_ld, i * kSliceColumns, false, stream);
+    }
+    for (std::uint32_t i = 0; i < gate_count; ++i) {
+      NpuDecodeOutput(npu_->Staged(stream, c_[qkv_count + i]), gate, kTokens,
+                      kSliceColumns, gate_ld, i * kSliceColumns, false, stream);
+    }
+    hipLaunchHostFunc(
+        stream, [](void* self) { Release(static_cast<Qwen27bNpuFfn*>(self)); },
+        this);
+  }
+
 private:
   Qwen27bNpuFfn() = default;
 
@@ -190,6 +270,11 @@ private:
 
   std::unique_ptr<NpuGemm> npu_;
   std::uint32_t slices_{0};
+  std::uint32_t qkv_slices_{0};
+  std::uint32_t gate_slices_{0};
+  std::vector<std::vector<int>> lin_b_;
+  std::vector<std::uint32_t> qkv_columns_;
+  std::vector<std::uint32_t> gate_columns_;
   int a_{-1};
   std::vector<int> c_;
   std::vector<std::vector<int>> b_;

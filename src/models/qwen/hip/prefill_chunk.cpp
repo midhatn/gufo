@@ -404,18 +404,42 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                      arena_.d_scratch_q8_act, batch_size,
                                      hidden_size, arena_.stream);
       }
-      gemm_weight(layer.attn_qkv, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_qkv, ssm_qkv_size, hidden_size,
-                  arena_.d_scratch_q8_act);
-      gemm_weight(layer.attn_gate, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_gate, ssm_inner_size, hidden_size,
-                  arena_.d_scratch_q8_act);
+      // The NPU takes the leading columns of attn_qkv and attn_gate for a full
+      // 4096-token chunk; its runs are queued ahead of the GPU rows.
+      std::uint32_t npu_qkv = 0, npu_gate = 0;
+      if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+          (npu_ffn->QkvColumns(l) != 0 || npu_ffn->GateColumns(l) != 0) &&
+          npu_ffn->BeginLinear(l, arena_.d_scratch_bf16, arena_.stream)) {
+        npu_qkv = npu_ffn->QkvColumns(l);
+        npu_gate = npu_ffn->GateColumns(l);
+      }
+      if (npu_qkv != 0 || npu_gate != 0) {
+        LaunchBatchedQuantGEMMFp16Rows(layer.attn_qkv.type, layer.attn_qkv.data,
+                                       arena_.d_scratch_bf16, arena_.d_ssm_qkv,
+                                       batch_size, ssm_qkv_size, hidden_size,
+                                       npu_qkv, arena_.stream);
+        LaunchBatchedQuantGEMMFp16Rows(
+            layer.attn_gate.type, layer.attn_gate.data, arena_.d_scratch_bf16,
+            arena_.d_ssm_gate, batch_size, ssm_inner_size, hidden_size,
+            npu_gate, arena_.stream);
+      } else {
+        gemm_weight(layer.attn_qkv, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_ssm_qkv, ssm_qkv_size, hidden_size,
+                    arena_.d_scratch_q8_act);
+        gemm_weight(layer.attn_gate, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_ssm_gate, ssm_inner_size, hidden_size,
+                    arena_.d_scratch_q8_act);
+      }
       gemm_weight(layer.ssm_alpha, arena_.d_scratch_bf16, arena_.d_normed,
                   arena_.d_alpha_buf, time_step_rank, hidden_size,
                   arena_.d_scratch_q8_act);
       gemm_weight(layer.ssm_beta, arena_.d_scratch_bf16, arena_.d_normed,
                   arena_.d_beta_buf, time_step_rank, hidden_size,
                   arena_.d_scratch_q8_act);
+      if (npu_qkv != 0 || npu_gate != 0) {
+        npu_ffn->FinishLinear(l, arena_.d_ssm_qkv, ssm_qkv_size,
+                              arena_.d_ssm_gate, ssm_inner_size, arena_.stream);
+      }
       if (arena_.IsSsmReplayCaptureActive()) {
         LaunchCaptureBatchedSsmReplay(
             arena_.d_ssm_qkv, arena_.d_alpha_buf, arena_.d_beta_buf,
