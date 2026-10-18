@@ -80,46 +80,62 @@ __global__ void MoeRouterTopKKernel(const float* __restrict__ router_logits,
   }
   __syncthreads();
 
-  if (tid == 0) {
-    float best_val[64];
-    std::int32_t best_idx[64];
-    const std::uint32_t capacity =
-        num_used < 64 ? num_used : static_cast<std::uint32_t>(64);
-    std::uint32_t n = 0;
-    for (std::uint32_t e = 0; e < num_experts; ++e) {
+  // Top-k by repeated block-wide argmax: ties resolve toward the lower index,
+  // as a stable sort would.
+  __shared__ float s_best_value[8];
+  __shared__ std::int32_t s_best_index[8];
+  __shared__ float s_pick_value[64];
+  __shared__ std::int32_t s_pick_index[64];
+  const std::uint32_t capacity =
+      num_used < 64 ? num_used : static_cast<std::uint32_t>(64);
+  for (std::uint32_t k = 0; k < capacity; ++k) {
+    float best = -1.0F;
+    std::int32_t best_e = 0x7fffffff;
+    for (std::uint32_t e = tid; e < num_experts; e += blockDim.x) {
       const float v = probs[e];
-      std::uint32_t pos = n;
-      for (std::uint32_t k = 0; k < n; ++k) {
-        if (v > best_val[k]) {
-          pos = k;
-          break;
-        }
-      }
-      if (pos < capacity) {
-        const std::uint32_t last = n < capacity ? n : capacity - 1;
-        for (std::uint32_t k = last; k > pos; --k) {
-          best_val[k] = best_val[k - 1];
-          best_idx[k] = best_idx[k - 1];
-        }
-        best_val[pos] = v;
-        best_idx[pos] = static_cast<std::int32_t>(e);
-        if (n < capacity)
-          ++n;
+      if (v > best || (v == best && static_cast<std::int32_t>(e) < best_e)) {
+        best = v;
+        best_e = static_cast<std::int32_t>(e);
       }
     }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      const float other = __shfl_xor(best, offset);
+      const std::int32_t other_e = __shfl_xor(best_e, offset);
+      if (other > best || (other == best && other_e < best_e)) {
+        best = other;
+        best_e = other_e;
+      }
+    }
+    if (lane == 0) {
+      s_best_value[warp] = best;
+      s_best_index[warp] = best_e;
+    }
+    __syncthreads();
+    if (tid == 0) {
+      float block_best = s_best_value[0];
+      std::int32_t block_e = s_best_index[0];
+      for (std::uint32_t w = 1; w < warp_count; ++w) {
+        if (s_best_value[w] > block_best ||
+            (s_best_value[w] == block_best && s_best_index[w] < block_e)) {
+          block_best = s_best_value[w];
+          block_e = s_best_index[w];
+        }
+      }
+      s_pick_value[k] = block_best;
+      s_pick_index[k] = block_e;
+      probs[block_e] = -1.0F;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
     float selected_sum = 0.0F;
-    for (std::uint32_t k = 0; k < n; ++k) {
-      selected_sum += best_val[k];
+    for (std::uint32_t k = 0; k < capacity; ++k) {
+      selected_sum += s_pick_value[k];
     }
     const float inv = selected_sum > 0.0F ? 1.0F / selected_sum : 0.0F;
     for (std::uint32_t k = 0; k < capacity; ++k) {
-      if (k < n) {
-        expert_ids[k] = best_idx[k];
-        expert_weights[k] = best_val[k] * inv;
-      } else {
-        expert_ids[k] = 0;
-        expert_weights[k] = 0.0F;
-      }
+      expert_ids[k] = s_pick_index[k];
+      expert_weights[k] = s_pick_value[k] * inv;
     }
     shared_weight[0] = 1.0F / (1.0F + expf(-shared_logit[0]));
   }
@@ -132,6 +148,23 @@ __global__ void MoeScaledAccumulateKernel(float* __restrict__ out,
   if (idx < dim) {
     out[idx] += scale * add[idx];
   }
+}
+
+__global__ void MoeCombineKernel(float* __restrict__ out,
+                                 const float* __restrict__ slot_out,
+                                 const float* __restrict__ slot_weight,
+                                 const float* __restrict__ shared_out,
+                                 const float* __restrict__ shared_weight,
+                                 std::uint32_t used, std::uint32_t hidden) {
+  const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden) {
+    return;
+  }
+  float sum = 0.0F;
+  for (std::uint32_t s = 0; s < used; ++s) {
+    sum += slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
+  }
+  out[i] = sum + shared_weight[0] * shared_out[i];
 }
 
 }  // namespace
@@ -153,6 +186,14 @@ void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
   const std::size_t grid = (dim + kBlockSize - 1) / kBlockSize;
   MoeScaledAccumulateKernel<<<grid, kBlockSize, 0, stream>>>(out, add, scale,
                                                              dim);
+}
+
+void LaunchMoeCombine(float* out, const float* slot_out,
+                      const float* slot_weight, const float* shared_out,
+                      const float* shared_weight, std::uint32_t used,
+                      std::uint32_t hidden, hipStream_t stream) {
+  MoeCombineKernel<<<(hidden + 255) / 256, 256, 0, stream>>>(
+      out, slot_out, slot_weight, shared_out, shared_weight, used, hidden);
 }
 
 }  // namespace gufo::hip

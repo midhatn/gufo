@@ -226,8 +226,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
     // Fused SwiGLU FFN
     if (config.IsMoe()) {
-      MoeFfnForwardSingleToken(layer, config, decode_scratch.normed.data(),
-                               ffn_scratch.out.data(), arena.stream);
+      MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
+                        ffn_scratch.out.data(), arena.stream);
     } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The

@@ -3,12 +3,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
+#include "src/models/qwen/hip/ops/moe_vec.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
 namespace gufo::hip {
@@ -157,6 +159,72 @@ void MoeFfnForwardSingleToken(const models::QwenLayerWeights& layer,
              stream);
   LaunchMoeScaledAccumulate(out, scratch.d_expert_out,
                             scratch.h_shared_weight[0], hidden, stream);
+}
+
+void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
+                       const core::ModelConfig& config,
+                       const QwenMoeScratch& scratch, const float* x,
+                       float* out, hipStream_t stream) {
+  const int experts = static_cast<int>(config.num_experts);
+  const int used = static_cast<int>(config.num_experts_used);
+  const int ff = static_cast<int>(config.expert_ff);
+  const int hidden = static_cast<int>(config.hidden_size);
+  const int shared_ff = static_cast<int>(config.shared_expert_ff);
+
+  LaunchGEMV(layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type, x,
+             scratch.shared_logit, 1, hidden, stream);
+  LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, x,
+             scratch.router_logits, experts, hidden, stream);
+  LaunchMoeRouterTopK(scratch.router_logits, scratch.shared_logit, scratch.ids,
+                      scratch.weights, scratch.shared_weight,
+                      static_cast<std::uint32_t>(experts),
+                      static_cast<std::uint32_t>(used), stream);
+  // activation[s] = SiLU(gate_e x) * (up_e x) for the selected experts e.
+  if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
+                            layer.ffn_gate_exps.data, layer.ffn_up_exps.data, x,
+                            scratch.ids, scratch.act, ff, hidden, 1, experts,
+                            used, stream) != 0) {
+    throw std::runtime_error("qwen35moe expert gate/up projection failed");
+  }
+  // Each slot row multiplies its own expert's down matrix: used rows, one
+  // expert each.
+  if (qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
+                      layer.ffn_down_exps.data, scratch.act, scratch.ids,
+                      scratch.down_out, hidden, ff, used, experts, 1, stream,
+                      nullptr, nullptr) != 0) {
+    throw std::runtime_error("qwen35moe expert down projection failed");
+  }
+  LaunchFusedSwiGLUGEMV(layer.ffn_gate_shexp.data, layer.ffn_gate_shexp.type,
+                        layer.ffn_up_shexp.data, layer.ffn_up_shexp.type, x,
+                        scratch.shared_act, shared_ff, hidden, stream);
+  LaunchGEMV(layer.ffn_down_shexp.data, layer.ffn_down_shexp.type,
+             scratch.shared_act, scratch.shared_out, hidden, shared_ff, stream);
+  LaunchMoeCombine(out, scratch.down_out, scratch.weights, scratch.shared_out,
+                   scratch.shared_weight, static_cast<std::uint32_t>(used),
+                   static_cast<std::uint32_t>(hidden), stream);
+}
+
+void WarmMoeDecode(const models::QwenModelWeights& weights,
+                   const core::ModelConfig& config,
+                   const QwenMoeScratch& scratch, const float* x,
+                   hipStream_t stream) {
+  const int experts = static_cast<int>(config.num_experts);
+  const int used = static_cast<int>(config.num_experts_used);
+  const int ff = static_cast<int>(config.expert_ff);
+  const int hidden = static_cast<int>(config.hidden_size);
+  HIP_CHECK(
+      hipMemsetAsync(scratch.ids, 0, used * sizeof(std::int32_t), stream));
+  for (const auto& layer : weights.layers) {
+    (void)qfn_mmq_moe_gated_vec(
+        static_cast<int>(layer.ffn_gate_exps.type), layer.ffn_gate_exps.data,
+        layer.ffn_up_exps.data, x, scratch.ids, scratch.act, ff, hidden, 1,
+        experts, used, stream);
+    (void)qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
+                          layer.ffn_down_exps.data, scratch.act, scratch.ids,
+                          scratch.down_out, hidden, ff, used, experts, 1,
+                          stream, nullptr, nullptr);
+  }
+  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 }  // namespace gufo::hip

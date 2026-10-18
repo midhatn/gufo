@@ -24,6 +24,13 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
 void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
                                std::size_t dim, hipStream_t stream = nullptr);
 
+/// out[i] = sum_s slot_weight[s] * slot_out[s][i] + shared_weight[0] *
+/// shared_out[i]: the routed experts and the gated shared expert in one pass.
+void LaunchMoeCombine(float* out, const float* slot_out,
+                      const float* slot_weight, const float* shared_out,
+                      const float* shared_weight, std::uint32_t used,
+                      std::uint32_t hidden, hipStream_t stream = nullptr);
+
 }  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

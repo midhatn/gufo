@@ -274,6 +274,19 @@ struct QwenPrefillBank {
   void* scratch_q8_act{nullptr};
 };
 
+/// Device scratch of the single-token MoE feed-forward (qwen35moe decode).
+struct QwenMoeScratch {
+  float* router_logits{nullptr};
+  float* shared_logit{nullptr};
+  std::int32_t* ids{nullptr};
+  float* weights{nullptr};
+  float* shared_weight{nullptr};
+  float* act{nullptr};
+  float* down_out{nullptr};
+  float* shared_act{nullptr};
+  float* shared_out{nullptr};
+};
+
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
@@ -339,6 +352,7 @@ public:
   void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};
   float* d_target_layer_features{nullptr};
+  QwenMoeScratch moe;
 
   hipStream_t stream{nullptr};
   hipblasHandle_t hipblas_handle{nullptr};
@@ -407,6 +421,7 @@ private:
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
   std::unique_ptr<QwenPrefillBank> second_bank_;
+  float* d_moe_buf_{nullptr};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -640,6 +655,7 @@ private:
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
+  bool moe_warmed_{false};
 };
 
 }  // namespace gufo::hip

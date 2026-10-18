@@ -734,6 +734,31 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(
         hipMalloc(&d_target_layer_features, 5 * hidden_size * sizeof(float)));
 
+    if (config_.IsMoe()) {
+      const std::size_t experts = config_.num_experts;
+      const std::size_t used = config_.num_experts_used;
+      const std::size_t ff = config_.expert_ff;
+      const std::size_t shared_ff = config_.shared_expert_ff;
+      const std::size_t total = experts + 4 + used + used + 4 + (used * ff) +
+                                (used * hidden_size) + shared_ff + hidden_size;
+      HIP_CHECK(hipMalloc(&d_moe_buf_, total * sizeof(float)));
+      float* cursor = d_moe_buf_;
+      const auto take = [&cursor](std::size_t count) {
+        float* start = cursor;
+        cursor += count;
+        return start;
+      };
+      moe.router_logits = take(experts);
+      moe.shared_logit = take(4);
+      moe.ids = reinterpret_cast<std::int32_t*>(take(used));
+      moe.weights = take(used);
+      moe.shared_weight = take(4);
+      moe.act = take(used * ff);
+      moe.down_out = take(used * hidden_size);
+      moe.shared_act = take(shared_ff);
+      moe.shared_out = take(hidden_size);
+    }
+
     const std::size_t scratch_elements =
         batch * std::max<std::size_t>(
                     {intermediate_size, hidden_size, projection_width,
@@ -1052,6 +1077,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
   d_prompt_tokens = other.d_prompt_tokens;
   d_target_layer_features = other.d_target_layer_features;
+  moe = other.moe;
+  d_moe_buf_ = other.d_moe_buf_;
   stream = other.stream;
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
@@ -1096,6 +1123,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_deltanet_state = nullptr;
   other.d_prompt_tokens = nullptr;
   other.d_target_layer_features = nullptr;
+  other.moe = {};
+  other.d_moe_buf_ = nullptr;
   other.stream = nullptr;
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
@@ -1149,6 +1178,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
     d_prompt_tokens = other.d_prompt_tokens;
     d_target_layer_features = other.d_target_layer_features;
+    moe = other.moe;
+    d_moe_buf_ = other.d_moe_buf_;
     stream = other.stream;
     hipblas_handle = other.hipblas_handle;
     hipblaslt_gemm = std::move(other.hipblaslt_gemm);
@@ -1193,6 +1224,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_deltanet_state = nullptr;
     other.d_prompt_tokens = nullptr;
     other.d_target_layer_features = nullptr;
+    other.moe = {};
+    other.d_moe_buf_ = nullptr;
     other.stream = nullptr;
     other.hipblas_handle = nullptr;
     other.d_scratch_bf16 = nullptr;
@@ -1314,6 +1347,11 @@ void QwenGpuArena::FreeAll() noexcept {
   if (d_target_layer_features != nullptr) {
     LogCleanupError(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
+  }
+  if (d_moe_buf_ != nullptr) {
+    LogCleanupError(hipFree(d_moe_buf_));
+    d_moe_buf_ = nullptr;
+    moe = {};
   }
   if (d_kv_cache != nullptr)
     LogCleanupError(hipFree(d_kv_cache));
