@@ -5,6 +5,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/modules/modules.hpp"
 
@@ -224,7 +225,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Fused SwiGLU FFN
-    {
+    if (config.IsMoe()) {
+      MoeFfnForwardSingleToken(layer, config, decode_scratch.normed.data(),
+                               ffn_scratch.out.data(), arena.stream);
+    } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The
       // module reads the arena device spans (x = d_normed, act_scratch =

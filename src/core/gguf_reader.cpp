@@ -961,6 +961,19 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   if (auto val = GetMetadataUint32(prefix + "ssm.inner_size")) {
     config.ssm_inner_size = *val;
   }
+  if (auto val = GetMetadataUint32(prefix + "expert_count")) {
+    config.num_experts = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "expert_used_count")) {
+    config.num_experts_used = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "expert_feed_forward_length")) {
+    config.expert_ff = *val;
+  }
+  if (auto val =
+          GetMetadataUint32(prefix + "expert_shared_feed_forward_length")) {
+    config.shared_expert_ff = *val;
+  }
   if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
     config.rope_theta = *val;
   }

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/quant/ggml_gemm.hpp"
@@ -265,6 +266,89 @@ void ForwardFFN(std::span<const float> x, const QwenTensorRef& gate_weight,
                    ffn_out);
 }
 
+namespace {
+
+/// One expert's [rows][cols] matrix inside a stacked [experts][rows][cols]
+/// quantized tensor.
+QwenTensorRef ExpertSlice(const QwenTensorRef& stacked, std::size_t expert,
+                          std::size_t rows, std::size_t cols) noexcept {
+  const std::size_t stride = quant::QuantizedRowBytes(stacked.type, cols) * rows;
+  return {.data = static_cast<const std::uint8_t*>(stacked.data) +
+                  (expert * stride),
+          .type = stacked.type,
+          .num_elements = rows * cols,
+          .available_bytes = stride};
+}
+
+[[nodiscard]] float Silu(float v) noexcept {
+  return v / (1.0F + std::exp(-v));
+}
+
+}  // namespace
+
+void ForwardMoeFFN(std::span<const float> x, const QwenLayerWeights& layer,
+                   const core::ModelConfig& config,
+                   std::span<float> out) noexcept {
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t experts = config.num_experts;
+  const std::size_t used = config.num_experts_used;
+  const std::size_t ff = config.expert_ff;
+  const std::size_t shared_ff = config.shared_expert_ff;
+
+  std::vector<float> logits(experts);
+  TensorGEMV(layer.ffn_gate_inp, x, experts, hidden, logits);
+  const float peak = *std::max_element(logits.begin(), logits.end());
+  float total = 0.0F;
+  for (float& v : logits) {
+    v = std::exp(v - peak);
+    total += v;
+  }
+  for (float& v : logits)
+    v /= total;
+
+  std::vector<std::size_t> order(experts);
+  for (std::size_t i = 0; i < experts; ++i)
+    order[i] = i;
+  std::partial_sort(order.begin(), order.begin() + used, order.end(),
+                    [&](std::size_t a, std::size_t b) {
+                      return logits[a] > logits[b] ||
+                             (logits[a] == logits[b] && a < b);
+                    });
+  float selected_sum = 0.0F;
+  for (std::size_t i = 0; i < used; ++i)
+    selected_sum += logits[order[i]];
+
+  std::fill(out.begin(), out.begin() + hidden, 0.0F);
+  std::vector<float> gate(std::max(ff, shared_ff)), up(gate.size()),
+      act(gate.size()), down(hidden);
+  const auto accumulate = [&](const QwenTensorRef& gate_w,
+                              const QwenTensorRef& up_w,
+                              const QwenTensorRef& down_w, std::size_t width,
+                              float weight) {
+    TensorGEMV(gate_w, x, width, hidden, gate);
+    TensorGEMV(up_w, x, width, hidden, up);
+    for (std::size_t i = 0; i < width; ++i)
+      act[i] = Silu(gate[i]) * up[i];
+    TensorGEMV(down_w, act, hidden, width, down);
+    for (std::size_t i = 0; i < hidden; ++i)
+      out[i] += weight * down[i];
+  };
+  for (std::size_t i = 0; i < used; ++i) {
+    const std::size_t e = order[i];
+    accumulate(ExpertSlice(layer.ffn_gate_exps, e, ff, hidden),
+               ExpertSlice(layer.ffn_up_exps, e, ff, hidden),
+               ExpertSlice(layer.ffn_down_exps, e, hidden, ff), ff,
+               logits[e] / selected_sum);
+  }
+
+  float shared_logit = 0.0F;
+  const auto* gate_row = static_cast<const float*>(layer.ffn_gate_inp_shexp.data);
+  for (std::size_t i = 0; i < hidden; ++i)
+    shared_logit += gate_row[i] * x[i];
+  accumulate(layer.ffn_gate_shexp, layer.ffn_up_shexp, layer.ffn_down_shexp,
+             shared_ff, 1.0F / (1.0F + std::exp(-shared_logit)));
+}
+
 void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                   const core::ModelConfig& config, QwenKvCache& kv_cache,
                   QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
@@ -291,10 +375,14 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
   // 4. FFN Pre-RMSNorm
   ForwardRMSNorm(hidden, layer.ffn_norm, 1e-6F, arena.normed);
 
-  // 5. SwiGLU FFN
-  ForwardFFN(arena.normed, layer.ffn_gate, layer.ffn_up, layer.ffn_down,
-             hidden_size, config.intermediate_size, arena.mlp_gate,
-             arena.mlp_up, arena.mlp_act, arena.mlp_out);
+  // 5. SwiGLU FFN (routed experts plus a shared expert for qwen35moe)
+  if (config.IsMoe()) {
+    ForwardMoeFFN(arena.normed, layer, config, arena.mlp_out);
+  } else {
+    ForwardFFN(arena.normed, layer.ffn_gate, layer.ffn_up, layer.ffn_down,
+               hidden_size, config.intermediate_size, arena.mlp_gate,
+               arena.mlp_up, arena.mlp_act, arena.mlp_out);
+  }
 
   // 6. Residual Add
   qwen::ResidualAdd(ctx, hidden, arena.mlp_out);

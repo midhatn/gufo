@@ -41,6 +41,12 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
                       std::span<float> attn_out) noexcept;
 
 /// Computes SwiGLU FFN: out = (SiLU(gate) * up) * down.
+/// qwen35moe feed-forward: softmax router, top-k experts with renormalized
+/// weights, and a sigmoid-gated shared expert. `out` holds `hidden_size`.
+void ForwardMoeFFN(std::span<const float> x, const QwenLayerWeights& layer,
+                   const core::ModelConfig& config,
+                   std::span<float> out) noexcept;
+
 void ForwardFFN(std::span<const float> x, const QwenTensorRef& gate_weight,
                 const QwenTensorRef& up_weight,
                 const QwenTensorRef& down_weight, std::size_t hidden_size,
