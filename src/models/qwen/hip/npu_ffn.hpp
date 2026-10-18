@@ -32,11 +32,11 @@ public:
   /// NPU runs behind the stream's earlier work. Returns false, having queued
   /// nothing, when the NPU is busy or unhealthy; the caller then computes every
   /// column on the GPU.
-  [[nodiscard]] virtual bool Begin(std::uint32_t layer, const void* normed,
-                                   hipStream_t stream) = 0;
+  [[nodiscard]] virtual bool Begin(std::uint32_t layer, int bank,
+                                   const void* normed, hipStream_t stream) = 0;
   /// Blocks the stream until the NPU runs finish and writes the SwiGLU result
   /// into columns [0, Columns(layer)) of `out` (FP16, row pitch `ld`).
-  virtual void Finish(std::uint32_t layer, void* out, std::size_t ld,
+  virtual void Finish(std::uint32_t layer, int bank, void* out, std::size_t ld,
                       hipStream_t stream) = 0;
 
   /// Leading output columns of the linear-attention `attn_qkv` and `attn_gate`
@@ -50,29 +50,30 @@ public:
       std::uint32_t layer) const noexcept = 0;
   /// Encodes the FP16 SwiGLU output (Tokens() x intermediate) and queues the
   /// down-projection runs; false leaves everything to the GPU.
-  [[nodiscard]] virtual bool BeginDown(std::uint32_t layer, const void* act,
-                                       hipStream_t stream) = 0;
+  [[nodiscard]] virtual bool BeginDown(std::uint32_t layer, int bank,
+                                       const void* act, hipStream_t stream) = 0;
   /// Waits for the NPU and adds the leading columns into the FP32 residual
   /// (row pitch `ld`).
-  virtual void FinishDown(std::uint32_t layer, float* residual, std::size_t ld,
-                          hipStream_t stream) = 0;
+  virtual void FinishDown(std::uint32_t layer, int bank, float* residual,
+                          std::size_t ld, hipStream_t stream) = 0;
   /// The same for the linear-attention output projection `ssm_out`
   /// (FP16 activations Tokens() x ssm inner size, added into the residual).
   [[nodiscard]] virtual std::uint32_t SsmOutColumns(
       std::uint32_t layer) const noexcept = 0;
-  [[nodiscard]] virtual bool BeginSsmOut(std::uint32_t layer, const void* act,
+  [[nodiscard]] virtual bool BeginSsmOut(std::uint32_t layer, int bank,
+                                         const void* act,
                                          hipStream_t stream) = 0;
-  virtual void FinishSsmOut(std::uint32_t layer, float* residual,
+  virtual void FinishSsmOut(std::uint32_t layer, int bank, float* residual,
                             std::size_t ld, hipStream_t stream) = 0;
   /// As Begin for those two projections of the normed FP16 activations.
-  [[nodiscard]] virtual bool BeginLinear(std::uint32_t layer,
+  [[nodiscard]] virtual bool BeginLinear(std::uint32_t layer, int bank,
                                          const void* normed,
                                          hipStream_t stream) = 0;
   /// Waits for the NPU and decodes the leading columns into the FP32 outputs
   /// (row pitches `qkv_ld` and `gate_ld`).
-  virtual void FinishLinear(std::uint32_t layer, float* qkv, std::size_t qkv_ld,
-                            float* gate, std::size_t gate_ld,
-                            hipStream_t stream) = 0;
+  virtual void FinishLinear(std::uint32_t layer, int bank, float* qkv,
+                            std::size_t qkv_ld, float* gate,
+                            std::size_t gate_ld, hipStream_t stream) = 0;
 };
 
 using QwenNpuFfnFactory = std::function<std::unique_ptr<QwenNpuFfn>(

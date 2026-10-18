@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +23,7 @@ constexpr std::uint32_t kTokens = 4096;
 constexpr std::uint32_t kHidden = 5120;
 constexpr std::uint32_t kIntermediate = 17408;
 constexpr std::uint32_t kSliceColumns = 1024;
-constexpr std::uint32_t kDefaultSlices = 6;
+constexpr std::uint32_t kDefaultSlices = 7;
 constexpr std::uint32_t kIntermediateK = kIntermediate;
 constexpr std::uint32_t kDefaultDownSlices = 1;
 constexpr std::uint32_t kSsmInner = 6144;
@@ -102,9 +103,11 @@ public:
       if (ffn->ssm_out_program_ < 0) {
         return nullptr;
       }
-      ffn->a_ssm_out_ = npu->NewBuffer(npu->ABytes(kSsmInner), error);
-      if (ffn->a_ssm_out_ < 0) {
-        return nullptr;
+      for (auto& slot : ffn->slots_) {
+        slot.a_ssm_out = npu->NewBuffer(npu->ABytes(kSsmInner), error);
+        if (slot.a_ssm_out < 0) {
+          return nullptr;
+        }
       }
     }
     if (down_slices != 0) {
@@ -114,14 +117,18 @@ public:
       if (ffn->down_program_ < 0) {
         return nullptr;
       }
-      ffn->a_down_ = npu->NewBuffer(npu->ABytes(kIntermediateK), error);
-      if (ffn->a_down_ < 0) {
-        return nullptr;
+      for (auto& slot : ffn->slots_) {
+        slot.a_down = npu->NewBuffer(npu->ABytes(kIntermediateK), error);
+        if (slot.a_down < 0) {
+          return nullptr;
+        }
       }
     }
-    ffn->a_ = npu->NewBuffer(npu->ABytes(), error);
-    if (ffn->a_ < 0) {
-      return nullptr;
+    for (auto& slot : ffn->slots_) {
+      slot.a = npu->NewBuffer(npu->ABytes(), error);
+      if (slot.a < 0) {
+        return nullptr;
+      }
     }
     for (std::uint32_t i = 0;
          i < std::max({2 * slices, qkv_slices + gate_slices, down_slices,
@@ -131,7 +138,12 @@ public:
       if (id < 0) {
         return nullptr;
       }
-      ffn->c_.push_back(id);
+      ffn->slots_[0].c.push_back(id);
+      const int id2 = npu->NewBuffer(npu->CBytes(), error);
+      if (id2 < 0) {
+        return nullptr;
+      }
+      ffn->slots_[1].c.push_back(id2);
     }
     hipStream_t stream = nullptr;
     if (hipStreamCreate(&stream) != hipSuccess) {
@@ -246,29 +258,32 @@ public:
     return layer < columns_.size() ? columns_[layer] : 0;
   }
 
-  bool Begin(std::uint32_t layer, const void* normed,
+  bool Begin(std::uint32_t layer, int bank, const void* normed,
              hipStream_t stream) override {
+    Slot& slot = slots_[bank];
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
     NpuEncodeActivations(static_cast<const __half*>(normed), kHidden, kTokens,
-                         kHidden, 0, kHidden, npu_->Device(a_), stream);
+                         kHidden, 0, kHidden, npu_->Device(slot.a), stream);
     const auto& b = b_[layer];
-    if (!npu_->Submit(stream, a_, b.data(), c_.data(),
+    if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
       Release(this);
       return false;
     }
+    slot.ticket = npu_->Ticket();
     return true;
   }
 
-  void Finish(std::uint32_t layer, void* out, std::size_t ld,
+  void Finish(std::uint32_t layer, int bank, void* out, std::size_t ld,
               hipStream_t stream) override {
     (void)layer;
-    npu_->Wait(stream);
+    Slot& slot = slots_[bank];
+    npu_->Wait(stream, slot.ticket);
     for (std::uint32_t i = 0; i < slices_; ++i) {
-      NpuSwiglu(npu_->Staged(stream, c_[i]),
-                npu_->Staged(stream, c_[slices_ + i]), nullptr, nullptr,
+      NpuSwiglu(npu_->Staged(stream, slot.c[i]),
+                npu_->Staged(stream, slot.c[slices_ + i]), nullptr, nullptr,
                 static_cast<__half*>(out), kTokens, kSliceColumns,
                 kSliceColumns, stream, ld, i * kSliceColumns);
     }
@@ -282,29 +297,32 @@ public:
     return layer < ssm_out_columns_.size() ? ssm_out_columns_[layer] : 0;
   }
 
-  bool BeginSsmOut(std::uint32_t layer, const void* act,
+  bool BeginSsmOut(std::uint32_t layer, int bank, const void* act,
                    hipStream_t stream) override {
+    Slot& slot = slots_[bank];
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
     NpuEncodeActivations(static_cast<const __half*>(act), kSsmInner, kTokens,
-                         kSsmInner, 0, kSsmInner, npu_->Device(a_ssm_out_),
+                         kSsmInner, 0, kSsmInner, npu_->Device(slot.a_ssm_out),
                          stream);
     const auto& b = ssm_out_b_[layer];
-    if (!npu_->Submit(stream, a_ssm_out_, b.data(), c_.data(),
+    if (!npu_->Submit(stream, slot.a_ssm_out, b.data(), slot.c.data(),
                       static_cast<int>(b.size()), ssm_out_program_)) {
       Release(this);
       return false;
     }
+    slot.ticket = npu_->Ticket();
     return true;
   }
 
-  void FinishSsmOut(std::uint32_t layer, float* residual, std::size_t ld,
-                    hipStream_t stream) override {
-    npu_->Wait(stream);
+  void FinishSsmOut(std::uint32_t layer, int bank, float* residual,
+                    std::size_t ld, hipStream_t stream) override {
+    Slot& slot = slots_[bank];
+    npu_->Wait(stream, slot.ticket);
     const std::uint32_t count = ssm_out_columns_[layer] / kSliceColumns;
     for (std::uint32_t i = 0; i < count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, c_[i]), residual, kTokens,
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, kTokens,
                       kSliceColumns, ld, i * kSliceColumns, true, stream);
     }
     hipLaunchHostFunc(
@@ -316,29 +334,32 @@ public:
     return layer < down_columns_.size() ? down_columns_[layer] : 0;
   }
 
-  bool BeginDown(std::uint32_t layer, const void* act,
+  bool BeginDown(std::uint32_t layer, int bank, const void* act,
                  hipStream_t stream) override {
+    Slot& slot = slots_[bank];
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
     NpuEncodeActivations(static_cast<const __half*>(act), kIntermediateK,
                          kTokens, kIntermediateK, 0, kIntermediateK,
-                         npu_->Device(a_down_), stream);
+                         npu_->Device(slot.a_down), stream);
     const auto& b = down_b_[layer];
-    if (!npu_->Submit(stream, a_down_, b.data(), c_.data(),
+    if (!npu_->Submit(stream, slot.a_down, b.data(), slot.c.data(),
                       static_cast<int>(b.size()), down_program_)) {
       Release(this);
       return false;
     }
+    slot.ticket = npu_->Ticket();
     return true;
   }
 
-  void FinishDown(std::uint32_t layer, float* residual, std::size_t ld,
-                  hipStream_t stream) override {
-    npu_->Wait(stream);
+  void FinishDown(std::uint32_t layer, int bank, float* residual,
+                  std::size_t ld, hipStream_t stream) override {
+    Slot& slot = slots_[bank];
+    npu_->Wait(stream, slot.ticket);
     const std::uint32_t count = down_columns_[layer] / kSliceColumns;
     for (std::uint32_t i = 0; i < count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, c_[i]), residual, kTokens,
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, kTokens,
                       kSliceColumns, ld, i * kSliceColumns, true, stream);
     }
     hipLaunchHostFunc(
@@ -353,35 +374,39 @@ public:
     return layer < gate_columns_.size() ? gate_columns_[layer] : 0;
   }
 
-  bool BeginLinear(std::uint32_t layer, const void* normed,
+  bool BeginLinear(std::uint32_t layer, int bank, const void* normed,
                    hipStream_t stream) override {
+    Slot& slot = slots_[bank];
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
     NpuEncodeActivations(static_cast<const __half*>(normed), kHidden, kTokens,
-                         kHidden, 0, kHidden, npu_->Device(a_), stream);
+                         kHidden, 0, kHidden, npu_->Device(slot.a), stream);
     const auto& b = lin_b_[layer];
-    if (!npu_->Submit(stream, a_, b.data(), c_.data(),
+    if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
       Release(this);
       return false;
     }
+    slot.ticket = npu_->Ticket();
     return true;
   }
 
-  void FinishLinear(std::uint32_t layer, float* qkv, std::size_t qkv_ld,
-                    float* gate, std::size_t gate_ld,
+  void FinishLinear(std::uint32_t layer, int bank, float* qkv,
+                    std::size_t qkv_ld, float* gate, std::size_t gate_ld,
                     hipStream_t stream) override {
-    npu_->Wait(stream);
+    Slot& slot = slots_[bank];
+    npu_->Wait(stream, slot.ticket);
     const std::uint32_t qkv_count = qkv_columns_[layer] / kSliceColumns;
     const std::uint32_t gate_count = gate_columns_[layer] / kSliceColumns;
     for (std::uint32_t i = 0; i < qkv_count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, c_[i]), qkv, kTokens, kSliceColumns,
-                      qkv_ld, i * kSliceColumns, false, stream);
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), qkv, kTokens,
+                      kSliceColumns, qkv_ld, i * kSliceColumns, false, stream);
     }
     for (std::uint32_t i = 0; i < gate_count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, c_[qkv_count + i]), gate, kTokens,
-                      kSliceColumns, gate_ld, i * kSliceColumns, false, stream);
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[qkv_count + i]), gate,
+                      kTokens, kSliceColumns, gate_ld, i * kSliceColumns, false,
+                      stream);
     }
     hipLaunchHostFunc(
         stream, [](void* self) { Release(static_cast<Qwen27bNpuFfn*>(self)); },
@@ -414,11 +439,9 @@ private:
   std::uint32_t down_slices_{0};
   std::uint32_t ssm_out_slices_{0};
   int ssm_out_program_{0};
-  int a_ssm_out_{-1};
   std::vector<std::vector<int>> ssm_out_b_;
   std::vector<std::uint32_t> ssm_out_columns_;
   int down_program_{0};
-  int a_down_{-1};
   std::vector<std::vector<int>> down_b_;
   std::vector<std::uint32_t> down_columns_;
   std::uint32_t qkv_slices_{0};
@@ -426,8 +449,16 @@ private:
   std::vector<std::vector<int>> lin_b_;
   std::vector<std::uint32_t> qkv_columns_;
   std::vector<std::uint32_t> gate_columns_;
-  int a_{-1};
-  std::vector<int> c_;
+  /// Operand buffers of one chunk in flight; the ticket is the NPU submission
+  /// count after that chunk's latest stage, so a wait covers only its own runs.
+  struct Slot {
+    int a{-1};
+    int a_down{-1};
+    int a_ssm_out{-1};
+    std::vector<int> c;
+    std::uint64_t ticket{0};
+  };
+  std::array<Slot, 2> slots_;
   std::vector<std::vector<int>> b_;
   std::vector<std::uint32_t> columns_;
   std::atomic<hipStream_t> owner_{nullptr};
