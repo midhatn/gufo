@@ -33,6 +33,12 @@ add_qwen_cpu_test(qwen_oracle_test
   tests/models/qwen/cpu/model_oracle_test.cpp
   "cpu;models;qwen;oracles")
 
+if (GUFO_BUILD_TOOLS)
+  add_executable(qwen35moe_logits_tool
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen/cpu/qwen35moe_logits_tool.cpp)
+  target_link_libraries(qwen35moe_logits_tool PRIVATE gufo_core)
+endif()
+
 add_qwen_cpu_test(qwen_l1_norm_module_test
   tests/models/qwen/modules/norm_test.cpp
   "cpu;models;qwen;module;norm")
