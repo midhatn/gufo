@@ -796,6 +796,139 @@ QwenGpuArena::~QwenGpuArena() {
   FreeAll();
 }
 
+QwenPrefillBank QwenGpuArena::CurrentBank() const noexcept {
+  return {d_hidden,
+          d_normed,
+          d_q,
+          d_k,
+          d_v,
+          d_attn_out,
+          d_ffn_gate,
+          d_ffn_up,
+          d_ffn_act,
+          d_ffn_out,
+          d_ssm_qkv,
+          d_conv_out,
+          d_ssm_gate,
+          d_ssm_out,
+          d_alpha_buf,
+          d_beta_buf,
+          d_ssm_kq_scales,
+          d_ssm_alpha_beta,
+          d_prompt_tokens,
+          d_scratch_bf16,
+          d_scratch_q8_act};
+}
+
+void QwenGpuArena::UseBank(const QwenPrefillBank& bank) noexcept {
+  d_hidden = bank.hidden;
+  d_normed = bank.normed;
+  d_q = bank.q;
+  d_k = bank.k;
+  d_v = bank.v;
+  d_attn_out = bank.attn_out;
+  d_ffn_gate = bank.ffn_gate;
+  d_ffn_up = bank.ffn_up;
+  d_ffn_act = bank.ffn_act;
+  d_ffn_out = bank.ffn_out;
+  d_ssm_qkv = bank.ssm_qkv;
+  d_conv_out = bank.conv_out;
+  d_ssm_gate = bank.ssm_gate;
+  d_ssm_out = bank.ssm_out;
+  d_alpha_buf = bank.alpha_buf;
+  d_beta_buf = bank.beta_buf;
+  d_ssm_kq_scales = bank.ssm_kq_scales;
+  d_ssm_alpha_beta = bank.ssm_alpha_beta;
+  d_prompt_tokens = bank.prompt_tokens;
+  d_scratch_bf16 = bank.scratch_bf16;
+  d_scratch_q8_act = bank.scratch_q8_act;
+}
+
+const QwenPrefillBank* QwenGpuArena::SecondBank() {
+  if (second_bank_ != nullptr) {
+    return second_bank_.get();
+  }
+  auto bank = std::make_unique<QwenPrefillBank>();
+  const std::size_t hidden_size = config_.hidden_size;
+  const std::size_t intermediate_size = config_.intermediate_size;
+  const std::size_t batch = max_batch_;
+  const std::size_t attention_size = config_.AttentionSize();
+  const std::size_t kv_size =
+      static_cast<std::size_t>(config_.num_key_value_heads) * config_.head_dim;
+  const std::size_t ssm_qkv_size = config_.SsmQkvSize();
+  const std::size_t ssm_inner_size = config_.ssm_inner_size;
+  const std::size_t recurrent_width = std::max(attention_size, ssm_inner_size);
+  const std::size_t projection_width =
+      std::max<std::size_t>(2 * attention_size, ssm_qkv_size);
+  const std::size_t time_step_rank = config_.ssm_time_step_rank;
+  const auto alloc = [](auto** pointer, std::size_t bytes) {
+    return hipMalloc(reinterpret_cast<void**>(pointer), bytes) == hipSuccess;
+  };
+  bool ok = alloc(&bank->hidden, batch * hidden_size * sizeof(float)) &&
+            alloc(&bank->normed, batch * hidden_size * sizeof(float)) &&
+            alloc(&bank->q, batch * attention_size * sizeof(float)) &&
+            alloc(&bank->k, batch * kv_size * sizeof(float)) &&
+            alloc(&bank->v, batch * kv_size * sizeof(float)) &&
+            alloc(&bank->attn_out, batch * hidden_size * sizeof(float)) &&
+            alloc(&bank->ffn_gate, batch * intermediate_size * sizeof(float)) &&
+            alloc(&bank->ffn_up, batch * intermediate_size * sizeof(float)) &&
+            alloc(&bank->ffn_act, batch * intermediate_size * sizeof(float)) &&
+            alloc(&bank->ffn_out, batch * hidden_size * sizeof(float)) &&
+            alloc(&bank->ssm_qkv, batch * projection_width * sizeof(float)) &&
+            alloc(&bank->conv_out, batch * ssm_qkv_size * sizeof(float)) &&
+            alloc(&bank->ssm_gate, batch * recurrent_width * sizeof(float)) &&
+            alloc(&bank->ssm_out, batch * recurrent_width * sizeof(float)) &&
+            alloc(&bank->alpha_buf, batch * time_step_rank * sizeof(float)) &&
+            alloc(&bank->beta_buf, batch * time_step_rank * sizeof(float)) &&
+            alloc(&bank->ssm_kq_scales,
+                  batch * config_.ssm_group_count * 3 * sizeof(float)) &&
+            alloc(&bank->ssm_alpha_beta,
+                  batch * time_step_rank * 2 * sizeof(float)) &&
+            alloc(&bank->prompt_tokens,
+                  std::max<std::size_t>(batch, 2) * sizeof(std::uint32_t));
+  const std::size_t scratch_elements =
+      batch * std::max<std::size_t>(
+                  {intermediate_size, hidden_size, projection_width,
+                   ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
+  const std::size_t q8_rows = ((batch + 15) / 16) * 16;
+  const std::size_t q8_row_elements =
+      scratch_elements / std::max<std::size_t>(batch, 1);
+  const std::size_t scratch_q8_bytes =
+      ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) + 4096;
+  ok = ok &&
+       alloc(&bank->scratch_bf16, scratch_elements * sizeof(hip_bfloat16)) &&
+       alloc(&bank->scratch_q8_act, scratch_q8_bytes);
+  if (!ok) {
+    for (void* pointer : {static_cast<void*>(bank->hidden),
+                          static_cast<void*>(bank->normed),
+                          static_cast<void*>(bank->q),
+                          static_cast<void*>(bank->k),
+                          static_cast<void*>(bank->v),
+                          static_cast<void*>(bank->attn_out),
+                          static_cast<void*>(bank->ffn_gate),
+                          static_cast<void*>(bank->ffn_up),
+                          static_cast<void*>(bank->ffn_act),
+                          static_cast<void*>(bank->ffn_out),
+                          static_cast<void*>(bank->ssm_qkv),
+                          static_cast<void*>(bank->conv_out),
+                          static_cast<void*>(bank->ssm_gate),
+                          static_cast<void*>(bank->ssm_out),
+                          static_cast<void*>(bank->alpha_buf),
+                          static_cast<void*>(bank->beta_buf),
+                          static_cast<void*>(bank->ssm_kq_scales),
+                          static_cast<void*>(bank->ssm_alpha_beta),
+                          static_cast<void*>(bank->prompt_tokens),
+                          bank->scratch_bf16,
+                          bank->scratch_q8_act}) {
+      if (pointer != nullptr)
+        LogCleanupError(hipFree(pointer));
+    }
+    return nullptr;
+  }
+  second_bank_ = std::move(bank);
+  return second_bank_.get();
+}
+
 QwenGpuScratchView QwenGpuArena::GetScratchView(
     std::size_t batch_size) noexcept {
   const std::size_t batch = std::min<std::size_t>(batch_size, max_batch_);
@@ -892,7 +1025,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
       max_context_(other.max_context_),
       max_batch_(other.max_batch_),
       policy_(other.policy_),
-      target_layer_ids_(std::move(other.target_layer_ids_)) {
+      target_layer_ids_(std::move(other.target_layer_ids_)),
+      second_bank_(std::move(other.second_bank_)) {
   d_hidden = other.d_hidden;
   d_normed = other.d_normed;
   d_q = other.d_q;
@@ -989,6 +1123,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     max_batch_ = other.max_batch_;
     policy_ = other.policy_;
     target_layer_ids_ = std::move(other.target_layer_ids_);
+    second_bank_ = std::move(other.second_bank_);
     d_hidden = other.d_hidden;
     d_normed = other.d_normed;
     d_q = other.d_q;
@@ -1109,6 +1244,33 @@ void QwenGpuArena::Reset() {
 }
 
 void QwenGpuArena::FreeAll() noexcept {
+  if (second_bank_ != nullptr) {
+    for (void* pointer : {static_cast<void*>(second_bank_->hidden),
+                          static_cast<void*>(second_bank_->normed),
+                          static_cast<void*>(second_bank_->q),
+                          static_cast<void*>(second_bank_->k),
+                          static_cast<void*>(second_bank_->v),
+                          static_cast<void*>(second_bank_->attn_out),
+                          static_cast<void*>(second_bank_->ffn_gate),
+                          static_cast<void*>(second_bank_->ffn_up),
+                          static_cast<void*>(second_bank_->ffn_act),
+                          static_cast<void*>(second_bank_->ffn_out),
+                          static_cast<void*>(second_bank_->ssm_qkv),
+                          static_cast<void*>(second_bank_->conv_out),
+                          static_cast<void*>(second_bank_->ssm_gate),
+                          static_cast<void*>(second_bank_->ssm_out),
+                          static_cast<void*>(second_bank_->alpha_buf),
+                          static_cast<void*>(second_bank_->beta_buf),
+                          static_cast<void*>(second_bank_->ssm_kq_scales),
+                          static_cast<void*>(second_bank_->ssm_alpha_beta),
+                          static_cast<void*>(second_bank_->prompt_tokens),
+                          second_bank_->scratch_bf16,
+                          second_bank_->scratch_q8_act}) {
+      if (pointer != nullptr)
+        LogCleanupError(hipFree(pointer));
+    }
+    second_bank_.reset();
+  }
   if (d_hidden != nullptr)
     LogCleanupError(hipFree(d_hidden));
   if (d_normed != nullptr)

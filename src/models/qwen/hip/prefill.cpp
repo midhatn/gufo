@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
 
@@ -61,10 +62,30 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     throw std::length_error("prompt exceeds the GPU context length");
   }
 
+  // With the NPU offload, consecutive full chunks advance in pairs so the NPU
+  // stages of one overlap the GPU work of the other.
+  const std::size_t max_batch = arena_.GetMaxBatch();
+  const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
+  QwenNpuFfn* const npu_ffn = model_->NpuFfn();
+  const bool lockstep = npu_ffn != nullptr && npu_ffn->Tokens() == max_batch &&
+                        !capture_prompt_hidden_ &&
+                        vision_input_.rope() == nullptr &&
+                        (lockstep_env == nullptr || lockstep_env[0] != '0');
+
   tokenization::TokenId next_token = 0;
   for (std::size_t offset = 0; offset < prompt_tokens.size();
        offset += arena_.GetMaxBatch()) {
     CheckPrefillCancellation();
+    if (lockstep && prompt_tokens.size() - offset >= 2 * max_batch) {
+      const bool is_last = offset + 2 * max_batch == prompt_tokens.size();
+      next_token = ForwardPromptChunkPair(
+          prompt_tokens.subspan(offset, max_batch),
+          prompt_tokens.subspan(offset + max_batch, max_batch),
+          start_pos + static_cast<std::uint32_t>(offset),
+          compute_logits && is_last);
+      offset += max_batch;
+      continue;
+    }
     const std::size_t chunk_size = std::min<std::size_t>(
         arena_.GetMaxBatch(), prompt_tokens.size() - offset);
     const bool is_last = offset + chunk_size == prompt_tokens.size();
