@@ -1,4 +1,4 @@
-# Strix Halo inference with the XDNA2 NPU: about 2,000 tok/s prefill
+# Strix Halo inference with the XDNA2 NPU: about 2,100 tok/s prefill
 
 Qwen3.8 Flash-Next on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`)
 with the prefill split between the GPU and the Ryzen AI NPU.
@@ -8,33 +8,43 @@ Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 | Prefill, UD-IQ4_XS | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `gufo bench -p 8192` | 1,837 tok/s | **2,013 tok/s** (+9.6%) |
-| `gufo bench -p 12288` | 1,823 tok/s | **1,973 tok/s** (+8.2%) |
-| `gufo bench -p 16384` | 1,821 tok/s | **1,963 tok/s** (+7.8%) |
-| `gufo bench -p 32768` | 1,788 tok/s | **1,949 tok/s** (+9.0%) |
-| Served, 42k tokens cold, MTP and caches on | | **1,836 tok/s** |
+| `gufo bench -p 8192` | 1,842 tok/s | **2,113 tok/s** (+14.7%) |
+| `gufo bench -p 16384` | 1,821 tok/s | **2,117 tok/s** (+16.3%) |
+| `gufo bench -p 32768` | 1,786 tok/s | **2,067 tok/s** (+15.8%) |
+| Served, 54k tokens cold, MTP off | | **1,932 tok/s** |
 
-16384-token prefill tile, the GPU fabric clock held, EC and NPU in performance
-mode, nothing else running; the GPU + NPU figures for 8192 to 16384 tokens are
-the owner's own runs (`-r 2`). Prompts
-that are not a multiple of 4096 tokens also use the NPU (from 2,304 tokens up),
-which makes the server 2% to 8% faster on them than before. Speed depends on the
-text: a mix of code and markdown prefills 20% to 30% slower than code alone at
-the same length because expert routing differs. Of 30 long greedy prompts, 23
-give the same completion with and without the NPU on partial chunks; the other
-seven start with a first-token flip between an empty reply and text, which also
-happens on the GPU when only a one-character tag at the start of the prompt
-changes.
+| Decode with MTP drafting | tok/s |
+| --- | --- |
+| `gufo bench -n 128` | **61.1** |
+| `gufo bench -n 128 -d 32768` | 93.4 |
+| `gufo bench -n 128 -d 131072` | 116.8 |
+| Served, code / prose / file edits / JSON / Spanish | 79 / 49 / 108 / 100 / 44 |
+
+The `-d` rows run on the benchmark's own repetitive context, where drafts are
+accepted easily; the served rows are real prompts and show what speculation
+gives on each kind of text.
+
+Three runs per prefill cell (`-r 3`), the GPU fabric clock held, EC and NPU in
+performance mode, nothing else running. Two-bank mode splits each 16384-token
+chunk into two 8192-token banks and runs them layer by layer in lock step: while
+the NPU computes one bank's projections, the GPU works on the other. Prompt
+lengths that are not a multiple of 8192 tokens fall back to a single bank for the
+remainder, which is slower than the full-bank figures above. Speed also depends
+on the text: a mix of code and markdown prefills 20% to 30% slower than code
+alone at the same length because expert routing differs. The mode is not
+bit-identical to GPU-only prefill; against GPU-only logits its last-token KL
+divergence is 0.0076 on average over 10 real-text windows of 16K to 20K tokens
+(the single-bank NPU path measures 0.0084), and a needle-in-a-haystack check
+passes 21 of 21 at 18K, 33K and 54K tokens. `GUFO_TWO_BANK=0` turns it off.
 
 ## How the NPU is used
 
-The NPU runs block-float 8-bit GEMMs on parts of each layer that the GPU does
-not need yet, and the GPU goes on with other work meanwhile: the `z` rows of the
-linear-attention projection, the query and gate rows of all 24 attention heads, and
-the shared expert's gate and up projections. Each 4096-token group is
-awaited separately, so the attention for one group runs while the NPU computes
-the next. Each result is read back only where
-the GPU first needs it.
+The NPU runs block-float 8-bit GEMMs for whole projections: the complete
+linear-attention input projection (`ssm_in`) and the attention `q`/`k`/`v`
+projection (`attn_qkv`), plus the shared expert's gate and up projections. The
+GPU reads the NPU's output directly in its convolution, attention-preparation and
+gated-delta-net kernels, so no copy or conversion pass sits between them. The
+gated delta rule runs as 64-token chunks in WY form on the GPU's matrix units.
 
 ## Try it
 
@@ -63,7 +73,7 @@ the GPU first needs it.
 
    ```sh
    export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:/opt/rocm/lib
-   GUFO_NPU_DIR=tools/npu build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3   # NPU on
+   GUFO_NPU_DIR=tools/npu GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1 build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3   # NPU on
    build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3                          # NPU off
    ```
 
@@ -72,7 +82,7 @@ the GPU first needs it.
    For the server, run `GUFO_MODEL=<first shard> GUFO_MTP=<mtp sidecar> scripts/run-gufo.sh`.
    It enables the NPU only when the fabric clock is held and the NPU is not in
    turbo mode (`GUFO_NPU=0` forces GPU-only), uses a 16384-token prefill tile
-   (`GUFO_PREFILL_TILE`) and reads the options listed at the top of the script.
+   (`GUFO_PREFILL_TILE`; 24576 is faster for 24K+ prompts but needs about 6 GB more RAM) and reads the options listed at the top of the script.
 
 Every option is described in [docs/NPU.md](docs/NPU.md). `GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 12) and
 `GUFO_NPU_SHEXP=0` tune or switch off parts of the offload. Without
