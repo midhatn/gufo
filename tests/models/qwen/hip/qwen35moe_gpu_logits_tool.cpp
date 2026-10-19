@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   gufo::models::qwen38_flash_next::rocm::RegisterQwenMoePrefill();
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenNpuFfn();
   const bool generate = argc == 5;
   std::string error;
   auto reader_owner = gufo::core::GgufReader::OpenFile(argv[1], &error);
@@ -39,7 +40,11 @@ int main(int argc, char** argv) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  auto executor = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &error);
+  auto executor = gufo::hip::QwenGpuExecutor::CreateFromGguf(
+      reader, &error,
+      std::getenv("QUALITY_CTX") != nullptr
+          ? static_cast<std::uint32_t>(std::stoul(std::getenv("QUALITY_CTX")))
+          : 4096U);
   if (!executor) {
     std::cerr << "executor failed: " << error << '\n';
     return 1;
@@ -48,6 +53,37 @@ int main(int argc, char** argv) {
   std::ifstream in(argv[2]);
   for (std::uint32_t id; in >> id;)
     ids.push_back(id);
+  if (const char* prefill_env = std::getenv("QUALITY_PREFILL")) {
+    // Prefill the first N ids, feed the rest one token at a time and dump the
+    // logits row of every stride-th position from N - 1 on (the row at
+    // position p predicts token p + 1).
+    const std::size_t prefill = std::stoul(prefill_env);
+    const char* stride_env = std::getenv("QUALITY_STRIDE");
+    const std::size_t stride =
+        stride_env != nullptr ? std::stoul(stride_env) : 1;
+    if (prefill == 0 || prefill > ids.size())
+      return 2;
+    const std::vector<gufo::tokenization::TokenId> head(ids.begin(),
+                                                        ids.begin() + prefill);
+    std::ofstream out(argv[3], std::ios::binary);
+    const auto write_row = [&] {
+      const auto logits = executor->CopyLastLogits();
+      out.write(reinterpret_cast<const char*>(logits.data()),
+                static_cast<std::streamsize>(logits.size() * sizeof(float)));
+    };
+    (void)executor->ForwardPromptBatch(head, 0, true);
+    write_row();
+    std::size_t rows = 1;
+    for (std::size_t i = prefill; i + 1 < ids.size(); ++i) {
+      (void)executor->ForwardToken(ids[i], static_cast<std::uint32_t>(i));
+      if ((i - (prefill - 1)) % stride == 0) {
+        write_row();
+        ++rows;
+      }
+    }
+    std::fprintf(stderr, "wrote %zu rows\n", rows);
+    return 0;
+  }
   if (const char* rows_env = std::getenv("VERIFY_ROWS")) {
     const std::size_t rows = std::stoul(rows_env);
     const std::vector<gufo::tokenization::TokenId> head(ids.begin(),
