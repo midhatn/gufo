@@ -20,8 +20,17 @@ hold it before starting. The clock and power mode reset at boot.
 ## Easiest start
 
 ```sh
+# Qwen3.8 Flash-Next (default)
 GUFO_MODEL=<first shard .gguf> GUFO_MTP=<mtp sidecar .gguf> scripts/run-gufo.sh
+# Qwen3.8-27B: DFlash2 and/or an MTP file
+GUFO_KIND=27b GUFO_MODEL=<27b.gguf> GUFO_DFLASH=<dflash2.gguf> scripts/run-gufo.sh
+# Qwen3.6-35B-A3B: embedded MTP head, plus DFlash2 for the auto mode
+GUFO_KIND=35b GUFO_MODEL=<35b.gguf> GUFO_DFLASH=<dflash2.gguf> scripts/run-gufo.sh
 ```
+
+`GUFO_KIND` picks the model family. For the 27B and 35B-A3B the NPU shares each
+projection with the GPU (no two-bank mode) and the speculative mode follows
+what is set: both drafts select `auto`, one selects that draft.
 
 The script enables the NPU only while the fabric clock is held (any NPU power mode,
 turbo included), and turns the two-bank prefill on with it (`GUFO_TWO_BANK=0` opts
