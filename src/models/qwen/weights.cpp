@@ -286,15 +286,16 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
       const std::size_t expert_ff = weights.config.expert_ff;
       const std::size_t shared_ff = weights.config.shared_expert_ff;
       if (!ValidateTensor(l.ffn_gate_inp, experts * hidden_size,
-                          TensorRole::kProjection, prefix + "ffn_gate_inp.weight",
-                          error_msg) ||
+                          TensorRole::kProjection,
+                          prefix + "ffn_gate_inp.weight", error_msg) ||
           !ValidateTensor(l.ffn_gate_exps, experts * expert_ff * hidden_size,
                           TensorRole::kProjection,
                           prefix + "ffn_gate_exps.weight", error_msg,
                           hidden_size) ||
           !ValidateTensor(l.ffn_up_exps, experts * expert_ff * hidden_size,
-                          TensorRole::kProjection, prefix + "ffn_up_exps.weight",
-                          error_msg, hidden_size) ||
+                          TensorRole::kProjection,
+                          prefix + "ffn_up_exps.weight", error_msg,
+                          hidden_size) ||
           !ValidateTensor(l.ffn_down_exps, experts * hidden_size * expert_ff,
                           TensorRole::kProjection,
                           prefix + "ffn_down_exps.weight", error_msg,
@@ -303,10 +304,9 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
                           TensorRole::kProjection,
                           prefix + "ffn_gate_shexp.weight", error_msg,
                           hidden_size) ||
-          !ValidateTensor(l.ffn_up_shexp, shared_ff * hidden_size,
-                          TensorRole::kProjection,
-                          prefix + "ffn_up_shexp.weight", error_msg,
-                          hidden_size) ||
+          !ValidateTensor(
+              l.ffn_up_shexp, shared_ff * hidden_size, TensorRole::kProjection,
+              prefix + "ffn_up_shexp.weight", error_msg, hidden_size) ||
           !ValidateTensor(l.ffn_down_shexp, hidden_size * shared_ff,
                           TensorRole::kProjection,
                           prefix + "ffn_down_shexp.weight", error_msg,
@@ -392,6 +392,61 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     }
   }
 
+  if (weights.config.IsMoe()) {
+    const std::string prefix =
+        "blk." + std::to_string(weights.config.num_layers) + ".";
+    QwenEmbeddedMtp mtp;
+    mtp.embedding_norm =
+        ExtractTensorRef(reader, prefix + "nextn.enorm.weight");
+    mtp.hidden_norm = ExtractTensorRef(reader, prefix + "nextn.hnorm.weight");
+    mtp.fusion_projection =
+        ExtractTensorRef(reader, prefix + "nextn.eh_proj.weight");
+    mtp.shared_head_norm =
+        ExtractTensorRef(reader, prefix + "nextn.shared_head_norm.weight");
+    auto& l = mtp.layer;
+    l.is_full_attention = true;
+    l.attn_norm = ExtractTensorRef(reader, prefix + "attn_norm.weight");
+    l.ffn_norm =
+        ExtractTensorRef(reader, prefix + "post_attention_norm.weight");
+    l.attn_q = ExtractTensorRef(reader, prefix + "attn_q.weight");
+    l.attn_k = ExtractTensorRef(reader, prefix + "attn_k.weight");
+    l.attn_v = ExtractTensorRef(reader, prefix + "attn_v.weight");
+    l.attn_output = ExtractTensorRef(reader, prefix + "attn_output.weight");
+    l.attn_q_norm = ExtractTensorRef(reader, prefix + "attn_q_norm.weight");
+    l.attn_k_norm = ExtractTensorRef(reader, prefix + "attn_k_norm.weight");
+    l.ffn_gate_inp = ExtractTensorRef(reader, prefix + "ffn_gate_inp.weight");
+    l.ffn_gate_exps = ExtractTensorRef(reader, prefix + "ffn_gate_exps.weight");
+    l.ffn_up_exps = ExtractTensorRef(reader, prefix + "ffn_up_exps.weight");
+    l.ffn_down_exps = ExtractTensorRef(reader, prefix + "ffn_down_exps.weight");
+    l.ffn_gate_shexp =
+        ExtractTensorRef(reader, prefix + "ffn_gate_shexp.weight");
+    l.ffn_up_shexp = ExtractTensorRef(reader, prefix + "ffn_up_shexp.weight");
+    l.ffn_down_shexp =
+        ExtractTensorRef(reader, prefix + "ffn_down_shexp.weight");
+    l.ffn_gate_inp_shexp =
+        ExtractTensorRef(reader, prefix + "ffn_gate_inp_shexp.weight");
+    const std::size_t attention_size = weights.config.AttentionSize();
+    const std::size_t kv_size =
+        static_cast<std::size_t>(weights.config.num_key_value_heads) *
+        weights.config.head_dim;
+    const bool complete =
+        !mtp.embedding_norm.empty() && !mtp.hidden_norm.empty() &&
+        !mtp.fusion_projection.empty() && !mtp.shared_head_norm.empty() &&
+        !l.attn_norm.empty() && !l.ffn_norm.empty() && !l.attn_q.empty() &&
+        !l.attn_k.empty() && !l.attn_v.empty() && !l.attn_output.empty() &&
+        !l.attn_q_norm.empty() && !l.attn_k_norm.empty() &&
+        !l.ffn_gate_inp.empty() && !l.ffn_gate_exps.empty() &&
+        !l.ffn_up_exps.empty() && !l.ffn_down_exps.empty() &&
+        !l.ffn_gate_shexp.empty() && !l.ffn_up_shexp.empty() &&
+        !l.ffn_down_shexp.empty() && !l.ffn_gate_inp_shexp.empty() &&
+        mtp.fusion_projection.num_elements == 2 * hidden_size * hidden_size &&
+        l.attn_q.num_elements == 2 * attention_size * hidden_size &&
+        l.attn_k.num_elements == kv_size * hidden_size &&
+        l.attn_output.num_elements == hidden_size * attention_size;
+    if (complete) {
+      weights.mtp = std::move(mtp);
+    }
+  }
   return weights;
 }
 

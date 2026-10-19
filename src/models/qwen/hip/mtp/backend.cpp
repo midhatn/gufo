@@ -46,14 +46,19 @@ std::unique_ptr<QwenMtpGpuDraftBackend> QwenMtpGpuDraftBackend::CreateFromGguf(
     }
     return nullptr;
   }
-  auto reader_owner =
-      core::GgufReader::OpenFile(std::string(model_path), error_msg);
-  if (reader_owner == nullptr) {
-    return nullptr;
+  std::shared_ptr<const QwenMtpGpuModel> model;
+  if (model_path == "embedded") {
+    model = QwenMtpGpuModel::CreateEmbedded(std::move(target_model), error_msg);
+  } else {
+    auto reader_owner =
+        core::GgufReader::OpenFile(std::string(model_path), error_msg);
+    if (reader_owner == nullptr) {
+      return nullptr;
+    }
+    std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+    model = QwenMtpGpuModel::Create(std::move(reader), std::move(target_model),
+                                    error_msg);
   }
-  std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  auto model = QwenMtpGpuModel::Create(std::move(reader),
-                                       std::move(target_model), error_msg);
   if (model == nullptr) {
     return nullptr;
   }
@@ -128,7 +133,13 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
 
   speculative::DraftProposal proposal;
   proposal.start_pos = current_pos;
-  const std::uint32_t count = std::min(max_tokens, config_.max_draft_tokens);
+  // Verifying a row reads its own experts, so MoE targets pay for every
+  // extra draft row; three is the sweet spot on prose and code.
+  constexpr std::uint32_t kMoeDraftCap = 3;
+  std::uint32_t count = std::min(max_tokens, config_.max_draft_tokens);
+  if (executor_->IsMoe()) {
+    count = std::min(count, kMoeDraftCap);
+  }
   if (count == 0) {
     return proposal;
   }

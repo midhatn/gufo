@@ -35,6 +35,12 @@ public:
       std::shared_ptr<const QwenGpuModel> target_model,
       std::string* error_msg = nullptr);
 
+  /// The prediction head embedded in the target's own GGUF (MoE checkpoints);
+  /// it reads the target's device weights and packs nothing.
+  [[nodiscard]] static std::shared_ptr<const QwenMtpGpuModel> CreateEmbedded(
+      std::shared_ptr<const QwenGpuModel> target_model,
+      std::string* error_msg = nullptr);
+
   [[nodiscard]] const speculative::QwenMtpWeights& GetWeights() const noexcept {
     return weights_;
   }
@@ -103,6 +109,9 @@ public:
   [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
     return model_->GetConfig().hidden_size;
   }
+  [[nodiscard]] bool IsMoe() const noexcept {
+    return model_->GetConfig().IsMoe();
+  }
 
 private:
   QwenMtpGpuExecutor(std::shared_ptr<const QwenMtpGpuModel> model,
@@ -136,6 +145,8 @@ private:
   float* d_ffn_out_{nullptr};
   float* d_feedback_hidden_{nullptr};
   float* d_logits_{nullptr};
+  float* d_moe_buffer_{nullptr};
+  QwenMoeScratch moe_;
   float* d_kv_cache_{nullptr};
   void* d_kv_cache_f16_{nullptr};
   float* d_split_k_scratch_{nullptr};

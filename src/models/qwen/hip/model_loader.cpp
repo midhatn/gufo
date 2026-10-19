@@ -283,6 +283,23 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
                remap(layer.ffn_gate_shexp) && remap(layer.ffn_up_shexp) &&
                remap(layer.ffn_down_shexp) && remap(layer.ffn_gate_inp_shexp);
   }
+  if (weights_opt->mtp.has_value()) {
+    auto& mtp = *weights_opt->mtp;
+    auto& l = mtp.layer;
+    const bool mtp_remapped =
+        remap(mtp.embedding_norm) && remap(mtp.hidden_norm) &&
+        remap(mtp.fusion_projection) && remap(mtp.shared_head_norm) &&
+        remap(l.attn_norm) && remap(l.ffn_norm) && remap(l.attn_q) &&
+        remap(l.attn_k) && remap(l.attn_v) && remap(l.attn_output) &&
+        remap(l.attn_q_norm) && remap(l.attn_k_norm) && remap(l.ffn_gate_inp) &&
+        remap(l.ffn_gate_exps) && remap(l.ffn_up_exps) &&
+        remap(l.ffn_down_exps) && remap(l.ffn_gate_shexp) &&
+        remap(l.ffn_up_shexp) && remap(l.ffn_down_shexp) &&
+        remap(l.ffn_gate_inp_shexp);
+    if (!mtp_remapped) {
+      weights_opt->mtp.reset();
+    }
+  }
   if (!remapped) {
     ReleaseWeightRegions(weight_regions);
     if (error_msg != nullptr) {

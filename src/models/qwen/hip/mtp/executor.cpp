@@ -2,12 +2,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -93,7 +96,33 @@ void QwenMtpGpuExecutor::Allocate() {
   AllocateBuffer(d_gate_, attention);
   AllocateBuffer(d_context_, attention);
   AllocateBuffer(d_attn_out_, hidden);
-  AllocateBuffer(d_ffn_act_, intermediate);
+  AllocateBuffer(d_ffn_act_, std::max<std::size_t>(intermediate, 1));
+  if (config.IsMoe()) {
+    const std::size_t experts = config.num_experts;
+    const std::size_t used = config.num_experts_used;
+    const std::size_t ff = config.expert_ff;
+    const std::size_t shared_ff = config.shared_expert_ff;
+    const std::size_t total = experts + 1 + used + used + 1 + (used * ff) +
+                              (used * hidden) + (3 * shared_ff) + hidden + 8;
+    AllocateBuffer(d_moe_buffer_, total);
+    float* cursor = d_moe_buffer_;
+    const auto take = [&cursor](std::size_t count) {
+      float* start = cursor;
+      cursor += count;
+      return start;
+    };
+    moe_.router_logits = take(experts);
+    moe_.shared_logit = take(1);
+    moe_.ids = reinterpret_cast<std::int32_t*>(take(used));
+    moe_.weights = take(used);
+    moe_.shared_weight = take(1);
+    moe_.act = take(used * ff);
+    moe_.down_out = take(used * hidden);
+    moe_.shared_gate = take(shared_ff);
+    moe_.shared_up = take(shared_ff);
+    moe_.shared_act = take(shared_ff);
+    moe_.shared_out = take(hidden);
+  }
   AllocateBuffer(d_ffn_out_, hidden);
   AllocateBuffer(d_feedback_hidden_, hidden);
   AllocateBuffer(d_logits_, config.vocab_size);
@@ -126,6 +155,7 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_context_);
   free_buffer(d_attn_out_);
   free_buffer(d_ffn_act_);
+  free_buffer(d_moe_buffer_);
   free_buffer(d_ffn_out_);
   free_buffer(d_feedback_hidden_);
   free_buffer(d_logits_);
@@ -235,12 +265,17 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
 
   LaunchRMSNorm(d_hidden_, static_cast<const float*>(layer.ffn_norm.data),
                 d_normed_, hidden, 1.0e-6F, stream_);
-  LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
-                        layer.ffn_up.data, layer.ffn_up.type, d_normed_,
-                        d_ffn_act_, config.intermediate_size, hidden, stream_);
-  LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type, d_ffn_act_, d_ffn_out_,
-             hidden, config.intermediate_size, stream_,
-             models::qwen::QwenGemmMode::kHipMtp);
+  if (config.IsMoe()) {
+    MoeFfnDecodeToken(layer, config, moe_, d_normed_, d_ffn_out_, stream_);
+  } else {
+    LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
+                          layer.ffn_up.data, layer.ffn_up.type, d_normed_,
+                          d_ffn_act_, config.intermediate_size, hidden,
+                          stream_);
+    LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type, d_ffn_act_, d_ffn_out_,
+               hidden, config.intermediate_size, stream_,
+               models::qwen::QwenGemmMode::kHipMtp);
+  }
   LaunchResidualAdd(d_hidden_, d_ffn_out_, d_hidden_, hidden, stream_);
   LaunchRMSNorm(d_hidden_,
                 static_cast<const float*>(weights.shared_head_norm.data),
@@ -250,10 +285,21 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   if (!compute_logits) {
     return 0;
   }
+  // The draft only proposes: scoring the most frequent token ids (the BPE
+  // vocabulary is ordered by merge rank) reads a fraction of the output matrix.
+  static const std::size_t kDraftVocab = [] {
+    const char* v = std::getenv("GUFO_MTP_VOCAB");
+    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
+                        : std::size_t{65536};
+  }();
+  const std::size_t scored =
+      (kDraftVocab == 0 || !config.IsMoe())
+          ? static_cast<std::size_t>(config.vocab_size)
+          : std::min<std::size_t>(kDraftVocab, config.vocab_size);
   LaunchGEMV(weights.output.data, weights.output.type, d_feedback_hidden_,
-             d_logits_, config.vocab_size, hidden, stream_,
+             d_logits_, scored, hidden, stream_,
              models::qwen::QwenGemmMode::kHipMtp);
-  LaunchGPUArgmax(d_logits_, d_out_token_, config.vocab_size, stream_);
+  LaunchGPUArgmax(d_logits_, d_out_token_, scored, stream_);
   tokenization::TokenId result = 0;
   const auto copy_error = hipMemcpyAsync(&result, d_out_token_, sizeof(result),
                                          hipMemcpyDeviceToHost, stream_);
