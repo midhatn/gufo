@@ -154,6 +154,17 @@ attention caches, compressor state, position, and sampling state. Dense and
 expert projections share weight reads across the batch; one request uses the
 single-session path.
 
+Qwen3.8-27B and Qwen3.6-35B-A3B accept `--speculative dflash2`, `mtp` and
+`auto`. `--mtp-model embedded` uses the MTP head stored in the 35B-A3B
+checkpoint; a path selects a separate MTP file. With `auto` both drafts stay in
+step with every committed token and each request proposes with whichever has been
+committing more tokens per second (it starts on DFlash2, probes MTP after twelve
+steps and re-probes the idle draft after 128); sampled requests always use
+DFlash2, the draft that reports its proposal distribution. MTP and auto
+sessions snapshot, restore, persist to `--cache-disk` and rewind on cancellation
+like DFlash2 sessions, and the MTP draft sees images through the target's
+vision input.
+
 With `--dspark-model <support.gguf>`, DSpark is selected automatically unless
 `--speculative off` is explicit. Greedy and sampled requests keep independent
 samplers, cache state and draft policies. C1 uses point-mass proposals and

@@ -10,9 +10,9 @@ namespace {
 
 constexpr double kRateSmoothing = 0.3;
 constexpr double kSwitchMargin = 1.05;
-constexpr std::uint32_t kFirstProbeStep = 8;
-constexpr std::uint32_t kProbeSteps = 4;
-constexpr std::uint32_t kReprobeIdleSteps = 48;
+constexpr std::uint32_t kFirstProbeStep = 12;
+constexpr std::uint32_t kProbeSteps = 3;
+constexpr std::uint32_t kReprobeIdleSteps = 128;
 constexpr double kMaxStepSeconds = 2.0;
 constexpr std::uint8_t kSnapshotVersion = 1;
 
@@ -185,14 +185,14 @@ QwenAutoDraftBackend::Which QwenAutoDraftBackend::Choose() {
     --exploring_;
     return proposer_;
   }
-  if (steps_in_request_ == kFirstProbeStep && rates_[df].samples == 0) {
+  if (steps_in_request_ == kFirstProbeStep && rates_[mt].samples == 0) {
     exploring_ = kProbeSteps - 1;
-    return Which::kDFlash;
+    return Which::kMtp;
   }
-  const Which best = rates_[df].tokens_per_second >
-                             rates_[mt].tokens_per_second * kSwitchMargin
-                         ? Which::kDFlash
-                         : Which::kMtp;
+  const Which best = rates_[mt].tokens_per_second >
+                             rates_[df].tokens_per_second * kSwitchMargin
+                         ? Which::kMtp
+                         : Which::kDFlash;
   const Which other = best == Which::kDFlash ? Which::kMtp : Which::kDFlash;
   if (rates_[static_cast<std::size_t>(other)].idle_steps > kReprobeIdleSteps &&
       steps_in_request_ > kFirstProbeStep) {
@@ -200,7 +200,7 @@ QwenAutoDraftBackend::Which QwenAutoDraftBackend::Choose() {
     return other;
   }
   if (steps_in_request_ < kFirstProbeStep) {
-    return Which::kMtp;
+    return Which::kDFlash;
   }
   return best;
 }
@@ -386,7 +386,7 @@ void QwenAutoDraftBackend::BeginRequest() noexcept {
   exploring_ = 0;
   have_last_ = false;
   pending_committed_ = 0;
-  proposer_ = Which::kMtp;
+  proposer_ = Which::kDFlash;
 }
 
 }  // namespace gufo::hip

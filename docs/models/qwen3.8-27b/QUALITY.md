@@ -43,6 +43,34 @@ acceptance, full-vocabulary residual correction, nonfinite inputs and replay.
 replay requires the same configuration. GPU/CPU distributions have numerical
 tolerances, not bit-identical upstream sampler parity.
 
+## NPU prefill
+
+With `GUFO_NPU_DIR` set, the NPU computes the leading output columns of the FFN,
+attention and linear-attention projections (see [NPU options](../../NPU.md)).
+Reference: llama.cpp on the CPU with the same GGUF; real-text windows (repository
+documentation and C++ source), 1,024 continuation tokens fed one at a time,
+512 positions per window.
+
+| Build | KL vs llama.cpp | Top-1 | Perplexity |
+| --- | --- | --- | --- |
+| GPU only | 0.00351 | 95.7% | 4.6776 |
+| GPU + NPU | 0.00351 | 95.9% | 4.6759 |
+
+Against the GPU-only build the NPU build has KL 6e-5 to 3e-4 and 99.0% to 99.6%
+top-1 agreement over prompts of 2,560, 4,096, 6,144 and 8,192 tokens. That
+covers single chunks, partial chunks that use fewer slices, lock-step pairs and
+the paired halves a long prompt is split into. Lock-step output is bit-identical
+to running the chunks one at a time. The block-float rounding of the NPU is the
+only numeric difference.
+
+## MTP
+
+The separate MTP head (`mtp-Qwen3.8-27B-Q4_0.gguf`) drafts poorly on this model:
+about 13.8 tok/s against 12.4 plain, where DFlash2 reaches 25 to 62. Use
+`--speculative dflash2`; `auto` works but spends steps probing the weaker draft.
+Greedy MTP, DFlash2 and auto produced identical text to plain decode on an
+image request (448x448 PNG, 200 tokens).
+
 ## Vision
 
 Q4/Q8 AR and DFlash2 pass multi-image, sampled/greedy C4, cancellation,
@@ -90,3 +118,24 @@ DFlash2 uses mixed/repetitive cases. Rates sum individual decode rates.
 Loading uses cold files, C1/DFlash2/capacity 262144; memory uses C1/AR peak HIP
 allocation. Commands, hashes and counts remain in [artifacts](artifacts/bench.json)
 and the [benchmark workflow](../../../.agents/skills/benchmark-model/SKILL.md).
+
+## NPU prefill
+
+Next-token KL divergence of the continuation after a long prompt, NPU against the
+same build without it (`GUFO_NPU_DIR` unset): the prompt is prefilled, then 512
+positions are scored through single-token decode. Real text, code and
+documentation windows.
+
+| Prefill path | KL against GPU-only | Top-1 agreement |
+| --- | ---: | ---: |
+| 4,096-token chunk | 2.6e-4, 2.9e-4 | 99.6%, 99.0% |
+| 8,192 tokens (lock-step pair) | 1.1e-4, 6.9e-5 | 99.2%, 99.6% |
+| 6,144 tokens (two halves) | 7.6e-5 | 99.4% |
+| 2,560 tokens (partial chunk) | 6.3e-5 | 99.8% |
+
+Against llama.cpp on the CPU the GPU-only path measures KL 0.0035 and the NPU path
+0.0035; perplexity of the true continuation changes by under 0.01%. Lock-step
+pairing is bit-identical to running the chunks one at a time.
+
+Images work with every draft: plain, MTP and auto produced identical greedy text
+for a test image.

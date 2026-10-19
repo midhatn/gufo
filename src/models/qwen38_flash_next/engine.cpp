@@ -2,14 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <atomic>
 #include <cstdlib>
-#include <mutex>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 
@@ -876,9 +876,8 @@ struct MtpRejectLog {
     }
   }
   void Print() const {
-    const double sc = step_cycles.load() > 0
-                          ? static_cast<double>(step_cycles.load())
-                          : 1.0;
+    const double sc =
+        step_cycles.load() > 0 ? static_cast<double>(step_cycles.load()) : 1.0;
     std::fprintf(stderr,
                  "mtp-log step prepare=%.2f forward=%.2f finish=%.2f ms/cycle "
                  "tokens/cycle=%.2f\n",
@@ -898,17 +897,17 @@ struct MtpRejectLog {
     for (std::size_t p = 1; p < kPositions; ++p) {
       if (proposed[p] == 0)
         continue;
-      std::fprintf(
-          stderr,
-          "mtp-log pos=%zu reached=%llu accept=%.1f%% reject: 2nd=%llu 3rd=%llu "
-          "4th=%llu absent=%llu\n",
-          p, static_cast<unsigned long long>(proposed[p]),
-          100.0 * static_cast<double>(accepted[p]) /
-              static_cast<double>(proposed[p]),
-          static_cast<unsigned long long>(rank[p][1]),
-          static_cast<unsigned long long>(rank[p][2]),
-          static_cast<unsigned long long>(rank[p][3]),
-          static_cast<unsigned long long>(rank[p][4]));
+      std::fprintf(stderr,
+                   "mtp-log pos=%zu reached=%llu accept=%.1f%% reject: "
+                   "2nd=%llu 3rd=%llu "
+                   "4th=%llu absent=%llu\n",
+                   p, static_cast<unsigned long long>(proposed[p]),
+                   100.0 * static_cast<double>(accepted[p]) /
+                       static_cast<double>(proposed[p]),
+                   static_cast<unsigned long long>(rank[p][1]),
+                   static_cast<unsigned long long>(rank[p][2]),
+                   static_cast<unsigned long long>(rank[p][3]),
+                   static_cast<unsigned long long>(rank[p][4]));
     }
   }
 };

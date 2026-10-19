@@ -272,7 +272,8 @@ namespace {
 /// quantized tensor.
 QwenTensorRef ExpertSlice(const QwenTensorRef& stacked, std::size_t expert,
                           std::size_t rows, std::size_t cols) noexcept {
-  const std::size_t stride = quant::QuantizedRowBytes(stacked.type, cols) * rows;
+  const std::size_t stride =
+      quant::QuantizedRowBytes(stacked.type, cols) * rows;
   return {.data = static_cast<const std::uint8_t*>(stacked.data) +
                   (expert * stride),
           .type = stacked.type,
@@ -321,18 +322,17 @@ void ForwardMoeFFN(std::span<const float> x, const QwenLayerWeights& layer,
   std::fill(out.begin(), out.begin() + hidden, 0.0F);
   std::vector<float> gate(std::max(ff, shared_ff)), up(gate.size()),
       act(gate.size()), down(hidden);
-  const auto accumulate = [&](const QwenTensorRef& gate_w,
-                              const QwenTensorRef& up_w,
-                              const QwenTensorRef& down_w, std::size_t width,
-                              float weight) {
-    TensorGEMV(gate_w, x, width, hidden, gate);
-    TensorGEMV(up_w, x, width, hidden, up);
-    for (std::size_t i = 0; i < width; ++i)
-      act[i] = Silu(gate[i]) * up[i];
-    TensorGEMV(down_w, act, hidden, width, down);
-    for (std::size_t i = 0; i < hidden; ++i)
-      out[i] += weight * down[i];
-  };
+  const auto accumulate =
+      [&](const QwenTensorRef& gate_w, const QwenTensorRef& up_w,
+          const QwenTensorRef& down_w, std::size_t width, float weight) {
+        TensorGEMV(gate_w, x, width, hidden, gate);
+        TensorGEMV(up_w, x, width, hidden, up);
+        for (std::size_t i = 0; i < width; ++i)
+          act[i] = Silu(gate[i]) * up[i];
+        TensorGEMV(down_w, act, hidden, width, down);
+        for (std::size_t i = 0; i < hidden; ++i)
+          out[i] += weight * down[i];
+      };
   for (std::size_t i = 0; i < used; ++i) {
     const std::size_t e = order[i];
     accumulate(ExpertSlice(layer.ffn_gate_exps, e, ff, hidden),
@@ -342,7 +342,8 @@ void ForwardMoeFFN(std::span<const float> x, const QwenLayerWeights& layer,
   }
 
   float shared_logit = 0.0F;
-  const auto* gate_row = static_cast<const float*>(layer.ffn_gate_inp_shexp.data);
+  const auto* gate_row =
+      static_cast<const float*>(layer.ffn_gate_inp_shexp.data);
   for (std::size_t i = 0; i < hidden; ++i)
     shared_logit += gate_row[i] * x[i];
   accumulate(layer.ffn_gate_shexp, layer.ffn_up_shexp, layer.ffn_down_shexp,

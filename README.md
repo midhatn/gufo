@@ -1,58 +1,129 @@
-# Strix Halo inference with the XDNA2 NPU: about 2,100 tok/s prefill
+# gufo on Strix Halo: GPU + XDNA2 NPU inference
 
-Qwen3.8 Flash-Next on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`)
-with the prefill split between the GPU and the Ryzen AI NPU.
-Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+Fast local inference for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S
+`gfx1151`), with prefill shared between the GPU and the Ryzen AI NPU and
+speculative decoding on top. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+
+| Model | Weights tested | NPU prefill | Speculative decode |
+| --- | --- | --- | --- |
+| Qwen3.6-35B-A3B | UD-Q4_K_XL | linear-attention and attention projections | MTP (embedded head), DFlash2, auto |
+| Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
+| Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | MTP |
 
 ## Speed
 
-| Prefill, UD-IQ4_XS | GPU only | GPU + NPU |
+Measured with `gufo bench` (three runs per prefill cell) and, for decode on real
+text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
+[Try it](#try-it); GPU-only numbers use the same binary without `GUFO_NPU_DIR`.
+
+### Qwen3.6-35B-A3B
+
+| Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `gufo bench -p 8192` | 1,842 tok/s | **2,113 tok/s** (+14.7%) |
-| `gufo bench -p 16384` | 1,821 tok/s | **2,117 tok/s** (+16.3%) |
-| `gufo bench -p 32768` | 1,786 tok/s | **2,067 tok/s** (+15.8%) |
-| Served, 54k tokens cold, MTP off | | **1,932 tok/s** |
+| `-p 2048` | 3,007 | **3,061** |
+| `-p 4096` | 3,023 | **3,277** (+8.4%) |
+| `-p 8192` | 2,842 | **3,138** (+10.4%) |
 
-| Decode with MTP drafting | tok/s |
+| Decode, tok/s | plain | MTP | DFlash2 | auto |
+| --- | --- | --- | --- | --- |
+| code | 61 | 111 | **140** | 138 |
+| prose | 61 | **72** | 59 | 68 |
+| JSON | 61 | 122 | **159** | 156 |
+
+`gufo bench -n 128` plain decode: 60.6 tok/s.
+
+### Qwen3.8-27B
+
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| `-p 2048` | 655 | **718** (+9.6%) |
+| `-p 4096` | 643 | **794** (+23.5%) |
+| `-p 8192` | 629 | **807** (+28.3%) |
+
+| Decode, tok/s | plain | DFlash2 | auto |
+| --- | --- | --- | --- |
+| code | 12.3 | **47.6** | 43 |
+| prose | 12.3 | **24.8** | 24 |
+| JSON | 12.3 | **62.2** | 53 |
+
+### Qwen3.8 Flash-Next
+
+| Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
+| --- | --- | --- |
+| `-p 8192` | 1,814 | **2,089** (+15.2%) |
+| `-p 16384` | 1,774 | **2,089** (+17.8%) |
+| `-p 32768` | 1,760 | **2,038** (+15.8%) |
+
+| Decode, tok/s | plain | MTP |
+| --- | --- | --- |
+| code | 36.6 | **76.5** |
+| prose | 36.5 | **47.2** |
+| JSON | 36.7 | **99.8** |
+
+`gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
+own repetitive context, where drafts are accepted easily).
+
+Prefill depends on the text as well as the length: code, markdown and prose
+route to experts differently, so the same length can vary by 20% or more.
+
+## Quality
+
+Output is exact by default, with two documented exceptions, and the NPU is
+opt-in. Numbers below compare each build with llama.cpp on the CPU (next-token
+KL divergence and perplexity of the true continuation) or with the same build
+without the NPU.
+
+| Path | Measured effect |
 | --- | --- |
-| `gufo bench -n 128` | **61.1** |
-| `gufo bench -n 128 -d 32768` | 93.4 |
-| `gufo bench -n 128 -d 131072` | 116.8 |
-| Served, code / prose / file edits / JSON / Spanish | 79 / 49 / 108 / 100 / 44 |
+| 27B, NPU prefill | KL against GPU-only 6e-5 to 3e-4, top-1 agreement 99.0% to 99.6%, perplexity change under 0.01% |
+| 35B-A3B, NPU prefill | perplexity change under 0.03% against llama.cpp; routing near-ties give 0.002 to 0.003 KL for any numeric change, NPU included |
+| Flash-Next, NPU slice and two-bank modes | KL against GPU-only 0.003 to 0.02 over real-text windows; needle-in-a-haystack 21 of 21 |
+| Flash-Next decode copies, `balanced` (default) | perplexity +1.3% against llama.cpp, decode +19% (plain) and +21% (MTP) |
+| Flash-Next decode copies, `off` | exact Q8_0 weights; plain 30.5 tok/s, MTP 44.9 tok/s |
+| Flash-Next F16 residual, `GUFO_F16_RESIDUAL=1` | perplexity +0.5%; no longer faster, so it stays off |
+| Speculative decoding | the target verifies every draft; greedy text can differ from plain decode only at near-tie tokens |
 
-The `-d` rows run on the benchmark's own repetitive context, where drafts are
-accepted easily; the served rows are real prompts and show what speculation
-gives on each kind of text.
-
-Three runs per prefill cell (`-r 3`), the GPU fabric clock held, EC and NPU in
-performance mode, nothing else running. Two-bank mode splits each 16384-token
-chunk into two 8192-token banks and runs them layer by layer in lock step: while
-the NPU computes one bank's projections, the GPU works on the other. Prompt
-lengths that are not a multiple of 8192 tokens fall back to a single bank for the
-remainder, which is slower than the full-bank figures above. Speed also depends
-on the text: a mix of code and markdown prefills 20% to 30% slower than code
-alone at the same length because expert routing differs. The mode is not
-bit-identical to GPU-only prefill; against GPU-only logits its last-token KL
-divergence is 0.0076 on average over 10 real-text windows of 16K to 20K tokens
-(the single-bank NPU path measures 0.0084), and a needle-in-a-haystack check
-passes 21 of 21 at 18K, 33K and 54K tokens. `GUFO_TWO_BANK=0` turns it off.
+Details and methods are in the per-model `QUALITY.md` files under
+[docs/models](docs/models/README.md).
 
 ## How the NPU is used
 
-The NPU runs block-float 8-bit GEMMs for whole projections: the complete
-linear-attention input projection (`ssm_in`) and the attention `q`/`k`/`v`
-projection (`attn_qkv`), plus the shared expert's gate and up projections. The
-GPU reads the NPU's output directly in its convolution, attention-preparation and
-gated-delta-net kernels, so no copy or conversion pass sits between them. The
-gated delta rule runs as 64-token chunks in WY form on the GPU's matrix units.
+The NPU runs block-float 8-bit GEMMs for the leading output columns of a
+projection while the GPU computes the rest of the same projection, then the GPU
+reads the NPU result directly. One runtime-K program serves every reduction length
+(2048 to 17408), so the same kernel works for all three models.
+
+- **Qwen3.8-27B:** FFN gate/up and down, attention q and output, and the
+  linear-attention qkv, gate and output projections. Pairs of chunks run in
+  lock-step so one chunk's NPU waits overlap the other's GPU work; prompts of
+  5000 tokens or more split into two halves for the same reason, and chunks of
+  1536 to 4095 tokens use proportionally fewer slices.
+- **Qwen3.6-35B-A3B:** the same for the dense projections. The routed experts
+  stay on the GPU, which runs them as grouped F16 matrix-core GEMMs. The router
+  runs in fp32 accuracy through one split-bf16 GEMM.
+- **Qwen3.8 Flash-Next:** whole `ssm_in`/`attn_qkv` projections and the shared
+  expert, in two banks of 8192 tokens that run layer by layer in lock-step.
+
+## Speculative decoding
+
+| Flag | Effect |
+| --- | --- |
+| `--speculative mtp --mtp-model embedded` | MTP head stored in the checkpoint (35B-A3B), or a separate MTP file (`--mtp-model PATH`) |
+| `--speculative dflash2 --dflash-model PATH` | DFlash2 draft model |
+| `--speculative auto --dflash-model PATH --mtp-model embedded` | both drafts; each request uses whichever commits more tokens per second, with sampled requests on DFlash2 |
+
+The 35B-A3B runs MTP at three draft tokens (verifying more rows reads more
+experts); DFlash2 wins on code and JSON, MTP on prose, and auto lands within a few
+percent of the better one on each. On the 27B DFlash2 is far better than its MTP
+head, so use `--speculative dflash2` there (auto costs 5% to 15% against it).
 
 ## Try it
 
 1. Build with the NPU enabled:
    `cmake --preset release -DGUFO_ENABLE_NPU=ON -DGUFO_XRT_INCLUDE_DIR=<xrt include dir>`
    then `cmake --build --preset release --parallel 4`. The compiled NPU kernel
-   (`final_4096x2560x1024_128x64x128.xclbin` and its `insts_*.txt`) and its AIE
-   source are in [tools/npu](tools/npu), so nothing else has to be built.
+   and its instruction streams are in [tools/npu](tools/npu), so nothing else has
+   to be built.
 2. Hold the GPU fabric clock at its top level (2000 MHz on this chip). This is
    required: without it the GPU and the NPU together can hang the machine.
    `sudo tools/npu/fabric-clock.sh hold` sets `power_dpm_force_performance_level`
@@ -73,22 +144,30 @@ gated delta rule runs as 64-token chunks in WY form on the GPU's matrix units.
 
    ```sh
    export LD_LIBRARY_PATH=/opt/xilinx/xrt/lib:/opt/rocm/lib
-   GUFO_NPU_DIR=tools/npu GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1 build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3   # NPU on
-   build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3                          # NPU off
+   # Qwen3.8-27B or Qwen3.6-35B-A3B
+   GUFO_NPU_DIR=tools/npu build/release/gufo bench -m <model.gguf> -p 4096,8192 -n 128 -r 3
+   # Qwen3.8 Flash-Next
+   GUFO_NPU_DIR=tools/npu GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1 build/release/gufo bench -m <model.gguf> -p 16384 -n 1 -r 3
+   build/release/gufo bench -m <model.gguf> -p 4096 -n 128 -r 3   # NPU off
    ```
 
-   The NPU run prints `NPU: z projection of 36 layers`, `NPU: attention
-   query/gate of 12 layers` and `NPU: shared expert of 48 layers` while loading.
-   For the server, run `GUFO_MODEL=<first shard> GUFO_MTP=<mtp sidecar> scripts/run-gufo.sh`.
-   It enables the NPU only when the fabric clock is held and the NPU is not in
-   turbo mode (`GUFO_NPU=0` forces GPU-only), uses a 16384-token prefill tile
-   (`GUFO_PREFILL_TILE`; 24576 is faster for 24K+ prompts but needs about 6 GB more RAM) and reads the options listed at the top of the script.
+   The NPU run prints which projections it took while loading. For the
+   Flash-Next server, run
+   `GUFO_MODEL=<first shard> GUFO_MTP=<mtp sidecar> scripts/run-gufo.sh`. It
+   enables the NPU only when the fabric clock is held and the NPU is not in turbo
+   mode (`GUFO_NPU=0` forces GPU-only) and reads the options listed at the top of
+   the script.
+6. Serve with speculation, for example the 35B-A3B:
 
-Every option is described in [docs/NPU.md](docs/NPU.md). `GUFO_NPU_SLICES` (default 6), `GUFO_NPU_GATE_SLICES` (default 12) and
-`GUFO_NPU_SHEXP=0` tune or switch off parts of the offload. Without
+   ```sh
+   GUFO_NPU_DIR=tools/npu build/release/gufo serve llm --model <35b.gguf> \
+     --speculative auto --dflash-model <dflash2.gguf> --mtp-model embedded
+   ```
+
+Every option is described in [docs/NPU.md](docs/NPU.md). Without
 `GUFO_NPU_DIR` the build runs GPU-only.
 
-## Build without the NPU
+## Build from source
 
 ```sh
 cmake --preset release

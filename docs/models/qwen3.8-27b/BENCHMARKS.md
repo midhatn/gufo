@@ -8,6 +8,29 @@ HTTP, greedy, thinking off. Measured September 23, 2026.
 Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md) · [Model identities](artifacts/model-identities.json)
 
+## NPU prefill
+
+`gufo bench -m UD-Q4_K_XL -p N -n 128 -r 3`, fabric clock held, NPU in
+performance mode. GPU + NPU sets `GUFO_NPU_DIR=tools/npu`; see
+[NPU options](../../NPU.md).
+
+| Tokens | GPU only | GPU + NPU |
+| --- | --- | --- |
+| 2048 | 655 | 718 |
+| 4096 | 643 | 794 |
+| 8192 | 629 | 807 |
+| 12288 | | 780 |
+
+Decode is not affected: 12.4 tok/s plain with or without the NPU.
+
+Served greedy requests (200 tokens, two timed repeats), tok/s:
+
+| Prompt | Plain | DFlash2 | Auto |
+| --- | --- | --- | --- |
+| Code | 12.3 | 47.6 | 43.3 |
+| Prose | 12.3 | 24.8 | 23.8 |
+| JSON | 12.3 | 62.2 | 53.0 |
+
 ## Single user, autoregressive
 
 Approximately pp2048 / tg128; depth is the cached prefix in tokens.
@@ -180,3 +203,29 @@ C1, context capacity 262144, AR. Peak memory reported by HIP.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory-q8.svg)
+
+## NPU prefill
+
+Same GGUF (UD-Q4_K_XL), `gufo bench -n 128 -r 3`, GPU fabric clock held, NPU in
+performance mode, October 19, 2026. The NPU computes leading columns of the
+FFN, attention and linear-attention projections (`GUFO_NPU_DIR=tools/npu`).
+
+| Prompt tokens | GPU only (tok/s) | GPU + NPU (tok/s) | Gain |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 655 | 718 | +9.6% |
+| 4,096 | 643 | 794 | +23.5% |
+| 8,192 | 629 | 807 | +28.3% |
+
+Chunks of 1,536 to 4,095 tokens use proportionally fewer NPU slices; prompts of
+5,000 tokens or more run as a lock-step pair. Decode is 12.4 tok/s with or
+without the NPU.
+
+### Speculative decoding, HTTP, greedy
+
+200 generated tokens, mean of two runs after a warm-up request.
+
+| Prompt | plain | DFlash2 | auto |
+| --- | ---: | ---: | ---: |
+| code | 12.3 | 47.6 | 43.3 |
+| prose | 12.3 | 24.8 | 23.8 |
+| JSON | 12.3 | 62.2 | 53.0 |

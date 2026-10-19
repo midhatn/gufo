@@ -109,12 +109,13 @@ int main(int argc, char** argv) {
     tiles48 += ((c + 15u) / 16u * 16u + 47u) / 48u;
     tiles128 += (c + 127u) / 128u;
   }
-  std::printf("routing: slots=%zu max_bucket=%u tiles48=%llu (fill %.2f) "
-              "tiles128=%llu (fill %.2f)\n",
-              slots, max_bucket, static_cast<unsigned long long>(tiles48),
-              static_cast<double>(slots) / (tiles48 * 48.0),
-              static_cast<unsigned long long>(tiles128),
-              static_cast<double>(slots) / (tiles128 * 128.0));
+  std::printf(
+      "routing: slots=%zu max_bucket=%u tiles48=%llu (fill %.2f) "
+      "tiles128=%llu (fill %.2f)\n",
+      slots, max_bucket, static_cast<unsigned long long>(tiles48),
+      static_cast<double>(slots) / (tiles48 * 48.0),
+      static_cast<unsigned long long>(tiles128),
+      static_cast<double>(slots) / (tiles128 * 128.0));
 
   // IQ3_S gate/up (110 bytes per 256 weights) and IQ4_NL down (18 per 32).
   const std::size_t gate_row = kHidden / 256 * 110;
@@ -137,7 +138,8 @@ int main(int argc, char** argv) {
   Check(hipMalloc(&d_up_out, (slots + 8192) * kFf * sizeof(__half)), "malloc");
   Check(hipMalloc(&d_down_out, (slots + 8192) * kHidden * sizeof(__half)),
         "malloc");
-  Check(hipMemset(d_up_out, 0, (slots + 8192) * kFf * sizeof(__half)), "memset");
+  Check(hipMemset(d_up_out, 0, (slots + 8192) * kFf * sizeof(__half)),
+        "memset");
   Check(hipMemset(d_down_out, 0, (slots + 8192) * kHidden * sizeof(__half)),
         "memset");
 
@@ -167,16 +169,17 @@ int main(int argc, char** argv) {
   const double flop_down = 2.0 * slots * kHidden * kFf;
 
   const double pair_ms = TimeMs([&] {
-    return q::RoutedGatedF16Gemm(d_gate, d_up, q::WeightType::kIQ3_S, d_x,
-                                 d_t128, static_cast<std::uint32_t>(t128.size()),
-                                 128, d_bounds, d_rows_token, d_rows_slot,
-                                 d_up_out, kFf, kHidden, nullptr);
+    return q::RoutedGatedF16Gemm(
+        d_gate, d_up, q::WeightType::kIQ3_S, d_x, d_t128,
+        static_cast<std::uint32_t>(t128.size()), 128, d_bounds, d_rows_token,
+        d_rows_slot, d_up_out, kFf, kHidden, nullptr);
   });
-  std::printf("pair  IQ3_S gate+up : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
-              "hash %016llx\n",
-              pair_ms, flop_pair / (pair_ms * 1e9),
-              static_cast<unsigned long long>(
-                  Hash(d_up_out, slots * kFf * sizeof(__half))));
+  std::printf(
+      "pair  IQ3_S gate+up : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
+      "hash %016llx\n",
+      pair_ms, flop_pair / (pair_ms * 1e9),
+      static_cast<unsigned long long>(
+          Hash(d_up_out, slots * kFf * sizeof(__half))));
 
   const double down_ms = TimeMs([&] {
     return q::RoutedF16Gemm(d_down, q::WeightType::kIQ4_NL, d_u, d_t128,
@@ -184,17 +187,18 @@ int main(int argc, char** argv) {
                             d_bounds, d_rows_slot, d_rows_slot, nullptr,
                             nullptr, d_down_out, kHidden, kFf, nullptr);
   });
-  std::printf("down  IQ4_NL (128) : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
-              "hash %016llx\n",
-              down_ms, flop_down / (down_ms * 1e9),
-              static_cast<unsigned long long>(
-                  Hash(d_down_out, slots * kHidden * sizeof(__half))));
+  std::printf(
+      "down  IQ4_NL (128) : %7.3f ms/call  %5.1f TFLOPS (real rows)  "
+      "hash %016llx\n",
+      down_ms, flop_down / (down_ms * 1e9),
+      static_cast<unsigned long long>(
+          Hash(d_down_out, slots * kHidden * sizeof(__half))));
 
   const double down48_ms = TimeMs([&] {
     return q::RoutedF16Gemm(d_down, q::WeightType::kIQ4_NL, d_u, d_t48,
-                            static_cast<std::uint32_t>(t48.size()), 48, d_bounds,
-                            d_rows_slot, d_rows_slot, nullptr, nullptr,
-                            d_down_out, kHidden, kFf, nullptr);
+                            static_cast<std::uint32_t>(t48.size()), 48,
+                            d_bounds, d_rows_slot, d_rows_slot, nullptr,
+                            nullptr, d_down_out, kHidden, kFf, nullptr);
   });
   std::printf("down  IQ4_NL (48)  : %7.3f ms/call  %5.1f TFLOPS (real rows)\n",
               down48_ms, flop_down / (down48_ms * 1e9));

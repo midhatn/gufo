@@ -36,7 +36,7 @@ out). `GUFO_PREFILL_TILE=24576` (two 12288-token banks) prefills 24K-token promp
 | `GUFO_NPU_DIR` | unset (NPU off) | Directory with the NPU kernel files (`tools/npu`). Setting it turns the NPU on. |
 | `GUFO_NPU` | `1` | Read by `scripts/run-gufo.sh` only. `0` forces GPU-only. |
 
-### What the NPU computes
+### What the NPU computes (Qwen3.8 Flash-Next)
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -75,6 +75,50 @@ for the slice mode. See `EXPERIMENTS.md` for what was tried and rejected.
 | `GUFO_NPU_ISOLATE` | unset | `1` gives the NPU private buffers and copies through the CPU. Slower; for debugging. |
 | `GUFO_NPU_STATS` | unset | Print wall-clock accounting of the NPU path. |
 | `GUFO_NPU_TRACE` | unset | Path of a synchronous event log, one line per NPU event. |
+
+## Qwen3.8-27B and Qwen3.6-35B-A3B
+
+These models use one runtime-K program for every reduction length
+(`tools/npu/runtime_k`, K = 2048, 2560, 4096, 5120, 6144 and 17408). The NPU
+computes the leading output columns of a projection in 1024-column slices while
+the GPU computes the rest, and the GPU adds or reads the result in place. A chunk
+needs 1536 to 4096 tokens; the program always runs 4096 rows, so a shorter chunk
+gets proportionally fewer slices.
+
+| Variable | 27B | 35B-A3B | Effect |
+| --- | --- | --- | --- |
+| `GUFO_QWEN_NPU_FFN_SLICES` | 7 (6 for a lone chunk) | 0 | FFN gate/up slices on the NPU, 0 to 16 |
+| `GUFO_QWEN_NPU_DOWN_SLICES` | 1 | 0 | `ffn_down` slices, 0 to 5 |
+| `GUFO_QWEN_NPU_QKV_SLICES` | 4 | 6 | linear-attention `attn_qkv` slices, 0 to 10 |
+| `GUFO_QWEN_NPU_GATE_SLICES` | 2 | 2 | linear-attention `attn_gate` slices, 0 to 6 |
+| `GUFO_QWEN_NPU_SSM_OUT_SLICES` | 2 | 1 | linear-attention output projection slices, 0 to 5 |
+| `GUFO_QWEN_NPU_ATTN_Q_SLICES` | 4 | 3 | full-attention `attn_q` slices, 0 to 12 |
+| `GUFO_QWEN_NPU_ATTN_O_SLICES` | 2 | 1 | full-attention `attn_output` slices, 0 to 5 |
+| `GUFO_QWEN_NPU_ATTN` | on | on | `0` keeps the full-attention layers on the GPU |
+
+### Chunk pairing
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GUFO_QWEN_LOCKSTEP` | on | `0` runs chunks one at a time. Pairs of chunks advance layer by layer so the NPU waits of one overlap the GPU work of the other (bit-identical to the one-at-a-time order). |
+| `GUFO_QWEN_LOCKSTEP_YIELDS` | 4 (27B), 3 (MoE) | Stages that hand over to the other chunk: 1 attention-linear, 2 output projection, 4 FFN gate/up, 8 down. |
+| `GUFO_QWEN_PAIR_MIN` | 5000 | A prompt of at least this many tokens is split into a pair of halves (or two full chunks) for lock-step. |
+
+### 35B-A3B prefill and speculation
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GUFO_QWEN_MOE_PREFILL` | on | `0` runs prefill through the per-token decode kernels, the slow reference path. |
+| `GUFO_QWEN_ROUTER_SPLIT` | on | `0` computes the router logits with the plain fp32 GEMM instead of the split-bf16 one. |
+| `GUFO_MTP_VOCAB` | 65536 | Token ids the MTP draft head scores on the 35B-A3B (the first ids are the most frequent); `0` scores the full vocabulary. |
+
+## Qwen3.8 Flash-Next decode and residual precision
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `GUFO_DECODE_COPY` | `balanced` | Decode reads Q4_1 copies of `ssm_in`, `ssm_out`, `attn_qkv` and the shared expert (+19% plain, +21% MTP decode, perplexity +1.3%). `q4` copies every large matrix, `q5` uses Q5_1, `off` decodes from the exact Q8_0 weights. |
+| `GUFO_DECODE_COPY_CLASSES` | per mode | Comma list of `ssm_in`, `ssm_out`, `attn_qkv`, `attn_out`, `hc`, `shexp` to copy. |
+| `GUFO_F16_RESIDUAL` | unset | `1` keeps the prefill residual in F16 between combines (perplexity +0.5%, no longer faster). |
 
 ## Examples
 

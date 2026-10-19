@@ -100,13 +100,13 @@ private:
   std::size_t hidden_size_;
 
   Rate rates_[2];
-  Which proposer_{Which::kMtp};
+  Which proposer_{Which::kDFlash};
   bool proposal_open_{false};
   tokenization::TokenId step_frontier_{0};
   std::uint32_t step_position_{0};
   std::vector<float> mtp_rows_;
   std::chrono::steady_clock::time_point last_propose_{};
-  Which last_which_{Which::kMtp};
+  Which last_which_{Which::kDFlash};
   bool have_last_{false};
   std::uint32_t steps_in_request_{0};
   std::uint32_t exploring_{0};

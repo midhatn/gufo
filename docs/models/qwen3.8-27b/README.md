@@ -22,6 +22,11 @@ DRAFT=models/qwen3.8-27b/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
   --dflash-model "$DRAFT" --sessions 2 --context 32768
 ```
 
+On a Strix Halo with the XDNA2 NPU, build with `-DGUFO_ENABLE_NPU=ON` and set
+`GUFO_NPU_DIR=tools/npu` to share prefill between the GPU and the NPU (prefill
+643 to 807 tok/s, see [Benchmarks](BENCHMARKS.md#npu-prefill) and the
+[setup](../../../README.md#try-it)).
+
 Substitute `Qwen3.8-27B-UD-Q8_K_XL.gguf` for Q8. Targets and drafts need not
 have matching precision. Use the Q4_K_M DFlash2 draft with either target.
 
@@ -29,6 +34,8 @@ have matching precision. Use the Q4_K_M DFlash2 draft with either target.
 | --- | --- | --- |
 | AR | No speculative option | Target-only generation. |
 | DFlash2 | `--speculative dflash2 --dflash-model PATH` | Adaptive default; `--draft-tokens` caps proposals, `--draft-policy fixed` is a comparison mode. |
+| MTP | `--speculative mtp --mtp-model PATH` | The Q4_0 MTP head; accepted drafts are rare on this model, so DFlash2 is far faster. |
+| Auto | `--speculative auto --dflash-model PATH --mtp-model PATH` | Both drafts stay in step; each request proposes with whichever commits more tokens per second. |
 
 Greedy speculation must match AR. Sampled modes preserve the target policy,
 but AR and speculation need not share the same-seed sequence. See the
@@ -71,3 +78,13 @@ Image numbering is off by default; `--add-vision-id` or
 `chat_template_kwargs: {"add_vision_id": true}` adds `Picture N:` prefixes.
 Cache identity includes processed pixels, placement, preprocessing version and
 projector contents. See [vision checks and limits](QUALITY.md#vision).
+
+## NPU prefill
+
+With the XDNA2 NPU set up as in the [repository README](../../../README.md#try-it),
+`GUFO_NPU_DIR=tools/npu` moves the leading output columns of the FFN, attention
+and linear-attention projections to the NPU while the GPU computes the rest.
+Pairs of 4096-token chunks (or two halves of a prompt of 5000 tokens or more)
+advance in lock-step so the NPU waits of one chunk overlap the GPU work of the
+other. Prefill rises by 10% to 28%; decode is unchanged. Options are in
+[docs/NPU.md](../../NPU.md#qwen38-27b-and-qwen36-35b-a3b).

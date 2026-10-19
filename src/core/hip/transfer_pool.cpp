@@ -1,4 +1,3 @@
-#include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/hip/transfer_pool.hpp"
 
 #include <algorithm>
@@ -7,6 +6,8 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include "src/core/hip/snapshot_transfer.hpp"
 
 namespace gufo::hip {
 namespace {
