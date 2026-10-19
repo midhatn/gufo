@@ -36,12 +36,15 @@ enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
   kDFlash,
   kDSpark,
-  kMtp,  ///< Qwen MTP draft block
+  kMtp,   ///< Qwen MTP draft block
+  kAuto,  ///< Qwen DFlash2 and MTP together, chosen per request
 };
 
 struct TextSpeculativeConfig {
   TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
   std::string draft_model_path;
+  /// With kAuto: the MTP GGUF (or "embedded"); draft_model_path is DFlash2.
+  std::string secondary_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{

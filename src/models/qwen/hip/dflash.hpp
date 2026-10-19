@@ -218,6 +218,7 @@ private:
   hipStream_t stream_{nullptr};
   hipblasHandle_t hipblas_handle_{nullptr};
   std::unique_ptr<HipblasLtGemm> hipblaslt_gemm_;
+  std::unique_ptr<HipblasLtGemm> inject_gemm_;
 
   // GPU Allocations for draft KV cache
   std::vector<float*> d_injected_k_;
@@ -245,6 +246,8 @@ private:
   float* d_confidences_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
   hip_bfloat16* d_bf16_input_{nullptr};
+  hip_bfloat16* d_inject_bf16_{nullptr};
+  std::size_t inject_bf16_elements_{0};
   std::size_t scratch_bytes_{0};
   void* d_batch_scratch_{nullptr};
   std::size_t batch_scratch_bytes_{0};
@@ -322,10 +325,15 @@ public:
   void BeginRequest() noexcept override { controller_.Reset(); }
   /// The most recent verification has not yet injected these target rows.
   /// Discard them when the target returns to its saved verification frontier.
-  void DiscardPendingTargetContext(std::uint32_t position);
+  void DiscardPendingTargetContext(std::uint32_t position) override;
 
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept {
     return executor_->GetMemoryUsage();
+  }
+  [[nodiscard]] std::pair<std::size_t, std::size_t> RequestMemoryBytes()
+      const override {
+    const auto usage = executor_->GetMemoryUsage();
+    return {usage.request_state_bytes, usage.temporary_scratch_bytes};
   }
 
 private:

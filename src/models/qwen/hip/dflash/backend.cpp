@@ -532,9 +532,15 @@ void QwenDFlashGpuDraftBackend::UpdateTargetHidden(
 
 void QwenDFlashGpuDraftBackend::DiscardPendingTargetContext(
     std::uint32_t position) {
-  if (proposal_active_ || executor_->GetInjectedContextLength() != position)
+  const auto width = executor_->GetTargetFeaturesSize();
+  const auto injected = executor_->GetInjectedContextLength();
+  const std::size_t pending_rows = pending_target_features_.size() / width;
+  if (proposal_active_ || position < injected ||
+      position - injected > pending_rows)
     throw std::logic_error("DFlash cancellation frontier is not retained");
-  pending_target_features_.clear();
+  // Drop the unconsumed rows past the frontier; earlier ones stay pending.
+  pending_target_features_.resize(
+      static_cast<std::size_t>(position - injected) * width);
 }
 
 std::size_t QwenDFlashGpuDraftBackend::SnapshotPayloadBytes() const {

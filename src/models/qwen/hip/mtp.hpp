@@ -35,6 +35,12 @@ public:
       std::shared_ptr<const QwenGpuModel> target_model,
       std::string* error_msg = nullptr);
 
+  /// The prediction head embedded in the target's own GGUF (MoE checkpoints);
+  /// it reads the target's device weights and packs nothing.
+  [[nodiscard]] static std::shared_ptr<const QwenMtpGpuModel> CreateEmbedded(
+      std::shared_ptr<const QwenGpuModel> target_model,
+      std::string* error_msg = nullptr);
+
   [[nodiscard]] const speculative::QwenMtpWeights& GetWeights() const noexcept {
     return weights_;
   }
@@ -87,6 +93,21 @@ public:
       tokenization::TokenId input_token, std::span<const float> target_hidden,
       std::uint32_t position, bool compute_logits = true);
 
+  /// Writes the K/V cache entries of `tokens.size()` consecutive positions in
+  /// batches: row i pairs input token tokens[i] with target hidden state
+  /// hidden[i] at start_position + i. Only the projections the cache needs run.
+  void PrimeBatch(std::span<const tokenization::TokenId> tokens,
+                  std::span<const float> hidden, std::uint32_t start_position);
+
+  /// Serialized cache state for snapshots: positions, then the K/V planes of
+  /// the valid prefix in both precisions.
+  [[nodiscard]] std::size_t StateBytes() const noexcept;
+  void SaveState(std::span<std::uint8_t> destination) const;
+  void LoadState(std::span<const std::uint8_t> source);
+  [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept;
+  [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
+      const QwenMtpGpuModel& model, std::uint32_t max_context);
+
   [[nodiscard]] tokenization::TokenId ForwardFeedback(
       tokenization::TokenId input_token, std::uint32_t position,
       bool compute_logits = true);
@@ -102,6 +123,9 @@ public:
   }
   [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
     return model_->GetConfig().hidden_size;
+  }
+  [[nodiscard]] bool IsMoe() const noexcept {
+    return model_->GetConfig().IsMoe();
   }
 
 private:
@@ -136,10 +160,19 @@ private:
   float* d_ffn_out_{nullptr};
   float* d_feedback_hidden_{nullptr};
   float* d_logits_{nullptr};
+  float* d_moe_buffer_{nullptr};
+  QwenMoeScratch moe_;
   float* d_kv_cache_{nullptr};
   void* d_kv_cache_f16_{nullptr};
   float* d_split_k_scratch_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
+
+  static constexpr std::size_t kPrimeChunk = 1024;
+  void EnsurePrimeScratch();
+  std::uint32_t* d_prime_tokens_{nullptr};
+  float* d_prime_buffer_{nullptr};
+  void* d_prime_bf16_{nullptr};
+  std::size_t prime_buffer_elements_{0};
 
   models::qwen::vision::DeviceInput* vision_input_{
       nullptr};  // owned by the target session
@@ -189,6 +222,34 @@ public:
   void UpdateTargetHidden(std::span<const float> hidden) override;
   void Reset() noexcept override;
 
+  void DiscardPendingTargetContext(std::uint32_t position) override;
+  /// Records the state a cancellation rewinds to, for steps another backend
+  /// proposes. Call once per step before the committed rows arrive.
+  void MarkStep() {
+    step_hidden_ = target_hidden_;
+    step_checkpoint_ = executor_->GetNextPosition();
+    step_valid_ = true;
+  }
+  [[nodiscard]] std::uint32_t NextPosition() const noexcept {
+    return executor_->GetNextPosition();
+  }
+  [[nodiscard]] bool Primed() const noexcept { return primed_; }
+  [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
+    return target_hidden_.size();
+  }
+  [[nodiscard]] std::pair<std::size_t, std::size_t> RequestMemoryBytes()
+      const override {
+    const auto usage = executor_->GetMemoryUsage();
+    return {usage.request_state_bytes, usage.temporary_scratch_bytes};
+  }
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const override;
+  [[nodiscard]] std::unique_ptr<speculative::IDraftBackendSnapshot> Snapshot()
+      const override;
+  void RestoreSnapshot(
+      const speculative::IDraftBackendSnapshot& snapshot) override;
+  void RestorePersistentSnapshot(
+      std::span<const std::uint8_t> payload) override;
+
   [[nodiscard]] const std::string& GetLastError() const noexcept {
     return last_error_;
   }
@@ -196,6 +257,8 @@ public:
 private:
   QwenMtpGpuDraftBackend(std::unique_ptr<QwenMtpGpuExecutor> executor,
                          QwenMtpGpuDraftConfig config);
+  [[nodiscard]] std::vector<std::uint8_t> SerializeState() const;
+  void LoadSerializedState(std::span<const std::uint8_t> payload);
 
   std::unique_ptr<QwenMtpGpuExecutor> executor_;
   QwenMtpGpuDraftConfig config_;
@@ -203,6 +266,9 @@ private:
   std::vector<float> proposal_target_hidden_;
   std::vector<float> committed_target_hidden_;
   std::vector<tokenization::TokenId> proposed_tokens_;
+  std::vector<float> step_hidden_;
+  std::uint32_t step_checkpoint_{0};
+  bool step_valid_{false};
   tokenization::TokenId proposal_input_{0};
   std::uint32_t proposal_checkpoint_{0};
   bool primed_{false};

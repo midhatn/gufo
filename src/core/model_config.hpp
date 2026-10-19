@@ -33,6 +33,16 @@ struct ModelConfig {
   float rope_scale{1.0F};
   bool is_text_only{true};
 
+  // Mixture-of-experts feed-forward (qwen35moe); all zero for dense models.
+  std::uint32_t num_experts{0};
+  std::uint32_t num_experts_used{0};
+  std::uint32_t expert_ff{0};
+  std::uint32_t shared_expert_ff{0};
+
+  [[nodiscard]] constexpr bool IsMoe() const noexcept {
+    return num_experts > 0;
+  }
+
   [[nodiscard]] constexpr std::uint32_t AttentionSize() const noexcept {
     return num_attention_heads * head_dim;
   }

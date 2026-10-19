@@ -90,11 +90,6 @@ __global__ void SyncTiledAttentionKvPrefixKernel(
 namespace {
 
 constexpr std::uint32_t kHeadDim = detail::kTiledAttentionHeadDim;
-constexpr std::uint32_t kQueryHeads = detail::kTiledAttentionQueryHeads;
-constexpr std::uint32_t kKvHeads = detail::kTiledAttentionKvHeads;
-constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
-constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
-constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
@@ -140,7 +135,8 @@ constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 // dimension, which is what keeps Q in registers at 64 VGPRs. Growing kQueryRows
 // and shrinking kKeys in step therefore trades nothing in the tiling but halves
 // the K/V bytes each block pulls per query row -- the dominant cost.
-template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor = false>
+template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kHeadMajor,
+         std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
 __launch_bounds__(256, 2) __global__
     void WmmaCausalAttention(const float* __restrict__ q,
                              const float* __restrict__ gate,
@@ -150,6 +146,10 @@ __launch_bounds__(256, 2) __global__
                              std::uint32_t start_pos, std::size_t batch_size,
                              float* __restrict__ lse_out,
                              std::uint32_t key_begin) {
+  constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+  constexpr std::uint32_t kAttnWidth = kQueryHeads * kHeadDim;
+  constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
+  static_assert(kGqa % kWmmaHeads == 0, "head pairs must divide the GQA group");
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
@@ -591,6 +591,7 @@ __launch_bounds__(256, 2) __global__
 
 // FFN scratch is idle during attention. Keep K head-major and transpose each
 // 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
+template<std::uint32_t kKvHeads>
 __global__ void PackAttentionHeads(const __half* keys, const __half* values,
                                    __half* packed_keys, __half* packed_values,
                                    std::uint32_t length) {
@@ -632,7 +633,8 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
   }
 }
 
-bool LaunchQwenWmmaAttention(
+template<std::uint32_t kQueryHeads, std::uint32_t kKvHeads>
+bool LaunchWmmaGeometry(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
@@ -640,19 +642,8 @@ bool LaunchQwenWmmaAttention(
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
     float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
     std::span<float> packed_k_workspace, std::span<float> packed_v_workspace) {
-  const detail::AttentionSupportParams support_params{
-      .batch_size = batch_size,
-      .start_pos = start_pos,
-      .max_context = max_context,
-      .num_heads = num_heads,
-      .num_kv_heads = num_kv_heads,
-      .head_dim = head_dim,
-      .has_k_cache_f16 = k_cache_f16 != nullptr,
-      .has_v_cache_f16 = v_cache_f16 != nullptr,
-  };
-  if (!detail::IsTiledAttentionSupported(support_params)) {
-    return false;
-  }
+  constexpr std::uint32_t kGqa = kQueryHeads / kKvHeads;
+  constexpr std::uint32_t kKvWidth = kKvHeads * kHeadDim;
 
   constexpr std::size_t block_size = 256;
   const std::size_t layer_cache_offset =
@@ -703,25 +694,59 @@ bool LaunchQwenWmmaAttention(
       const auto heads = std::min(heads_per_group, kKvHeads - first);
       const std::size_t query_offset =
           static_cast<std::size_t>(first) * kGqa * kHeadDim;
-      PackAttentionHeads<<<dim3(heads, (length + 15u) / 16u), block_size, 0,
-                           stream>>>(layer_k + first * kHeadDim,
-                                     layer_v + first * kHeadDim, packed_k,
-                                     packed_v, length);
+      PackAttentionHeads<kKvHeads>
+          <<<dim3(heads, (length + 15u) / 16u), block_size, 0, stream>>>(
+              layer_k + first * kHeadDim, layer_v + first * kHeadDim, packed_k,
+              packed_v, length);
       const dim3 group_grid(grid.x, heads * (kGqa / kWmmaHeads));
-      WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
-          <<<group_grid, block_size, 0, stream>>>(
-              q + query_offset, gate ? gate + query_offset : nullptr, packed_k,
-              packed_v, out_context + query_offset, start_pos, batch_size,
-              lse_out ? lse_out + first * kGqa * batch_size : nullptr,
-              key_begin);
+      WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true, kQueryHeads,
+                          kKvHeads><<<group_grid, block_size, 0, stream>>>(
+          q + query_offset, gate ? gate + query_offset : nullptr, packed_k,
+          packed_v, out_context + query_offset, start_pos, batch_size,
+          lse_out ? lse_out + first * kGqa * batch_size : nullptr, key_begin);
     }
     return true;
   }
-  WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys>
+  WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, false, kQueryHeads, kKvHeads>
       <<<grid, block_size, 0, stream>>>(q, gate, layer_k, layer_v, out_context,
                                         start_pos, batch_size, lse_out,
                                         key_begin);
   return true;
+}
+
+bool LaunchQwenWmmaAttention(
+    const float* q, const float* k, const float* v, const float* gate,
+    float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
+    float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
+    std::span<float> packed_k_workspace, std::span<float> packed_v_workspace) {
+  const detail::AttentionSupportParams support_params{
+      .batch_size = batch_size,
+      .start_pos = start_pos,
+      .max_context = max_context,
+      .num_heads = num_heads,
+      .num_kv_heads = num_kv_heads,
+      .head_dim = head_dim,
+      .has_k_cache_f16 = k_cache_f16 != nullptr,
+      .has_v_cache_f16 = v_cache_f16 != nullptr,
+  };
+  if (!detail::IsWmmaAttentionSupported(support_params)) {
+    return false;
+  }
+  if (num_heads == 24 && num_kv_heads == 4) {
+    return LaunchWmmaGeometry<24, 4>(
+        q, k, v, gate, k_cache, v_cache, k_cache_f16, v_cache_f16, out_context,
+        layer_idx, start_pos, batch_size, max_context, num_heads, num_kv_heads,
+        head_dim, stream, lse_out, key_begin, skip_kv_write, packed_k_workspace,
+        packed_v_workspace);
+  }
+  return LaunchWmmaGeometry<16, 2>(
+      q, k, v, gate, k_cache, v_cache, k_cache_f16, v_cache_f16, out_context,
+      layer_idx, start_pos, batch_size, max_context, num_heads, num_kv_heads,
+      head_dim, stream, lse_out, key_begin, skip_kv_write, packed_k_workspace,
+      packed_v_workspace);
 }
 
 }  // namespace gufo::hip

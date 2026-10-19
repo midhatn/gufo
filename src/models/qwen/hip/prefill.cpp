@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <thread>
 
@@ -61,10 +62,41 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     throw std::length_error("prompt exceeds the GPU context length");
   }
 
+  // With the NPU offload, consecutive full chunks advance in pairs so the NPU
+  // stages of one overlap the GPU work of the other.
+  const std::size_t max_batch = arena_.GetMaxBatch();
+  const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
+  QwenNpuFfn* const npu_ffn = model_->NpuFfn();
+  const bool lockstep = npu_ffn != nullptr && npu_ffn->Tokens() == max_batch &&
+                        !capture_prompt_hidden_ &&
+                        vision_input_.rope() == nullptr &&
+                        (lockstep_env == nullptr || lockstep_env[0] != '0');
+
+  static const std::size_t kMinPairedTokens = [] {
+    const char* v = std::getenv("GUFO_QWEN_PAIR_MIN");
+    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
+                        : std::size_t{5000};
+  }();
   tokenization::TokenId next_token = 0;
   for (std::size_t offset = 0; offset < prompt_tokens.size();
        offset += arena_.GetMaxBatch()) {
     CheckPrefillCancellation();
+    const std::size_t remaining = prompt_tokens.size() - offset;
+    if (lockstep && remaining >= kMinPairedTokens) {
+      // Two full chunks, or one shorter run split in halves: either way the
+      // NPU stages of one chunk overlap the GPU work of the other.
+      const std::size_t first =
+          remaining >= 2 * max_batch ? max_batch : (remaining + 1) / 2;
+      const std::size_t second = std::min(max_batch, remaining - first);
+      const bool is_last = first + second == remaining;
+      next_token =
+          ForwardPromptChunkPair(prompt_tokens.subspan(offset, first),
+                                 prompt_tokens.subspan(offset + first, second),
+                                 start_pos + static_cast<std::uint32_t>(offset),
+                                 compute_logits && is_last);
+      offset += first + second - max_batch;
+      continue;
+    }
     const std::size_t chunk_size = std::min<std::size_t>(
         arena_.GetMaxBatch(), prompt_tokens.size() - offset);
     const bool is_last = offset + chunk_size == prompt_tokens.size();

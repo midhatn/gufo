@@ -7,6 +7,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -25,7 +26,10 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/models/qwen/hip/detail/prefill_task.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
+#include "src/models/qwen/hip/moe_prefill.hpp"
+#include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -110,6 +114,15 @@ public:
     return weight_regions_.size();
   }
   [[nodiscard]] std::size_t GetResidentBytes() const noexcept;
+  /// NPU offload of the FFN gate/up projections, or null when it is off.
+  [[nodiscard]] QwenNpuFfn* NpuFfn() const;
+  /// Grouped-expert prefill for qwen35moe, or null when unavailable.
+  [[nodiscard]] QwenMoePrefill* MoePrefill(std::uint32_t max_tokens) const;
+  /// bf16 [hi, hi, lo] weights of the router and shared-expert gate rows of
+  /// `layer` (kRouterSplitRows rows of 3 * hidden), built on first use; null
+  /// when the layer's gate tensors are not F32 or BF16.
+  [[nodiscard]] const std::uint16_t* RouterSplitWeights(
+      std::uint32_t layer) const;
 
 private:
   // Keep the mapped GGUF storage alive until every registered region is
@@ -119,6 +132,12 @@ private:
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
   std::shared_ptr<models::qwen::vision::Encoder> vision_;
+  mutable std::once_flag npu_once_;
+  mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
+  mutable std::once_flag moe_prefill_once_;
+  mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
+  mutable std::vector<std::uint16_t*> router_split_;
+  mutable std::mutex router_split_mutex_;
 };
 
 class QwenGpuSnapshot final {
@@ -240,6 +259,61 @@ template<typename T>
   return pointer == nullptr ? nullptr : pointer + offset;
 }
 
+/// The per-chunk prefill scratch of an arena. A second set lets two chunks
+/// advance layer by layer in one stream; persistent KV and recurrent state are
+/// shared and never part of a bank.
+struct QwenPrefillBank {
+  float* hidden{nullptr};
+  float* normed{nullptr};
+  float* q{nullptr};
+  float* k{nullptr};
+  float* v{nullptr};
+  float* attn_out{nullptr};
+  float* ffn_gate{nullptr};
+  float* ffn_up{nullptr};
+  float* ffn_act{nullptr};
+  float* ffn_out{nullptr};
+  float* ssm_qkv{nullptr};
+  float* conv_out{nullptr};
+  float* ssm_gate{nullptr};
+  float* ssm_out{nullptr};
+  float* alpha_buf{nullptr};
+  float* beta_buf{nullptr};
+  float* ssm_kq_scales{nullptr};
+  float* ssm_alpha_beta{nullptr};
+  std::uint32_t* prompt_tokens{nullptr};
+  void* scratch_bf16{nullptr};
+  void* scratch_q8_act{nullptr};
+};
+
+/// Device scratch of the single-token MoE feed-forward (qwen35moe decode).
+struct QwenMoeScratch {
+  float* router_logits{nullptr};
+  float* shared_logit{nullptr};
+  std::int32_t* ids{nullptr};
+  float* weights{nullptr};
+  float* shared_weight{nullptr};
+  float* act{nullptr};
+  float* down_out{nullptr};
+  float* shared_gate{nullptr};
+  float* shared_up{nullptr};
+  float* shared_act{nullptr};
+  float* shared_out{nullptr};
+};
+
+/// Device scratch of the batched qwen35moe prefill feed-forward.
+struct QwenMoePrefillScratch {
+  __half* x_half{nullptr};
+  float* router_logits{nullptr};
+  float* shared_logit{nullptr};
+  float* shared_gate{nullptr};
+  float* shared_up{nullptr};
+  float* shared_act{nullptr};
+  float* shared_out{nullptr};
+  std::uint16_t* router_x{nullptr};
+  float* router_y{nullptr};
+};
+
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
@@ -256,6 +330,11 @@ public:
   void Reset();
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
+  /// The scratch currently installed in the d_* members, and a way to install
+  /// another. The second bank is allocated on first use; null on failure.
+  [[nodiscard]] QwenPrefillBank CurrentBank() const noexcept;
+  void UseBank(const QwenPrefillBank& bank) noexcept;
+  [[nodiscard]] const QwenPrefillBank* SecondBank();
   [[nodiscard]] bool BeginSsmReplayCapture();
   void DisableSsmReplayCapture();
   void MarkSsmReplayPosition(std::uint32_t position) noexcept;
@@ -300,6 +379,8 @@ public:
   void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};
   float* d_target_layer_features{nullptr};
+  QwenMoeScratch moe;
+  QwenMoePrefillScratch moe_prefill;
 
   hipStream_t stream{nullptr};
   hipblasHandle_t hipblas_handle{nullptr};
@@ -367,6 +448,9 @@ private:
   std::size_t replay_captured_positions_{0};
   bool has_saved_state_{false};
   bool replay_capture_active_{false};
+  std::unique_ptr<QwenPrefillBank> second_bank_;
+  float* d_moe_buf_{nullptr};
+  void* d_moe_prefill_buf_{nullptr};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -563,6 +647,21 @@ private:
   [[nodiscard]] tokenization::TokenId ForwardPromptChunk(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t start_pos, bool compute_logits);
+  /// Two consecutive full chunks advanced layer by layer in one stream, the
+  /// first on the spare scratch bank, so NPU stages overlap the other chunk's
+  /// GPU work. Returns the second chunk's token when it computes logits.
+  [[nodiscard]] tokenization::TokenId ForwardPromptChunkPair(
+      std::span<const tokenization::TokenId> first_tokens,
+      std::span<const tokenization::TokenId> second_tokens,
+      std::uint32_t start_pos, bool compute_logits);
+  /// Batched routed-expert feed-forward of a qwen35moe layer; false leaves the
+  /// per-token path to run.
+  [[nodiscard]] bool MoePrefillFfn(const models::QwenLayerWeights& layer,
+                                   std::uint32_t layer_index,
+                                   std::size_t batch_size);
+  [[nodiscard]] detail::PrefillTask PrefillChunkTask(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t start_pos, bool compute_logits, int bank);
   [[nodiscard]] std::vector<tokenization::TokenId>
   ForwardDecodeEquivalentVerificationChunk(
       std::span<const tokenization::TokenId> candidate_tokens,
@@ -590,6 +689,7 @@ private:
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
+  bool moe_warmed_{false};
 };
 
 }  // namespace gufo::hip

@@ -155,15 +155,37 @@ struct QwenLayerWeights {
   QwenTensorRef ffn_gate;
   QwenTensorRef ffn_up;
   QwenTensorRef ffn_down;
+
+  // Mixture-of-experts feed-forward (qwen35moe layers use these instead).
+  QwenTensorRef ffn_gate_inp;        ///< router, [hidden, experts] F32
+  QwenTensorRef ffn_gate_exps;       ///< [experts][expert_ff][hidden]
+  QwenTensorRef ffn_up_exps;         ///< [experts][expert_ff][hidden]
+  QwenTensorRef ffn_down_exps;       ///< [experts][hidden][expert_ff]
+  QwenTensorRef ffn_gate_shexp;      ///< shared expert gate
+  QwenTensorRef ffn_up_shexp;        ///< shared expert up
+  QwenTensorRef ffn_down_shexp;      ///< shared expert down
+  QwenTensorRef ffn_gate_inp_shexp;  ///< shared expert scalar gate, [hidden]
 };
 
 /// Full model tensor references mapped directly from GGUF storage.
+/// The next-token prediction head some MoE checkpoints embed after the last
+/// block: a full-attention layer plus the projection that fuses the token
+/// embedding with the previous hidden state.
+struct QwenEmbeddedMtp {
+  QwenTensorRef embedding_norm;
+  QwenTensorRef hidden_norm;
+  QwenTensorRef fusion_projection;
+  QwenTensorRef shared_head_norm;
+  QwenLayerWeights layer;
+};
+
 struct QwenModelWeights {
   core::ModelConfig config;
   QwenTensorRef token_embd;
   std::vector<QwenLayerWeights> layers;
   QwenTensorRef output_norm;
   QwenTensorRef output;
+  std::optional<QwenEmbeddedMtp> mtp;
 
   /// Loads and binds weights from a GgufReader.
   [[nodiscard]] static std::optional<QwenModelWeights> LoadFromGguf(

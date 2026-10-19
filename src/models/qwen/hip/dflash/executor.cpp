@@ -458,6 +458,32 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
     return;
   }
 
+  // The draft only proposes tokens (the target verifies them), so long
+  // injections round the features to BF16 and use the matrix cores instead of
+  // the sixteen-row exact kernel.
+  constexpr std::size_t kInjectGemmMinTokens = 256;
+  if (is_bf16 && num_tokens >= kInjectGemmMinTokens) {
+    if (inject_gemm_ == nullptr) {
+      inject_gemm_ = std::make_unique<HipblasLtGemm>();
+    }
+    const std::size_t elements = num_tokens * input_size;
+    if (inject_bf16_elements_ < elements) {
+      HIP_CHECK(hipStreamSynchronize(stream_));
+      if (d_inject_bf16_ != nullptr) {
+        HIP_CHECK(hipFree(d_inject_bf16_));
+        d_inject_bf16_ = nullptr;
+        inject_bf16_elements_ = 0;
+      }
+      HIP_CHECK(hipMalloc(&d_inject_bf16_, elements * sizeof(hip_bfloat16)));
+      inject_bf16_elements_ = elements;
+    }
+    LaunchFloatToBfloat16(input, d_inject_bf16_, elements, stream_);
+    if (inject_gemm_->RunBf16(weight.data, d_inject_bf16_, output, num_tokens,
+                              output_size, input_size, stream_)) {
+      return;
+    }
+  }
+
   for (std::size_t offset = 0; offset < num_tokens;) {
     const std::size_t chunk =
         is_bf16 && num_tokens - offset >= 16
@@ -537,9 +563,12 @@ void QwenDFlashGpuExecutor::Free() noexcept {
     (void)hipFree(d_out_token_);
   if (d_bf16_input_ != nullptr)
     (void)hipFree(d_bf16_input_);
+  if (d_inject_bf16_ != nullptr)
+    (void)hipFree(d_inject_bf16_);
   if (d_batch_scratch_ != nullptr)
     (void)hipFree(d_batch_scratch_);
   hipblaslt_gemm_.reset();
+  inject_gemm_.reset();
   if (hipblas_handle_ != nullptr) {
     (void)hipblasDestroy(hipblas_handle_);
     hipblas_handle_ = nullptr;

@@ -1,0 +1,75 @@
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_MOE_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_MOE_HPP_
+
+#include <cstddef>
+#include <cstdint>
+
+#include "src/core/gguf_reader.hpp"
+
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+
+namespace gufo::hip {
+
+/// Softmax over `num_experts` router logits, selection of the `num_used`
+/// highest-probability experts (ties resolved toward the lower index), and
+/// renormalization of the selected weights to sum one. `shared_logit` is the
+/// single scalar router score for the shared expert; its sigmoid is written to
+/// `shared_weight[0]`. Runs as one block so the whole vocabulary of experts
+/// stays in shared memory.
+void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
+                         std::int32_t* expert_ids, float* expert_weights,
+                         float* shared_weight, std::uint32_t num_experts,
+                         std::uint32_t num_used, std::uint32_t rows = 1,
+                         hipStream_t stream = nullptr);
+
+/// Router logits of `experts` expert rows and the shared-expert gate in one
+/// launch, bit-identical to a GEMV per tensor.
+void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
+                           const void* shared, core::GgmlType shared_type,
+                           const float* x, float* router_logits,
+                           float* shared_logit, std::size_t experts,
+                           std::size_t hidden, hipStream_t stream = nullptr);
+
+/// out[r] = [a[r], b[r]] for rows of `cols` floats.
+void LaunchConcatRows(const float* a, const float* b, float* out,
+                      std::size_t rows, std::size_t cols,
+                      hipStream_t stream = nullptr);
+
+/// Rows of the split router weight matrix: experts, the shared-expert gate and
+/// padding to a multiple of eight.
+inline constexpr std::size_t kRouterSplitRows = 264;
+
+/// fp32-accurate router logits through one bf16 GEMM: each fp32 value splits
+/// into a high and a low bf16 half and the K dimension triples to
+/// [hi, lo, hi] against weight rows [hi, hi, lo]. Rows of the weight matrix
+/// are `rows` consecutive source rows written at `first_row` of `dst`.
+void LaunchRouterSplitActivations(const float* x, std::uint16_t* dst,
+                                  std::size_t rows, std::size_t k,
+                                  hipStream_t stream = nullptr);
+void LaunchRouterSplitWeights(const void* src, bool src_bf16,
+                              std::uint16_t* dst, std::size_t first_row,
+                              std::size_t rows, std::size_t k,
+                              hipStream_t stream = nullptr);
+/// y [rows][ld] -> router [rows][experts] and shared [rows].
+void LaunchRouterSplitLogits(const float* y, float* router, float* shared,
+                             std::size_t rows, std::size_t experts,
+                             std::size_t ld, hipStream_t stream = nullptr);
+
+/// Elementwise weighted accumulation: out += scale * add.
+void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
+                               std::size_t dim, hipStream_t stream = nullptr);
+
+/// out[i] = sum_s slot_weight[s] * slot_out[s][i] + shared_weight[0] *
+/// shared_out[i]: the routed experts and the gated shared expert in one pass.
+void LaunchMoeCombine(float* out, const float* slot_out,
+                      const float* slot_weight, const float* shared_out,
+                      const float* shared_weight, std::uint32_t used,
+                      std::uint32_t hidden, std::uint32_t rows = 1,
+                      hipStream_t stream = nullptr);
+
+}  // namespace gufo::hip
+
+#endif  // defined(ENGINE_ENABLE_HIP)
+
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_MOE_HPP_

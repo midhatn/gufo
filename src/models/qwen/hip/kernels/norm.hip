@@ -9,6 +9,39 @@
 
 namespace gufo::hip {
 
+/// a += b followed by out = RMSNorm(a); the sums and their order match
+/// ResidualAddKernel followed by the generic RMSNormKernel.
+__global__ void ResidualAddRMSNormKernel(float* __restrict__ a,
+                                         const float* __restrict__ b,
+                                         const float* __restrict__ weight,
+                                         float* __restrict__ out,
+                                         std::size_t dim, float eps) {
+  __shared__ float s_sum[256];
+  const std::size_t tid = threadIdx.x;
+  float sum_sq = 0.0F;
+  for (std::size_t i = tid; i < dim; i += blockDim.x) {
+    const float val = a[i] + b[i];
+    a[i] = val;
+    sum_sq += val * val;
+  }
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float mean_sq = s_sum[0] / static_cast<float>(dim);
+  const float inv_rms = rsqrtf(mean_sq + eps);
+  for (std::size_t i = tid; i < dim; i += blockDim.x) {
+    const float w = (weight != nullptr) ? weight[i] : 1.0F;
+    out[i] = (a[i] * inv_rms) * w;
+  }
+}
+
 template<std::size_t CachedDim = 0>
 __global__ void RMSNormKernel(const float* __restrict__ x,
                               const float* __restrict__ weight,
@@ -109,6 +142,11 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
   } else {
     RMSNormKernel<><<<1, 256, 0, stream>>>(x, weight, out, dim, eps);
   }
+}
+void LaunchResidualAddRMSNorm(float* a, const float* b, const float* weight,
+                              float* out, std::size_t dim, float eps,
+                              hipStream_t stream) {
+  ResidualAddRMSNormKernel<<<1, 256, 0, stream>>>(a, b, weight, out, dim, eps);
 }
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,

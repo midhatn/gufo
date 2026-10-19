@@ -57,7 +57,14 @@ public:
   /// Enqueues `count` runs reading A buffer a_id and B buffers b_ids[i],
   /// writing C buffers c_ids[i]. The runs execute in order on the NPU.
   bool Submit(hipStream_t stream, int a_id, const int* b_ids, const int* c_ids,
-              int count);
+              int count, int program = 0);
+  /// Loads another instruction stream for the same kernel (a runtime-K program
+  /// serving a different reduction length) and returns its id for Submit, or
+  /// -1. The A and B operand sizes for reduction length k are ABytes(k) and
+  /// BBytes(k).
+  int AddProgram(const std::string& insts, std::string* error);
+  std::size_t ABytes(std::uint32_t k) const noexcept;
+  std::size_t BBytes(std::uint32_t k) const noexcept;
   /// Blocks the stream until every submitted run has finished and its C buffer
   /// is readable by the GPU.
   bool Wait(hipStream_t stream);
@@ -82,5 +89,10 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Hands the qwen executor the factory for the Qwen3.8-27B FFN NPU offload.
+void RegisterQwenNpuFfn();
+/// Hands the qwen executor the grouped-expert prefill for qwen35moe.
+void RegisterQwenMoePrefill();
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

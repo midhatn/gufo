@@ -6,6 +6,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 
 namespace gufo::hip {
 
@@ -74,6 +75,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     if (graph_executor_.IsCapturedFor(graph_key)) {
       launch_captured_graph();
     } else {
+      // The expert kernels draw their workspace from a growing pool, which
+      // must not happen while a graph is being captured.
+      if (config.IsMoe() && !moe_warmed_) {
+        WarmMoeDecode(weights_, config, arena_.moe, arena_.d_normed,
+                      arena_.stream);
+        moe_warmed_ = true;
+      }
       // Target feature taps change the captured copy operations.
       if (graph_executor_.IsCaptured())
         graph_executor_.Reset();

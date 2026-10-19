@@ -15,6 +15,9 @@
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
+#if defined(ENGINE_ENABLE_HIP)
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+#endif
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -189,6 +192,10 @@ int main(int argc, char* argv[]) {
       execv(self.data(), argv);
     }
   }
+#if defined(ENGINE_ENABLE_HIP)
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenNpuFfn();
+  gufo::models::qwen38_flash_next::rocm::RegisterQwenMoePrefill();
+#endif
   const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
   return run(args);
 }

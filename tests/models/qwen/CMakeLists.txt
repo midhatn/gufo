@@ -33,6 +33,12 @@ add_qwen_cpu_test(qwen_oracle_test
   tests/models/qwen/cpu/model_oracle_test.cpp
   "cpu;models;qwen;oracles")
 
+if (GUFO_BUILD_TOOLS)
+  add_executable(qwen35moe_logits_tool
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen/cpu/qwen35moe_logits_tool.cpp)
+  target_link_libraries(qwen35moe_logits_tool PRIVATE gufo_core)
+endif()
+
 add_qwen_cpu_test(qwen_l1_norm_module_test
   tests/models/qwen/modules/norm_test.cpp
   "cpu;models;qwen;module;norm")
@@ -125,4 +131,11 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_l2_gpu_integration_test
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
+
+  if (GUFO_BUILD_TOOLS)
+    add_executable(qwen35moe_gpu_logits_tool
+      ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)
+    target_link_libraries(qwen35moe_gpu_logits_tool PRIVATE
+      gufo_core gufo_qwen38_flash_next hip::host roc::hipblas roc::rocblas)
+  endif()
 endif()

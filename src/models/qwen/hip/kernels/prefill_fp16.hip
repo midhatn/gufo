@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <stdexcept>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 namespace gufo::hip {
@@ -226,8 +227,11 @@ __launch_bounds__(WM * WN * 32) __global__
                                const short* __restrict__ x,
                                float* __restrict__ y, int batch, int m, int k,
                                const float* __restrict__ gate,
-                               const void* __restrict__ up = nullptr) {
+                               const void* __restrict__ up = nullptr,
+                               int ldy = 0, int y_row0 = 0) {
   constexpr bool Paired = Epilogue == HalfEpilogue::kGateUp;
+  const std::size_t pitch =
+      ldy != 0 ? static_cast<std::size_t>(ldy) : static_cast<std::size_t>(m);
   constexpr bool Mixed = Paired && Type != UpType;
   constexpr bool UpRaw = UpType == gufo::core::GgmlType::kQ4_K ||
                          UpType == gufo::core::GgmlType::kQ5_K;
@@ -572,7 +576,8 @@ __launch_bounds__(WM * WN * 32) __global__
           if (Complete || (row < m && token < batch)) {
             const float g = acc[i][j][l], u = acc[i + 1][j][l];
             const float sig = 1.0F / (1.0F + expf(-g));
-            reinterpret_cast<__half*>(y)[std::size_t(token) * m + row] =
+            reinterpret_cast<__half*>(y)[std::size_t(token) * pitch +
+                                         y_row0 + row] =
                 RoundActivation(__fmul_rn(g * sig, u));
           }
         }
@@ -589,7 +594,7 @@ __launch_bounds__(WM * WN * 32) __global__
         for (int l = 0; l < 8; ++l) {
           const int token = t0 + 2 * l + hi;
           if (Complete || (row < m && token < batch))
-            store(std::size_t(token) * m + row, acc[i][j][l]);
+            store(std::size_t(token) * pitch + row, acc[i][j][l]);
         }
       }
     }
@@ -616,12 +621,12 @@ __launch_bounds__(WM * WN * 32) __global__
         const int t0 = t_block + (((wt * WTS) + j) * 16);
         if (t0 + 16 <= batch && r0 + 16 <= m) {
           const std::size_t base =
-              (static_cast<std::size_t>(t0) * m) + static_cast<std::size_t>(r0);
+              (static_cast<std::size_t>(t0) * pitch) + static_cast<std::size_t>(r0);
 #pragma unroll
           for (int s = 0; s < 256 / WaveSize; ++s) {
             const int flat = (s * WaveSize) + lane;
             store(
-                base + (static_cast<std::size_t>(flat >> 4) * m) + (flat & 15),
+                base + (static_cast<std::size_t>(flat >> 4) * pitch) + (flat & 15),
                 scratch[flat]);
           }
         } else {
@@ -631,7 +636,7 @@ __launch_bounds__(WM * WN * 32) __global__
             const int tok = t0 + (flat >> 4);
             const int r = r0 + (flat & 15);
             if (tok < batch && r < m) {
-              store((static_cast<std::size_t>(tok) * m) + r, scratch[flat]);
+              store((static_cast<std::size_t>(tok) * pitch) + r, scratch[flat]);
             }
           }
         }
@@ -723,7 +728,7 @@ void LaunchFloatToFp16(const float* x, void* y, std::size_t n,
 template<HalfEpilogue Epilogue>
 void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
                 float* y, std::size_t batch, std::size_t m, std::size_t k,
-                const float* gate, hipStream_t stream) {
+                const float* gate, hipStream_t stream, std::size_t ldy = 0) {
   const auto launch = [&]<gufo::core::GgmlType Type>() {
     constexpr bool LargeKvTile = Type == gufo::core::GgmlType::kQ4_K ||
                                  Type == gufo::core::GgmlType::kQ5_K ||
@@ -732,7 +737,8 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
     const auto large = [&]<bool Full>() {
       HalfPrefillGemmKernel<256, 256, 8, 4, Type, Epilogue, Full>
           <<<dim3((batch + 255) / 256, (m + 255) / 256), 1024, 0, stream>>>(
-              w, static_cast<const short*>(x), y, batch, m, k, gate);
+              w, static_cast<const short*>(x), y, batch, m, k, gate, nullptr,
+              static_cast<int>(ldy));
     };
     if (Epilogue == HalfEpilogue::kSwiGLU || m >= 4096 ||
         (LargeKvTile && m >= 1024 && batch >= 1024)) {
@@ -750,11 +756,13 @@ void DirectGemm(gufo::core::GgmlType type, const void* w, const void* x,
       if (m >= 1024) {
         HalfPrefillGemmKernel<64, 128, 2, 4, Type, Epilogue>
             <<<dim3((batch + 127) / 128, (m + 63) / 64), 256, 0, stream>>>(
-                w, static_cast<const short*>(x), y, batch, m, k, nullptr);
+                w, static_cast<const short*>(x), y, batch, m, k, nullptr, nullptr,
+                static_cast<int>(ldy));
       } else {
         HalfPrefillGemmKernel<32, 64, 2, 2, Type, Epilogue>
             <<<dim3((batch + 63) / 64, (m + 31) / 32), 128, 0, stream>>>(
-                w, static_cast<const short*>(x), y, batch, m, k, nullptr);
+                w, static_cast<const short*>(x), y, batch, m, k, nullptr, nullptr,
+                static_cast<int>(ldy));
       }
     }
   };
@@ -794,6 +802,18 @@ void LaunchBatchedQuantGEMMFp16(gufo::core::GgmlType type, const void* w,
                                 hipStream_t stream) {
   DirectGemm<HalfEpilogue::kStore>(type, w, x, y, batch, m, k, nullptr, stream);
 }
+
+void LaunchBatchedQuantGEMMFp16Rows(gufo::core::GgmlType type, const void* w,
+                                    const void* x, float* y,
+                                    std::size_t batch, std::size_t rows_total,
+                                    std::size_t k, std::size_t row_begin,
+                                    hipStream_t stream) {
+  DirectGemm<HalfEpilogue::kStore>(
+      type, static_cast<const std::uint8_t*>(w) +
+                row_begin * gufo::quant::QuantizedRowBytes(type, k),
+      x, y + row_begin, batch, rows_total - row_begin, k, nullptr, stream,
+      rows_total);
+}
 void LaunchBatchedQuantGEMMSwiGLUFp16(gufo::core::GgmlType type, const void* w,
                                       const void* x, const float* gate, void* y,
                                       std::size_t batch, std::size_t m,
@@ -811,18 +831,45 @@ void LaunchBatchedQuantGEMMResidualFp16(gufo::core::GgmlType type,
                                       nullptr, stream);
 }
 
+void LaunchBatchedQuantGEMMResidualFp16Rows(
+    gufo::core::GgmlType type, const void* w, const void* x, float* residual,
+    std::size_t batch, std::size_t rows_total, std::size_t k,
+    std::size_t row_begin, hipStream_t stream) {
+  DirectGemm<HalfEpilogue::kResidual>(
+      type, static_cast<const std::uint8_t*>(w) +
+                row_begin * gufo::quant::QuantizedRowBytes(type, k),
+      x, residual + row_begin, batch, rows_total - row_begin, k, nullptr,
+      stream, rows_total);
+}
+
 bool TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
     gufo::core::GgmlType gate_type, gufo::core::GgmlType up_type,
     const void* gate_weights, const void* up_weights, const void* x, void* y,
-    std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream) {
+    std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream,
+    std::size_t row_begin, std::size_t rows_total, bool dry_run) {
+  // A row range computes output columns [row_begin, m) of a rows_total-wide
+  // result; the weights are offset to the first row and y keeps its full pitch.
+  int ldy = 0, y_row0 = 0;
+  if (rows_total != 0) {
+    gate_weights = static_cast<const std::uint8_t*>(gate_weights) +
+                   row_begin * gufo::quant::QuantizedRowBytes(gate_type, k);
+    up_weights = static_cast<const std::uint8_t*>(up_weights) +
+                 row_begin * gufo::quant::QuantizedRowBytes(up_type, k);
+    ldy = static_cast<int>(rows_total);
+    y_row0 = static_cast<int>(row_begin);
+    m = rows_total - row_begin;
+  }
   const auto launch = [&]<gufo::core::GgmlType Type,
                           gufo::core::GgmlType UpType = Type>() {
+    if (dry_run)
+      return;
     const auto tile = [&]<bool Full>() {
       HalfPrefillGemmKernel<256, 256, 8, 4, Type, HalfEpilogue::kGateUp, Full,
                             UpType>
           <<<dim3((batch + 255) / 256, (m + 127) / 128), 1024, 0, stream>>>(
               gate_weights, static_cast<const short*>(x),
-              static_cast<float*>(y), batch, m, k, nullptr, up_weights);
+              static_cast<float*>(y), batch, m, k, nullptr, up_weights, ldy,
+              y_row0);
     };
     if constexpr ((Type == gufo::core::GgmlType::kQ4_K ||
                    Type == gufo::core::GgmlType::kQ5_K) &&

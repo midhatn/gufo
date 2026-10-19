@@ -255,5 +255,28 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
       std::move(allocations), packed_bytes, pack_seconds));
 }
 
+std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::CreateEmbedded(
+    std::shared_ptr<const QwenGpuModel> target_model, std::string* error_msg) {
+  if (target_model == nullptr || !target_model->GetWeights().mtp.has_value()) {
+    if (error_msg != nullptr) {
+      *error_msg = "the target model has no embedded MTP head";
+    }
+    return nullptr;
+  }
+  const auto& target = target_model->GetWeights();
+  const auto& mtp = *target.mtp;
+  speculative::QwenMtpWeights weights;
+  weights.config = target.config;
+  weights.token_embedding = target.token_embd;
+  weights.output = target.output;
+  weights.embedding_norm = mtp.embedding_norm;
+  weights.hidden_norm = mtp.hidden_norm;
+  weights.fusion_projection = mtp.fusion_projection;
+  weights.shared_head_norm = mtp.shared_head_norm;
+  weights.layer = mtp.layer;
+  return std::shared_ptr<const QwenMtpGpuModel>(new QwenMtpGpuModel(
+      nullptr, std::move(target_model), std::move(weights), {}, 0, 0.0));
+}
+
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

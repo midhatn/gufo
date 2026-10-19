@@ -57,6 +57,16 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
     gufo_qwen38_flash_next hip::host)
 
+  if (GUFO_ENABLE_NPU)
+    add_executable(qwen38_flash_next_npu_quant_check EXCLUDE_FROM_ALL
+      npu_quant_check.hip.cpp)
+    set_source_files_properties(npu_quant_check.hip.cpp PROPERTIES LANGUAGE HIP)
+    target_compile_definitions(qwen38_flash_next_npu_quant_check PRIVATE
+      ENGINE_ENABLE_HIP=1)
+    target_link_libraries(qwen38_flash_next_npu_quant_check PRIVATE
+      gufo_qwen38_flash_next hip::host)
+  endif()
+
   add_executable(qwen38_flash_next_attn_bench EXCLUDE_FROM_ALL attn_bench.cpp)
   target_link_libraries(qwen38_flash_next_attn_bench PRIVATE
     gufo_qwen38_flash_next hip::host)

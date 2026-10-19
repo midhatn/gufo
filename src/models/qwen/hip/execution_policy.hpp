@@ -141,6 +141,9 @@ enum class QwenGraphRejection : std::uint32_t {
   kLogitsNotRequested = 1U << 0U,
   kSplitKAttentionRequired = 1U << 1U,
   kGraphDisabled = 1U << 3U,
+  // The simple MoE FFN carries host-side top-k readback, which cannot be
+  // captured into a HIP graph. The vectorized path drops this rejection.
+  kMoeNotCapturable = 1U << 4U,
 };
 
 [[nodiscard]] constexpr QwenGraphRejection operator|(
@@ -162,7 +165,8 @@ constexpr QwenGraphRejection& operator|=(QwenGraphRejection& lhs,
 }
 
 [[nodiscard]] constexpr QwenGraphRejection ResolveQwenGraphRejections(
-    bool compute_logits, bool split_k_attention, bool graph_enabled) noexcept {
+    bool compute_logits, bool split_k_attention, bool graph_enabled,
+    bool moe_enabled = false) noexcept {
   QwenGraphRejection rejected = QwenGraphRejection::kNone;
   if (!compute_logits) {
     rejected |= QwenGraphRejection::kLogitsNotRequested;
@@ -172,6 +176,9 @@ constexpr QwenGraphRejection& operator|=(QwenGraphRejection& lhs,
   }
   if (!graph_enabled) {
     rejected |= QwenGraphRejection::kGraphDisabled;
+  }
+  if (moe_enabled) {
+    rejected |= QwenGraphRejection::kMoeNotCapturable;
   }
   return rejected;
 }

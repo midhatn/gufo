@@ -209,7 +209,7 @@ if (ENGINE_ENABLE_HIP)
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR})
   target_link_libraries(gufo_core PUBLIC hip::host roc::hipblas
-    roc::hipblaslt roc::rocblas)
+    roc::hipblaslt roc::rocblas gufo_qwen38_flash_next_mmq)
 endif()
 
 add_library(gufo_llm_cli STATIC

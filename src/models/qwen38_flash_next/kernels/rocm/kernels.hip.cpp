@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen/hip/quant_ops.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -7951,6 +7952,89 @@ __global__ void NpuEncodeWeightsQ8Kernel(
   NpuEncodeGroup(v, out + g * 9);
 }
 
+/// B groups from the K-quant and IQ rows of a Qwen 27B-style GGUF tensor
+/// (`type` is a core::GgmlType): the same layout as the Q8_0 kernel above, with
+/// each group of eight K values decoded from one 16-element sub-block.
+__global__ void NpuEncodeWeightsQuantKernel(
+    const std::uint8_t* __restrict__ w, std::uint32_t type,
+    std::size_t row_bytes, std::uint8_t* __restrict__ out, std::uint32_t row0,
+    std::uint32_t cols, std::uint32_t k_slice, std::uint32_t k_offset,
+    std::uint32_t k_valid) {
+  const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const std::size_t total = std::size_t{k_slice} * cols / 8;
+  if (g >= total) {
+    return;
+  }
+  constexpr std::uint32_t kGroupsPerTile = kNpuTileK * kNpuTileN / 8;
+  const std::size_t tile = g / kGroupsPerTile;
+  const std::uint32_t gi = static_cast<std::uint32_t>(g % kGroupsPerTile);
+  const std::uint32_t tiles_k = k_slice / kNpuTileK;
+  const std::uint32_t tile_col = static_cast<std::uint32_t>(tile / tiles_k);
+  const std::uint32_t tile_row = static_cast<std::uint32_t>(tile % tiles_k);
+  const std::uint32_t cib = gi & 7;
+  const std::uint32_t block = (gi >> 3) & 1;
+  const std::uint32_t sr = (gi >> 4) & 7;
+  const std::uint32_t sc2 = gi >> 7;
+  const std::uint32_t kk = k_offset + tile_row * kNpuTileK + sr * 8;
+  const std::uint32_t nn = tile_col * kNpuTileN + (sc2 * 2 + block) * 8 + cib;
+  float v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (kk + 8 <= k_valid) {
+    gufo::hip::QuantSub16 sub;
+    gufo::hip::DecodeQuantSub16(
+        static_cast<gufo::core::GgmlType>(type),
+        w + static_cast<std::size_t>(row0 + nn) * row_bytes, kk / 16, sub);
+    const std::uint32_t base = kk % 16;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      v[i] = (sub.scale * static_cast<float>(sub.q[base + i])) - sub.offset;
+    }
+  }
+  NpuEncodeGroup(v, out + g * 9);
+}
+
+/// One Q8_0 block of the output per thread: the 32 weights of a row of a
+/// K-quant or IQ tensor, rescaled to int8 with a half scale.
+__global__ void RequantToQ8_0Kernel(const std::uint8_t* __restrict__ src,
+                                    std::uint32_t type,
+                                    std::size_t src_row_bytes,
+                                    std::uint8_t* __restrict__ dst,
+                                    std::size_t rows, std::uint32_t k) {
+  const std::size_t index = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const std::uint32_t blocks_per_row = k / 32;
+  if (index >= rows * blocks_per_row) {
+    return;
+  }
+  const std::size_t row = index / blocks_per_row;
+  const std::uint32_t block =
+      static_cast<std::uint32_t>(index % blocks_per_row);
+  float v[32];
+  float amax = 0.0F;
+#pragma unroll
+  for (int half_index = 0; half_index < 2; ++half_index) {
+    gufo::hip::QuantSub16 sub;
+    gufo::hip::DecodeQuantSub16(static_cast<gufo::core::GgmlType>(type),
+                                src + row * src_row_bytes,
+                                block * 2 + half_index, sub);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float value =
+          (sub.scale * static_cast<float>(sub.q[i])) - sub.offset;
+      v[half_index * 16 + i] = value;
+      amax = fmaxf(amax, fabsf(value));
+    }
+  }
+  const __half scale = __float2half(amax / 127.0F);
+  const float inverse = amax > 0.0F ? 1.0F / __half2float(scale) : 0.0F;
+  std::uint8_t* out = dst + index * 34;
+  out[0] = reinterpret_cast<const std::uint8_t*>(&scale)[0];
+  out[1] = reinterpret_cast<const std::uint8_t*>(&scale)[1];
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    out[2 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(
+        fminf(127.0F, fmaxf(-127.0F, rintf(v[i] * inverse)))));
+  }
+}
+
 /// Decodes a C tile stream into rows of `out` (pitch out_pitch, first column
 /// col0). With accumulate the values add to what is there.
 __global__ void NpuDecodeOutputKernel(const std::uint8_t* __restrict__ in,
@@ -8019,7 +8103,8 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
                                 const std::uint8_t* __restrict__ gate_lo,
                                 const std::uint8_t* __restrict__ up_lo,
                                 __half* __restrict__ out, std::uint32_t tokens,
-                                std::uint32_t cols, std::uint32_t valid_cols) {
+                                std::uint32_t cols, std::uint32_t valid_cols,
+                                std::size_t out_pitch, std::uint32_t out_col0) {
   const std::size_t g = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
   if (g >= std::size_t{tokens} * cols / 8) {
     return;
@@ -8064,21 +8149,22 @@ __global__ void NpuSwigluKernel(const std::uint8_t* __restrict__ gate_in,
     }
     packed[i / 2] = __floats2half2_rn(SiluF(g0) * u0, SiluF(g1) * u1);
   }
-  *reinterpret_cast<uint4*>(out + row * valid_cols + col) =
+  *reinterpret_cast<uint4*>(
+      out + row * (out_pitch != 0 ? out_pitch : valid_cols) + out_col0 + col) =
       *reinterpret_cast<const uint4*>(packed);
 }
 
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
-               std::uint32_t cols, std::uint32_t valid_cols,
-               hipStream_t stream) {
+               std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
+               std::size_t out_pitch, std::uint32_t out_col0) {
   const std::size_t groups = std::size_t{tokens} * cols / 8;
   hipLaunchKernelGGL(NpuSwigluKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
                      stream, static_cast<const std::uint8_t*>(gate),
                      static_cast<const std::uint8_t*>(up),
                      static_cast<const std::uint8_t*>(gate_lo),
                      static_cast<const std::uint8_t*>(up_lo), out, tokens, cols,
-                     valid_cols);
+                     valid_cols, out_pitch, out_col0);
 }
 
 void NpuEncodeActivations(const __half* x, std::size_t ldx,
@@ -8106,6 +8192,30 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
       NpuEncodeWeightsQ8Kernel, dim3(Blocks(groups)), dim3(kThreads), 0, stream,
       static_cast<const Q8_0Block*>(q8), static_cast<std::uint8_t*>(dst), row0,
       cols, k_slice, k_offset, k_valid, k_total);
+}
+
+void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
+                           std::uint32_t k_total, std::uint32_t row0,
+                           std::uint32_t cols, std::uint32_t k_slice,
+                           std::uint32_t k_offset, std::uint32_t k_valid,
+                           void* dst, hipStream_t stream) {
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(
+      static_cast<gufo::core::GgmlType>(type), k_total);
+  const std::size_t groups = std::size_t{k_slice} * cols / 8;
+  hipLaunchKernelGGL(
+      NpuEncodeWeightsQuantKernel, dim3(Blocks(groups)), dim3(kThreads), 0,
+      stream, static_cast<const std::uint8_t*>(weights), type, row_bytes,
+      static_cast<std::uint8_t*>(dst), row0, cols, k_slice, k_offset, k_valid);
+}
+
+void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
+                   std::size_t rows, void* dst, hipStream_t stream) {
+  const std::size_t row_bytes = gufo::quant::QuantizedRowBytes(
+      static_cast<gufo::core::GgmlType>(type), k);
+  const std::size_t blocks = rows * (k / 32);
+  hipLaunchKernelGGL(RequantToQ8_0Kernel, dim3(Blocks(blocks)), dim3(kThreads),
+                     0, stream, static_cast<const std::uint8_t*>(src), type,
+                     row_bytes, static_cast<std::uint8_t*>(dst), rows, k);
 }
 
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,

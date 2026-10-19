@@ -348,10 +348,21 @@ void NpuEncodeWeights(const void* q8, std::uint32_t k_total, std::uint32_t row0,
                       std::uint32_t cols, std::uint32_t k_slice,
                       std::uint32_t k_offset, std::uint32_t k_valid, void* dst,
                       hipStream_t stream);
+/// Weights from a quantized GGUF tensor of `type` (a core::GgmlType value) with
+/// rows of k_total elements; otherwise as NpuEncodeWeights.
+void NpuEncodeWeightsQuant(const void* weights, std::uint32_t type,
+                           std::uint32_t k_total, std::uint32_t row0,
+                           std::uint32_t cols, std::uint32_t k_slice,
+                           std::uint32_t k_offset, std::uint32_t k_valid,
+                           void* dst, hipStream_t stream);
+/// Re-encodes `rows` rows of k weights (any K-quant or IQ `type`, a
+/// core::GgmlType value) as Q8_0 into dst (rows * k / 32 * 34 bytes).
+void RequantToQ8_0(const void* src, std::uint32_t type, std::uint32_t k,
+                   std::size_t rows, void* dst, hipStream_t stream);
 void NpuSwiglu(const void* gate, const void* up, const void* gate_lo,
                const void* up_lo, __half* out, std::uint32_t tokens,
-               std::uint32_t cols, std::uint32_t valid_cols,
-               hipStream_t stream);
+               std::uint32_t cols, std::uint32_t valid_cols, hipStream_t stream,
+               std::size_t out_pitch = 0, std::uint32_t out_col0 = 0);
 void NpuDecodeOutput(const void* src, float* out, std::uint32_t tokens,
                      std::uint32_t cols, std::size_t out_pitch,
                      std::uint32_t col0, bool accumulate, hipStream_t stream,

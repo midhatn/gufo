@@ -1336,15 +1336,20 @@ int RunBench(std::span<const char* const> args) {
       std::cerr << "MTP requires --mtp-model\n";
       return 1;
     }
-    auto mtp_reader_owner = core::GgufReader::OpenFile(mtp_path, &err);
-    if (mtp_reader_owner == nullptr) {
-      std::cerr << "Error loading MTP GGUF model: " << err << '\n';
-      return 1;
+    if (mtp_path == "embedded") {
+      mtp_gpu_model = hip::QwenMtpGpuModel::CreateEmbedded(
+          gpu_exec->GetSharedModel(), &err);
+    } else {
+      auto mtp_reader_owner = core::GgufReader::OpenFile(mtp_path, &err);
+      if (mtp_reader_owner == nullptr) {
+        std::cerr << "Error loading MTP GGUF model: " << err << '\n';
+        return 1;
+      }
+      std::shared_ptr<const core::GgufReader> mtp_reader(
+          std::move(mtp_reader_owner));
+      mtp_gpu_model = hip::QwenMtpGpuModel::Create(
+          std::move(mtp_reader), gpu_exec->GetSharedModel(), &err);
     }
-    std::shared_ptr<const core::GgufReader> mtp_reader(
-        std::move(mtp_reader_owner));
-    mtp_gpu_model = hip::QwenMtpGpuModel::Create(
-        std::move(mtp_reader), gpu_exec->GetSharedModel(), &err);
     if (mtp_gpu_model == nullptr) {
       std::cerr << "Error creating GPU MTP model: " << err << '\n';
       return 1;
