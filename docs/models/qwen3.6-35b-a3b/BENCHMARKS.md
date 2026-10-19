@@ -9,9 +9,9 @@ running. Prefill is `gufo bench -m MODEL -p N -n 128 -r 3`; GPU + NPU sets
 
 | Tokens | GPU only | GPU + NPU |
 | --- | --- | --- |
-| 2048 | 3,007 | 3,061 |
-| 4096 | 3,023 | 3,277 |
-| 8192 | 2,842 | 3,138 |
+| 2048 | 3,034 | 3,066 |
+| 4096 | 3,013 | 3,276 |
+| 8192 | 2,862 | 3,134 |
 
 ## Decode, tok/s
 

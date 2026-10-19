@@ -16,9 +16,9 @@ performance mode. GPU + NPU sets `GUFO_NPU_DIR=tools/npu`; see
 
 | Tokens | GPU only | GPU + NPU |
 | --- | --- | --- |
-| 2048 | 655 | 718 |
-| 4096 | 643 | 794 |
-| 8192 | 629 | 807 |
+| 2048 | 654 | 715 |
+| 4096 | 636 | 795 |
+| 8192 | 629 | 806 |
 | 12288 | | 780 |
 
 Decode is not affected: 12.4 tok/s plain with or without the NPU.

@@ -20,9 +20,9 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `-p 2048` | 3,007 | **3,061** |
-| `-p 4096` | 3,023 | **3,277** (+8.4%) |
-| `-p 8192` | 2,842 | **3,138** (+10.4%) |
+| `-p 2048` | 3,034 | **3,066** (+1.1%) |
+| `-p 4096` | 3,013 | **3,276** (+8.7%) |
+| `-p 8192` | 2,862 | **3,134** (+9.5%) |
 
 | Decode, tok/s | plain | MTP | DFlash2 | auto |
 | --- | --- | --- | --- | --- |
@@ -36,9 +36,9 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 | Prefill, tok/s | GPU only | GPU + NPU |
 | --- | --- | --- |
-| `-p 2048` | 655 | **718** (+9.6%) |
-| `-p 4096` | 643 | **794** (+23.5%) |
-| `-p 8192` | 629 | **807** (+28.3%) |
+| `-p 2048` | 654 | **715** (+9.3%) |
+| `-p 4096` | 636 | **795** (+25.0%) |
+| `-p 8192` | 629 | **806** (+28.2%) |
 
 | Decode, tok/s | plain | DFlash2 | auto |
 | --- | --- | --- | --- |
