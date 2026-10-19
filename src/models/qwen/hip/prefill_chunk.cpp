@@ -258,7 +258,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     }
   };
 
-  // 3. Layer stack
+  // 3. Layer stack. One recurrent pass per chunk.
+  const auto recurrent_state = arena_.BeginRecurrentWrite();
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     PrefillLayerCheckpoint(l);
     const auto& layer = weights_.layers[l];
@@ -623,9 +624,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       if (ssm_row_split) {
         LaunchBatchedSSMConvRecurrenceRowSplit(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
-            arena_.d_ssm_conv_state, arena_.d_conv_out,
-            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
-            static_cast<const float*>(layer.ssm_a.data),
+            recurrent_state, arena_.d_conv_out, arena_.d_alpha_buf,
+            arena_.d_beta_buf, static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out,
@@ -639,9 +639,8 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
-            arena_.d_ssm_conv_state, arena_.d_conv_out,
-            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
-            static_cast<const float*>(layer.ssm_a.data),
+            recurrent_state, arena_.d_conv_out, arena_.d_alpha_buf,
+            arena_.d_beta_buf, static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out, config.SsmLayerIndex(l), batch_size, ssm_qkv_size,
