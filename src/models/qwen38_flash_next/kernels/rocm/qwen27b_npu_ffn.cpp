@@ -29,6 +29,8 @@ constexpr std::uint32_t kMoeGateSlices = 2;
 constexpr std::uint32_t kMoeSsmOutSlices = 1;
 constexpr std::uint32_t kMoeAttnQSlices = 3;
 constexpr std::uint32_t kMoeAttnOSlices = 1;
+constexpr std::uint32_t kDenseAttnQSlices = 4;
+constexpr std::uint32_t kDenseAttnOSlices = 2;
 constexpr std::uint32_t kSliceColumns = 1024;
 constexpr std::uint32_t kDefaultSlices = 7;
 constexpr std::uint32_t kIntermediateK = kIntermediate;
@@ -86,14 +88,12 @@ public:
       ssm_out_slices =
           static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 5));
     }
-    if (slices == 0 &&
-        qkv_slices + gate_slices + down_slices + ssm_out_slices == 0) {
-      return nullptr;
-    }
     const char* attn_env = std::getenv("GUFO_QWEN_NPU_ATTN");
     const bool attn_enabled = attn_env == nullptr || attn_env[0] != '0';
-    std::uint32_t attn_q_slices = kMoeAttnQSlices;
-    std::uint32_t attn_o_slices = kMoeAttnOSlices;
+    std::uint32_t attn_q_slices =
+        dense27b ? kDenseAttnQSlices : kMoeAttnQSlices;
+    std::uint32_t attn_o_slices =
+        dense27b ? kDenseAttnOSlices : kMoeAttnOSlices;
     if (const char* v = std::getenv("GUFO_QWEN_NPU_ATTN_Q_SLICES")) {
       attn_q_slices =
           static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 8));
@@ -101,6 +101,11 @@ public:
     if (const char* v = std::getenv("GUFO_QWEN_NPU_ATTN_O_SLICES")) {
       attn_o_slices =
           static_cast<std::uint32_t>(std::clamp(std::atoi(v), 0, 2));
+    }
+    if (slices == 0 && qkv_slices + gate_slices + down_slices + ssm_out_slices +
+                               attn_q_slices + attn_o_slices ==
+                           0) {
+      return nullptr;
     }
     NpuGemm::Config cfg;
     cfg.xclbin =
@@ -122,7 +127,7 @@ public:
     ffn->gate_slices_ = gate_slices;
     ffn->down_slices_ = down_slices;
     ffn->ssm_out_slices_ = ssm_out_slices;
-    if (ssm_out_slices != 0) {
+    if (ssm_out_slices != 0 || attn_o_slices != 0) {
       ffn->ssm_out_program_ = npu->AddProgram(
           std::string(dir) + "/runtime_k/insts_4096x" +
               std::to_string(ssm_inner) + "x1024_128x64x128.txt",
@@ -159,7 +164,7 @@ public:
     }
     for (std::uint32_t i = 0;
          i < std::max({2 * slices, qkv_slices + gate_slices, down_slices,
-                       ssm_out_slices});
+                       ssm_out_slices, attn_q_slices, attn_o_slices});
          ++i) {
       const int id = npu->NewBuffer(npu->CBytes(), error);
       if (id < 0) {
@@ -221,8 +226,8 @@ public:
         }
       }
       std::vector<int> lin;
-      if (ok && moe35b && layer.is_full_attention && attn_enabled &&
-          attn_q_slices != 0 && EncodableType(layer.attn_q.type) &&
+      if (ok && layer.is_full_attention && attn_enabled && attn_q_slices != 0 &&
+          EncodableType(layer.attn_q.type) &&
           layer.attn_q.num_elements ==
               std::size_t{2} * config.AttentionSize() * hidden) {
         const std::uint32_t q_slices =
@@ -246,8 +251,8 @@ public:
         }
       }
       std::vector<int> ssm_out;
-      if (ok && moe35b && layer.is_full_attention && attn_enabled &&
-          attn_o_slices != 0 && EncodableType(layer.attn_output.type) &&
+      if (ok && layer.is_full_attention && attn_enabled && attn_o_slices != 0 &&
+          EncodableType(layer.attn_output.type) &&
           layer.attn_output.num_elements == std::size_t{hidden} * ssm_inner) {
         ok = encode(layer.attn_output, attn_o_slices, ssm_out, ssm_inner);
         if (ok) {

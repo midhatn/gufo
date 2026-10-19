@@ -153,6 +153,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   // The MoE models keep their quantized-activation dense path; only layers the
   // NPU takes columns of switch to FP16 activations for those projections.
   const bool npu_moe = !half_prefill && config.IsMoe() && batch_size >= 1024;
+  const bool npu_attn = half_prefill || npu_moe;
   QwenNpuFfn* const npu_ffn =
       (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
   // Which NPU stages hand over to the other chunk: 1 attention-linear, 2
@@ -259,7 +260,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     // FP32 normed row and the BF16 staging copy are both dead, so the norm can
     // write the tiled Q8_1 activation directly and skip two round trips.
     const bool npu_q =
-        npu_moe && npu_ffn != nullptr && layer.is_full_attention &&
+        npu_attn && npu_ffn != nullptr && layer.is_full_attention &&
         batch_size == npu_ffn->Tokens() && npu_ffn->QkvColumns(l) != 0;
     const bool norm_feeds_q8_only =
         !npu_q && IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
@@ -311,8 +312,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                     arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
         gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
                     arena_.d_v, kv_size, hidden_size, arena_.d_scratch_q8_act);
-        LaunchFloatToFp16(arena_.d_normed, arena_.d_scratch_bf16,
-                          batch_size * hidden_size, arena_.stream);
+        if (!half_prefill) {
+          LaunchFloatToFp16(arena_.d_normed, arena_.d_scratch_bf16,
+                            batch_size * hidden_size, arena_.stream);
+        }
         if (npu_ffn->BeginLinear(l, bank, arena_.d_scratch_bf16,
                                  arena_.stream)) {
           npu_q_columns = npu_ffn->QkvColumns(l);
@@ -455,7 +458,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
         }
       }
 
-      const bool npu_o = npu_moe && npu_ffn != nullptr &&
+      const bool npu_o = npu_attn && npu_ffn != nullptr &&
                          batch_size == npu_ffn->Tokens() &&
                          npu_ffn->SsmOutColumns(l) != 0;
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized
