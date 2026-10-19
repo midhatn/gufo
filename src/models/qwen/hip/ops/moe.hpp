@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
+
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
@@ -20,6 +22,14 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          float* shared_weight, std::uint32_t num_experts,
                          std::uint32_t num_used, std::uint32_t rows = 1,
                          hipStream_t stream = nullptr);
+
+/// Router logits of `experts` expert rows and the shared-expert gate in one
+/// launch, bit-identical to a GEMV per tensor.
+void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
+                           const void* shared, core::GgmlType shared_type,
+                           const float* x, float* router_logits,
+                           float* shared_logit, std::size_t experts,
+                           std::size_t hidden, hipStream_t stream = nullptr);
 
 /// Rows of the split router weight matrix: experts, the shared-expert gate and
 /// padding to a multiple of eight.

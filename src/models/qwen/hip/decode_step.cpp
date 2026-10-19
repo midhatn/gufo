@@ -11,6 +11,12 @@
 
 namespace gufo::hip {
 
+namespace {
+// RMSNorm keeps whole rows of this width in registers; fusing the residual add
+// into it would change its sum tree.
+constexpr std::size_t kRowCachedHidden = 5120;
+}  // namespace
+
 void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
                               const QwenExecutionPolicy& policy) {
   if (!detail::DispatchTelemetryEnabled()) {
@@ -211,17 +217,18 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                  arena.stream);
     }
 
-    {
+    if (hidden_size != kRowCachedHidden) {
+      LaunchResidualAddRMSNorm(
+          decode_scratch.hidden.data(), attention_scratch.output.data(),
+          static_cast<const float*>(layer.ffn_norm.data),
+          decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream);
+    } else {
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
-
-      {
-        // FFN Pre-RMSNorm
-        LaunchRMSNorm(decode_scratch.hidden.data(),
-                      static_cast<const float*>(layer.ffn_norm.data),
-                      decode_scratch.normed.data(), hidden_size, 1e-6F,
-                      arena.stream);
-      }
+      LaunchRMSNorm(decode_scratch.hidden.data(),
+                    static_cast<const float*>(layer.ffn_norm.data),
+                    decode_scratch.normed.data(), hidden_size, 1e-6F,
+                    arena.stream);
     }
 
     // Fused SwiGLU FFN

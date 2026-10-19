@@ -19,6 +19,11 @@ void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,
                           float eps = 1e-6F, hipStream_t stream = nullptr);
 
+/// a += b, then out = RMSNorm(a) * weight, in one launch (dim not 5120).
+void LaunchResidualAddRMSNorm(float* a, const float* b, const float* weight,
+                              float* out, std::size_t dim, float eps = 1e-6F,
+                              hipStream_t stream = nullptr);
+
 /// Computes residual add: out = a + b
 void LaunchResidualAdd(const float* a, const float* b, float* out,
                        std::size_t dim, hipStream_t stream = nullptr);

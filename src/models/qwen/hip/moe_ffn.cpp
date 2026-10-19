@@ -171,10 +171,10 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
   const int hidden = static_cast<int>(config.hidden_size);
   const int shared_ff = static_cast<int>(config.shared_expert_ff);
 
-  LaunchGEMV(layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type, x,
-             scratch.shared_logit, 1, hidden, stream);
-  LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, x,
-             scratch.router_logits, experts, hidden, stream);
+  LaunchMoeRouterLogits(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+                        layer.ffn_gate_inp_shexp.data,
+                        layer.ffn_gate_inp_shexp.type, x, scratch.router_logits,
+                        scratch.shared_logit, experts, hidden, stream);
   LaunchMoeRouterTopK(scratch.router_logits, scratch.shared_logit, scratch.ids,
                       scratch.weights, scratch.shared_weight,
                       static_cast<std::uint32_t>(experts),

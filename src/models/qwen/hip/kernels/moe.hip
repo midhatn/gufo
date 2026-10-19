@@ -1,4 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -179,6 +180,89 @@ __global__ void MoeCombineKernel(float* __restrict__ out,
   out[i] = sum + shared_weight[0] * shared_out[i];
 }
 
+// Row `m` of A dotted with x, summed exactly as FastGEMVBlockKernel does so a
+// fused launch matches the two GEMVs it replaces bit for bit.
+__device__ float RouterRowDot(const void* A, core::GgmlType a_type,
+                              std::size_t m, const float* x, std::size_t K,
+                              float* s_warp_sums) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t block_threads = blockDim.x;
+  float dot = 0.0F;
+  if (a_type == core::GgmlType::kBF16) {
+    const auto* row = static_cast<const hip_bfloat16*>(A) + (m * K);
+    const std::size_t K_vec = K / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+    for (std::size_t vi = tid; vi < K_vec; vi += block_threads) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+      const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+      const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+      dot += (static_cast<float>(vals[0]) * x0.x) +
+             (static_cast<float>(vals[1]) * x0.y) +
+             (static_cast<float>(vals[2]) * x0.z) +
+             (static_cast<float>(vals[3]) * x0.w) +
+             (static_cast<float>(vals[4]) * x1.x) +
+             (static_cast<float>(vals[5]) * x1.y) +
+             (static_cast<float>(vals[6]) * x1.z) +
+             (static_cast<float>(vals[7]) * x1.w);
+    }
+    for (std::size_t k = (K_vec * 8) + tid; k < K; k += block_threads) {
+      dot += static_cast<float>(row[k]) * x[k];
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A) + (m * K);
+    const std::size_t K_vec = K / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+    for (std::size_t vi = tid; vi < K_vec; vi += block_threads) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(&x[k]);
+      dot += (v.x * xv.x) + (v.y * xv.y) + (v.z * xv.z) + (v.w * xv.w);
+    }
+    for (std::size_t k = (K_vec * 4) + tid; k < K; k += block_threads) {
+      dot += row[k] * x[k];
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+  if (lane_id == 0) {
+    s_warp_sums[warp_id] = dot;
+  }
+  __syncthreads();
+  float block_sum = 0.0F;
+  if (warp_id == 0) {
+    const std::size_t num_warps = block_threads >> 5u;
+    block_sum = (lane_id < num_warps) ? s_warp_sums[lane_id] : 0.0F;
+    for (int offset = static_cast<int>(num_warps / 2); offset > 0;
+         offset >>= 1) {
+      block_sum += __shfl_xor(block_sum, offset);
+    }
+  }
+  return block_sum;
+}
+
+// One block per expert row plus a last block for the shared-expert gate.
+__global__ void MoeRouterLogitsKernel(
+    const void* __restrict__ router, core::GgmlType router_type,
+    const void* __restrict__ shared, core::GgmlType shared_type,
+    const float* __restrict__ x, float* __restrict__ router_logits,
+    float* __restrict__ shared_logit, std::size_t experts, std::size_t K) {
+  __shared__ float s_warp_sums[16];
+  const std::size_t m = blockIdx.x;
+  const bool is_shared = m == experts;
+  const float sum = RouterRowDot(is_shared ? shared : router,
+                                 is_shared ? shared_type : router_type,
+                                 is_shared ? 0 : m, x, K, s_warp_sums);
+  if (threadIdx.x == 0) {
+    const float r = 0.0F;
+    (is_shared ? shared_logit[0] : router_logits[m]) = sum + r;
+  }
+}
+
 __device__ inline std::uint16_t FloatToBf16Bits(float f) {
   std::uint32_t u = __float_as_uint(f);
   u += 0x7FFFU + ((u >> 16) & 1U);
@@ -239,6 +323,16 @@ __global__ void RouterSplitLogitsKernel(const float* __restrict__ y,
 }
 
 }  // namespace
+
+void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
+                           const void* shared, core::GgmlType shared_type,
+                           const float* x, float* router_logits,
+                           float* shared_logit, std::size_t experts,
+                           std::size_t hidden, hipStream_t stream) {
+  MoeRouterLogitsKernel<<<dim3(experts + 1), 256, 0, stream>>>(
+      router, router_type, shared, shared_type, x, router_logits, shared_logit,
+      experts, hidden);
+}
 
 void LaunchRouterSplitActivations(const float* x, std::uint16_t* dst,
                                   std::size_t rows, std::size_t k,

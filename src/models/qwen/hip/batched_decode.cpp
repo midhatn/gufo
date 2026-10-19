@@ -114,10 +114,11 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
   // would alone.
   for (std::size_t row = 0; row < rows; ++row) {
     const float* row_x = x + (row * hidden);
-    LaunchGEMV(layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type,
-               row_x, s.shared_logit + row, 1, hidden, stream);
-    LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type, row_x,
-               s.router_logits + (row * experts), experts, hidden, stream);
+    LaunchMoeRouterLogits(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+                          layer.ffn_gate_inp_shexp.data,
+                          layer.ffn_gate_inp_shexp.type, row_x,
+                          s.router_logits + (row * experts),
+                          s.shared_logit + row, experts, hidden, stream);
   }
   LaunchMoeRouterTopK(s.router_logits, s.shared_logit, s.ids, s.weights,
                       s.shared_weight, static_cast<std::uint32_t>(experts),
