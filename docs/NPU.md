@@ -118,7 +118,7 @@ gets proportionally fewer slices.
 | --- | --- | --- |
 | `GUFO_DECODE_COPY` | `balanced` | Decode reads Q4_1 copies of `ssm_in`, `ssm_out`, `attn_qkv` and the shared expert (+19% plain, +21% MTP decode, perplexity +1.3%). `q4` copies every large matrix, `q5` uses Q5_1, `off` decodes from the exact Q8_0 weights. |
 | `GUFO_DECODE_COPY_CLASSES` | per mode | Comma list of `ssm_in`, `ssm_out`, `attn_qkv`, `attn_out`, `hc`, `shexp` to copy. |
-| `GUFO_F16_RESIDUAL` | unset | `1` keeps the prefill residual in F16 between combines (perplexity +0.5%, no longer faster). |
+| `GUFO_F16_RESIDUAL` | on with `GUFO_TWO_BANK=1`, else off | Keeps the prefill residual in F16 between combines (perplexity +0.5%; +1.5% prefill with the NPU, no gain GPU-only). `0` or `1` overrides. |
 
 ## Examples
 

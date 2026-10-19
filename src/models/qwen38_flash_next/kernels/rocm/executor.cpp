@@ -3890,11 +3890,20 @@ bool Executor::ForwardBodyRange(
   const auto& layers = model_->layers();
   bool normed = initial_normed;
   constexpr std::uint32_t kResidualHalfMinRows = 1024;
-  const bool res_half_mode = std::getenv("GUFO_F16_RESIDUAL") != nullptr &&
-                             prefill_phase && wide_mixer_ && MatrixRows(n) &&
-                             !speculative && n >= kResidualHalfMinRows &&
-                             c.hc_count == 4 && c.hidden_size % 128 == 0 &&
-                             c.hidden_size <= 2560;
+  // F16 residual: explicit with GUFO_F16_RESIDUAL=0/1, otherwise on only in
+  // the two-bank NPU mode, which already trades exactness for speed.
+  static const bool f16_residual = [] {
+    const char* v = std::getenv("GUFO_F16_RESIDUAL");
+    if (v != nullptr) {
+      return v[0] != '0';
+    }
+    const char* two_bank = std::getenv("GUFO_TWO_BANK");
+    return two_bank != nullptr && two_bank[0] == '1';
+  }();
+  const bool res_half_mode = f16_residual && prefill_phase && wide_mixer_ &&
+                             MatrixRows(n) && !speculative &&
+                             n >= kResidualHalfMinRows && c.hc_count == 4 &&
+                             c.hidden_size % 128 == 0 && c.hidden_size <= 2560;
   bool res_is_half = initial_res_half;
   const std::size_t res_count = static_cast<std::size_t>(n) * c.HcDim();
   const auto residual_to_half = [&] {

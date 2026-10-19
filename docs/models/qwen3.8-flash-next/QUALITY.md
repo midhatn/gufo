@@ -152,4 +152,4 @@ Measured against llama.cpp on the CPU (UD-IQ4_XS, 18.7K-token code prompt, 542 d
 
 `q4` previously used a plain min/max Q4_1 mapping (+6.14%, KL 0.082 / 0.200); the copy now searches the step and minimum per block. Alone, the hyper-connection and `attn_out` copies cost the most (document KL 0.084 and 0.076 against 0.022 to 0.033 for `ssm_in`, `ssm_out`, `attn_qkv` and the shared expert), so `balanced` leaves them in Q8_0 and keeps nearly all of the speed. `GUFO_DECODE_COPY_CLASSES` picks other subsets.
 
-The F16 residual (+0.54% perplexity) is off unless `GUFO_F16_RESIDUAL=1`. The NPU stays opt-in through `GUFO_NPU_DIR`.
+The F16 residual (+0.54% perplexity) is on only in the two-bank NPU mode (`GUFO_TWO_BANK=1`), where it adds about 1.5% prefill (2,125 against 2,085 tok/s at 16,384 tokens); `GUFO_F16_RESIDUAL=0` or `1` overrides, and GPU-only prefill is exact. The NPU stays opt-in through `GUFO_NPU_DIR`.

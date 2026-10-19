@@ -50,9 +50,9 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 | Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
 | --- | --- | --- |
-| `-p 8192` | 1,814 | **2,089** (+15.2%) |
-| `-p 16384` | 1,774 | **2,089** (+17.8%) |
-| `-p 32768` | 1,760 | **2,038** (+15.8%) |
+| `-p 8192` | 1,814 | **2,121** (+16.9%) |
+| `-p 16384` | 1,786 | **2,125** (+19.0%) |
+| `-p 32768` | 1,760 | **2,070** (+17.6%) |
 
 | Decode, tok/s | plain | MTP |
 | --- | --- | --- |
@@ -63,10 +63,10 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 `gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
 own repetitive context, where drafts are accepted easily).
 
-`GUFO_F16_RESIDUAL=1` keeps the prefill residual in F16 and adds about 1.5% with the
-NPU (2,125 tok/s at `-p 16384`) for +0.5% perplexity; it is off by default. The
-first NPU run after the machine has been idle can be much slower, so discard it
-when benchmarking.
+In the two-bank NPU mode the prefill residual stays in F16, worth about 1.5%
+(+0.5% perplexity); `GUFO_F16_RESIDUAL=0` keeps it in F32 (about 2,085 tok/s at
+`-p 16384`). GPU-only prefill stays exact. The first NPU run after the machine
+has been idle can be much slower, so discard it when benchmarking.
 
 Prefill depends on the text as well as the length: code, markdown and prose
 route to experts differently, so the same length can vary by 20% or more.
@@ -85,7 +85,7 @@ without the NPU.
 | Flash-Next, NPU slice and two-bank modes | KL against GPU-only 0.003 to 0.02 over real-text windows; needle-in-a-haystack 21 of 21 |
 | Flash-Next decode copies, `balanced` (default) | perplexity +1.3% against llama.cpp, decode +19% (plain) and +21% (MTP) |
 | Flash-Next decode copies, `off` | exact Q8_0 weights; plain 30.5 tok/s, MTP 44.9 tok/s |
-| Flash-Next F16 residual, `GUFO_F16_RESIDUAL=1` | perplexity +0.5%; no longer faster, so it stays off |
+| Flash-Next F16 residual (on with the two-bank NPU mode, `GUFO_F16_RESIDUAL=0/1` overrides) | perplexity +0.5%, prefill +1.5% with the NPU, no gain on GPU-only |
 | Speculative decoding | the target verifies every draft; greedy text can differ from plain decode only at near-tie tokens |
 
 Details and methods are in the per-model `QUALITY.md` files under
