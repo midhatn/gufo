@@ -139,3 +139,9 @@ With the shared expert also in Q4_1 (same method, NPU off): free-form departures
 
 
 Two-bank whole-projection prefill (`GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1`, NPU on): final-token KL divergence from the GPU-only prefill, four 16K-token windows of real text (a window must reach 16,384 tokens or the NPU path never runs), mean 0.0128 against 0.0165 for the slice mode and 0.0198 for the whole mode before the chunked gated delta rule; top-1 identical on three windows and one near-tie flip on the fourth. The chunked recurrence matches the exact one to 3–4e-4 relative on every layer of a pp16384 run. Greedy text is not identical to the single-bank path.
+
+## Exact by default
+
+Measured against llama.cpp on the CPU (UD-IQ4_XS, 18.7K-token code prompt, 542 decode positions, perplexity on the true continuation): the exact path 1.5355 against 1.5363 for llama.cpp; the F16 residual +0.54%; the Q5_1 decode copy +1.79%; the Q4_1 decode copy +6.14% (KL 0.082, top-1 94.5%). Against the exact path on a 18.6K-token document prompt the Q4_1 copy has KL 0.20 and top-1 81%.
+
+The decode copies (`GUFO_DECODE_COPY=q4` or `q5`) and the F16 residual (`GUFO_F16_RESIDUAL=1`) are therefore off unless requested; the default output is byte-identical to the build with both disabled. The NPU stays opt-in through `GUFO_NPU_DIR`.

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <vector>
 
@@ -560,12 +561,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   // Decode reads each large dense matrix once per round, so its bytes set the
   // round's cost: a 4-bit (Q4_1) copy cuts them by 41% and a 5-bit copy by 29%.
-  // GUFO_DECODE_Q4=0 selects the Q5_1 copy instead; GUFO_DECODE_Q5=0 disables
-  // the copies altogether.
-  const char* q5_flag = std::getenv("GUFO_DECODE_Q5");
-  const bool q5_on = q5_flag == nullptr || q5_flag[0] != '0';
-  const char* q4_flag = std::getenv("GUFO_DECODE_Q4");
-  const bool q4_on = q5_on && (q4_flag == nullptr || q4_flag[0] != '0');
+  // The copies re-quantize 8-bit weights and change the output, so they are off
+  // unless GUFO_DECODE_COPY=q4 or q5 asks for the faster, less precise decode.
+  const char* copy_mode = std::getenv("GUFO_DECODE_COPY");
+  const bool q4_on = copy_mode != nullptr && std::strcmp(copy_mode, "q4") == 0;
+  const bool q5_on =
+      q4_on || (copy_mode != nullptr && std::strcmp(copy_mode, "q5") == 0);
   if (q4_on || q5_on) {
     const std::size_t blk_bytes = q4_on ? 20 : 24;
     const auto dec_type = q4_on ? core::GgmlType::kQ4_1 : core::GgmlType::kQ5_1;

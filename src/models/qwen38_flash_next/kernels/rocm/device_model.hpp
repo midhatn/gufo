@@ -23,7 +23,7 @@ struct DeviceTensor {
   /// A Q5_1 re-encoding of a large Q8_0 matrix that the decode GEMV reads in
   /// place of `data` (prefill keeps the Q8_0 rows); null when there is none.
   void* decode_data{nullptr};
-  /// Type of `decode_data`: Q4_1, or Q5_1 when GUFO_DECODE_Q4=0.
+  /// Type of `decode_data`: Q4_1, or Q5_1 for GUFO_DECODE_COPY=q5.
   core::GgmlType decode_type{core::GgmlType::kQ5_1};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }

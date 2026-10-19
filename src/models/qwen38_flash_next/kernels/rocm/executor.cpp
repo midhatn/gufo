@@ -3890,10 +3890,11 @@ bool Executor::ForwardBodyRange(
   const auto& layers = model_->layers();
   bool normed = initial_normed;
   constexpr std::uint32_t kResidualHalfMinRows = 1024;
-  const bool res_half_mode =
-      std::getenv("GUFO_X_NORES") == nullptr && prefill_phase && wide_mixer_ &&
-      MatrixRows(n) && !speculative && n >= kResidualHalfMinRows &&
-      c.hc_count == 4 && c.hidden_size % 128 == 0 && c.hidden_size <= 2560;
+  const bool res_half_mode = std::getenv("GUFO_F16_RESIDUAL") != nullptr &&
+                             prefill_phase && wide_mixer_ && MatrixRows(n) &&
+                             !speculative && n >= kResidualHalfMinRows &&
+                             c.hc_count == 4 && c.hidden_size % 128 == 0 &&
+                             c.hidden_size <= 2560;
   bool res_is_half = initial_res_half;
   const std::size_t res_count = static_cast<std::size_t>(n) * c.HcDim();
   const auto residual_to_half = [&] {
