@@ -156,6 +156,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   const bool npu_attn = half_prefill || npu_moe;
   QwenNpuFfn* const npu_ffn =
       (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
+  if (npu_ffn != nullptr &&
+      npu_ffn->Accepts(static_cast<std::uint32_t>(batch_size))) {
+    npu_ffn->SetRows(static_cast<std::uint32_t>(batch_size));
+  }
   // Which NPU stages hand over to the other chunk: 1 attention-linear, 2
   // ssm_out, 4 FFN gate/up, 8 down.
   static const unsigned yield_mask = [] {
@@ -261,7 +265,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
     // write the tiled Q8_1 activation directly and skip two round trips.
     const bool npu_q =
         npu_attn && npu_ffn != nullptr && layer.is_full_attention &&
-        batch_size == npu_ffn->Tokens() && npu_ffn->QkvColumns(l) != 0;
+        npu_ffn->Accepts(batch_size) && npu_ffn->QkvColumns(l) != 0;
     const bool norm_feeds_q8_only =
         !npu_q && IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
         (layer.is_full_attention
@@ -459,7 +463,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       }
 
       const bool npu_o = npu_attn && npu_ffn != nullptr &&
-                         batch_size == npu_ffn->Tokens() &&
+                         npu_ffn->Accepts(batch_size) &&
                          npu_ffn->SsmOutColumns(l) != 0;
       // opt-c172-fp32-quant: the Q8_0 route reads only the quantized
       // activation, so the BF16 staging buffer is dead. Quantizing straight
@@ -512,7 +516,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                                      hidden_size, arena_.stream);
       }
       const bool npu_lin =
-          npu_moe && npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+          npu_moe && npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
           (npu_ffn->QkvColumns(l) != 0 || npu_ffn->GateColumns(l) != 0);
       if (npu_lin) {
         LaunchFloatToFp16(arena_.d_normed, arena_.d_scratch_bf16,
@@ -521,7 +525,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // The NPU takes the leading columns of attn_qkv and attn_gate for a full
       // 4096-token chunk; its runs are queued ahead of the GPU rows.
       std::uint32_t npu_qkv = 0, npu_gate = 0;
-      if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+      if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
           (npu_ffn->QkvColumns(l) != 0 || npu_ffn->GateColumns(l) != 0) &&
           npu_ffn->BeginLinear(l, bank, arena_.d_scratch_bf16, arena_.stream)) {
         npu_qkv = npu_ffn->QkvColumns(l);
@@ -566,7 +570,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // The row-split recurrence parallelizes independent state rows. Its
       // epilogue emits the activation consumed by ssm_out directly.
       const bool npu_ssm = npu_moe && npu_ffn != nullptr &&
-                           batch_size == npu_ffn->Tokens() &&
+                           npu_ffn->Accepts(batch_size) &&
                            npu_ffn->SsmOutColumns(l) != 0;
       const bool ssm_epilogue_q8 = !npu_ssm && reads_q8_act(layer.ssm_out) &&
                                    IsFusedSSMEpilogueQuantizeQ8_1Supported(
@@ -627,7 +631,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       if (half_prefill || npu_ssm) {
         attn_in_hidden = npu_ssm;
         std::uint32_t npu_ssm_out = 0;
-        if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+        if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
             npu_ffn->SsmOutColumns(l) != 0 &&
             npu_ffn->BeginSsmOut(l, bank, arena_.d_scratch_bf16,
                                  arena_.stream)) {
@@ -730,7 +734,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
           // the pair kernel can compute the remainder; its runs are queued
           // before the GPU kernel so the two overlap.
           std::uint32_t npu_columns = 0;
-          if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+          if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
               npu_ffn->Columns(l) != 0 &&
               TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
                   layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
@@ -808,7 +812,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
 
       if (half_prefill) {
         std::uint32_t npu_down = 0;
-        if (npu_ffn != nullptr && batch_size == npu_ffn->Tokens() &&
+        if (npu_ffn != nullptr && npu_ffn->Accepts(batch_size) &&
             npu_ffn->DownColumns(l) != 0 &&
             npu_ffn->BeginDown(l, bank, ffn_down_input, arena_.stream)) {
           npu_down = npu_ffn->DownColumns(l);

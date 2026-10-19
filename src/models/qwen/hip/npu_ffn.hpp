@@ -24,6 +24,12 @@ public:
   virtual ~QwenNpuFfn() = default;
 
   [[nodiscard]] virtual std::uint32_t Tokens() const noexcept = 0;
+  /// True when a chunk of `rows` tokens (at most Tokens()) can use the NPU: the
+  /// program runs Tokens() rows, so it pads shorter chunks and takes
+  /// proportionally fewer output columns.
+  [[nodiscard]] virtual bool Accepts(std::uint32_t rows) const noexcept = 0;
+  /// Active rows of the chunk the following stages belong to.
+  virtual void SetRows(std::uint32_t rows) noexcept = 0;
   /// Leading FFN columns the NPU computes for `layer`; 0 when the layer stays
   /// on the GPU.
   [[nodiscard]] virtual std::uint32_t Columns(

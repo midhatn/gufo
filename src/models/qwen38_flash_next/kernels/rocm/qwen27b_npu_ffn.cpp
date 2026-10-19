@@ -20,6 +20,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 constexpr std::uint32_t kTokens = 4096;
+constexpr std::uint32_t kMinRows = 1536;
 constexpr std::uint32_t kHidden = 5120;
 constexpr std::uint32_t kIntermediate = 17408;
 constexpr std::uint32_t kMoeHidden = 2048;
@@ -311,8 +312,12 @@ public:
   }
 
   std::uint32_t Tokens() const noexcept override { return kTokens; }
+  bool Accepts(std::uint32_t rows) const noexcept override {
+    return rows >= kMinRows && rows <= kTokens;
+  }
+  void SetRows(std::uint32_t rows) noexcept override { rows_ = rows; }
   std::uint32_t Columns(std::uint32_t layer) const noexcept override {
-    return layer < columns_.size() ? columns_[layer] : 0;
+    return layer < columns_.size() ? Scaled(columns_[layer]) : 0;
   }
 
   bool Begin(std::uint32_t layer, int bank, const void* normed,
@@ -321,9 +326,12 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, kTokens,
+    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, rows_,
                          hidden_, 0, hidden_, npu_->Device(slot.a), stream);
-    const auto& b = b_[layer];
+    const auto& full = b_[layer];
+    const std::uint32_t used = Used(slices_);
+    std::vector<int> b(full.begin(), full.begin() + used);
+    b.insert(b.end(), full.begin() + slices_, full.begin() + slices_ + used);
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
       Release(this);
@@ -338,11 +346,12 @@ public:
     (void)layer;
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    for (std::uint32_t i = 0; i < slices_; ++i) {
+    const std::uint32_t used = Used(slices_);
+    for (std::uint32_t i = 0; i < used; ++i) {
       NpuSwiglu(npu_->Staged(stream, slot.c[i]),
-                npu_->Staged(stream, slot.c[slices_ + i]), nullptr, nullptr,
-                static_cast<__half*>(out), kTokens, kSliceColumns,
-                kSliceColumns, stream, ld, i * kSliceColumns);
+                npu_->Staged(stream, slot.c[used + i]), nullptr, nullptr,
+                static_cast<__half*>(out), rows_, kSliceColumns, kSliceColumns,
+                stream, ld, i * kSliceColumns);
     }
     // The shared buffers are free once these kernels have read them.
     hipLaunchHostFunc(
@@ -351,7 +360,8 @@ public:
   }
 
   std::uint32_t SsmOutColumns(std::uint32_t layer) const noexcept override {
-    return layer < ssm_out_columns_.size() ? ssm_out_columns_[layer] : 0;
+    return layer < ssm_out_columns_.size() ? Scaled(ssm_out_columns_[layer])
+                                           : 0;
   }
 
   bool BeginSsmOut(std::uint32_t layer, int bank, const void* act,
@@ -360,12 +370,14 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(act), ssm_inner_, kTokens,
+    NpuEncodeActivations(static_cast<const __half*>(act), ssm_inner_, rows_,
                          ssm_inner_, 0, ssm_inner_,
                          npu_->Device(slot.a_ssm_out), stream);
     const auto& b = ssm_out_b_[layer];
-    if (!npu_->Submit(stream, slot.a_ssm_out, b.data(), slot.c.data(),
-                      static_cast<int>(b.size()), ssm_out_program_)) {
+    if (!npu_->Submit(
+            stream, slot.a_ssm_out, b.data(), slot.c.data(),
+            static_cast<int>(Used(static_cast<std::uint32_t>(b.size()))),
+            ssm_out_program_)) {
       Release(this);
       return false;
     }
@@ -377,9 +389,9 @@ public:
                     std::size_t ld, hipStream_t stream) override {
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    const std::uint32_t count = ssm_out_columns_[layer] / kSliceColumns;
+    const std::uint32_t count = Used(ssm_out_columns_[layer] / kSliceColumns);
     for (std::uint32_t i = 0; i < count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, kTokens,
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, rows_,
                       kSliceColumns, ld, i * kSliceColumns, true, stream);
     }
     hipLaunchHostFunc(
@@ -388,7 +400,7 @@ public:
   }
 
   std::uint32_t DownColumns(std::uint32_t layer) const noexcept override {
-    return layer < down_columns_.size() ? down_columns_[layer] : 0;
+    return layer < down_columns_.size() ? Scaled(down_columns_[layer]) : 0;
   }
 
   bool BeginDown(std::uint32_t layer, int bank, const void* act,
@@ -397,12 +409,14 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(act), kIntermediateK,
-                         kTokens, kIntermediateK, 0, kIntermediateK,
+    NpuEncodeActivations(static_cast<const __half*>(act), kIntermediateK, rows_,
+                         kIntermediateK, 0, kIntermediateK,
                          npu_->Device(slot.a_down), stream);
     const auto& b = down_b_[layer];
-    if (!npu_->Submit(stream, slot.a_down, b.data(), slot.c.data(),
-                      static_cast<int>(b.size()), down_program_)) {
+    if (!npu_->Submit(
+            stream, slot.a_down, b.data(), slot.c.data(),
+            static_cast<int>(Used(static_cast<std::uint32_t>(b.size()))),
+            down_program_)) {
       Release(this);
       return false;
     }
@@ -414,9 +428,9 @@ public:
                   std::size_t ld, hipStream_t stream) override {
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    const std::uint32_t count = down_columns_[layer] / kSliceColumns;
+    const std::uint32_t count = Used(down_columns_[layer] / kSliceColumns);
     for (std::uint32_t i = 0; i < count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, kTokens,
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), residual, rows_,
                       kSliceColumns, ld, i * kSliceColumns, true, stream);
     }
     hipLaunchHostFunc(
@@ -425,10 +439,10 @@ public:
   }
 
   std::uint32_t QkvColumns(std::uint32_t layer) const noexcept override {
-    return layer < qkv_columns_.size() ? qkv_columns_[layer] : 0;
+    return layer < qkv_columns_.size() ? Scaled(qkv_columns_[layer]) : 0;
   }
   std::uint32_t GateColumns(std::uint32_t layer) const noexcept override {
-    return layer < gate_columns_.size() ? gate_columns_[layer] : 0;
+    return layer < gate_columns_.size() ? Scaled(gate_columns_[layer]) : 0;
   }
 
   bool BeginLinear(std::uint32_t layer, int bank, const void* normed,
@@ -437,9 +451,15 @@ public:
     if (!npu_->Healthy() || !Acquire(stream)) {
       return false;
     }
-    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, kTokens,
+    NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, rows_,
                          hidden_, 0, hidden_, npu_->Device(slot.a), stream);
-    const auto& b = lin_b_[layer];
+    const auto& full = lin_b_[layer];
+    const std::uint32_t qkv_full = qkv_columns_[layer] / kSliceColumns;
+    const std::uint32_t qkv_used = Used(qkv_full);
+    const std::uint32_t gate_used = Used(gate_columns_[layer] / kSliceColumns);
+    std::vector<int> b(full.begin(), full.begin() + qkv_used);
+    b.insert(b.end(), full.begin() + qkv_full,
+             full.begin() + qkv_full + gate_used);
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
                       static_cast<int>(b.size()))) {
       Release(this);
@@ -454,16 +474,15 @@ public:
                     hipStream_t stream) override {
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    const std::uint32_t qkv_count = qkv_columns_[layer] / kSliceColumns;
-    const std::uint32_t gate_count = gate_columns_[layer] / kSliceColumns;
+    const std::uint32_t qkv_count = Used(qkv_columns_[layer] / kSliceColumns);
+    const std::uint32_t gate_count = Used(gate_columns_[layer] / kSliceColumns);
     for (std::uint32_t i = 0; i < qkv_count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), qkv, kTokens,
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[i]), qkv, rows_,
                       kSliceColumns, qkv_ld, i * kSliceColumns, false, stream);
     }
     for (std::uint32_t i = 0; i < gate_count; ++i) {
-      NpuDecodeOutput(npu_->Staged(stream, slot.c[qkv_count + i]), gate,
-                      kTokens, kSliceColumns, gate_ld, i * kSliceColumns, false,
-                      stream);
+      NpuDecodeOutput(npu_->Staged(stream, slot.c[qkv_count + i]), gate, rows_,
+                      kSliceColumns, gate_ld, i * kSliceColumns, false, stream);
     }
     hipLaunchHostFunc(
         stream, [](void* self) { Release(static_cast<Qwen27bNpuFfn*>(self)); },
@@ -472,6 +491,20 @@ public:
 
 private:
   Qwen27bNpuFfn() = default;
+
+  /// Slices the NPU computes for `rows` active rows: the program always runs
+  /// kTokens rows, so a shorter chunk gets proportionally fewer slices to keep
+  /// the NPU and the GPU finishing together.
+  [[nodiscard]] std::uint32_t Used(std::uint32_t slices) const noexcept {
+    if (slices == 0) {
+      return 0;
+    }
+    return std::max<std::uint32_t>(1,
+                                   (slices * rows_ + (kTokens / 2)) / kTokens);
+  }
+  [[nodiscard]] std::uint32_t Scaled(std::uint32_t columns) const noexcept {
+    return Used(columns / kSliceColumns) * kSliceColumns;
+  }
 
   /// One stream owns the shared NPU buffers at a time. Its own layers follow
   /// each other in stream order, so they need no host-side wait; another
@@ -493,6 +526,7 @@ private:
 
   std::unique_ptr<NpuGemm> npu_;
   std::uint32_t hidden_{0};
+  std::uint32_t rows_{kTokens};
   std::uint32_t ssm_inner_{0};
   std::uint32_t slices_{0};
   std::uint32_t down_slices_{0};
