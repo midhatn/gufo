@@ -1337,6 +1337,8 @@ int RunServe(std::span<const char* const> args) {
       speculative_config.backend = server::TextSpeculativeBackend::kDSpark;
     } else if (speculative_backend == "mtp") {
       speculative_config.backend = server::TextSpeculativeBackend::kMtp;
+    } else if (speculative_backend == "auto") {
+      speculative_config.backend = server::TextSpeculativeBackend::kAuto;
     } else {
       std::cerr << "Error: speculative backend '" << speculative_backend
                 << "' is not supported by the HTTP server\n";
@@ -1344,7 +1346,9 @@ int RunServe(std::span<const char* const> args) {
     }
     try {
       if (!draft_policy.empty() &&
-          speculative_config.backend != server::TextSpeculativeBackend::kDFlash)
+          speculative_config.backend !=
+              server::TextSpeculativeBackend::kDFlash &&
+          speculative_config.backend != server::TextSpeculativeBackend::kAuto)
         throw std::invalid_argument("--draft-policy requires DFlash2");
       speculative_config.dflash_policy =
           speculative::ParseDFlashDraftPolicy(draft_policy);
@@ -1352,12 +1356,15 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
     }
-    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash &&
+    if ((speculative_config.backend ==
+             server::TextSpeculativeBackend::kDFlash ||
+         speculative_config.backend == server::TextSpeculativeBackend::kAuto) &&
         (dflash_model_path.empty() || min_draft_tokens != 1)) {
       std::cerr << "Error: DFlash2 requires --dflash-model and "
                    "--min-draft-tokens 1; bound blocks with --draft-tokens\n";
       return 2;
     }
+    speculative_config.secondary_model_path = mtp_model_path;
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
             ? dspark_model_path
@@ -1445,6 +1452,8 @@ int RunServe(std::span<const char* const> args) {
             ? "dspark"
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? "mtp"
+        : speculative_config.backend == server::TextSpeculativeBackend::kAuto
+            ? "auto"
             : "off";
     load_log.Complete(
         "model=" + backend->model_id() +

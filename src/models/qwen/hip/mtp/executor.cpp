@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -14,6 +15,7 @@
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -163,6 +165,9 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_kv_cache_f16_);
   free_buffer(d_split_k_scratch_);
   free_buffer(d_out_token_);
+  free_buffer(d_prime_tokens_);
+  free_buffer(d_prime_buffer_);
+  free_buffer(d_prime_bf16_);
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
     stream_ = nullptr;
@@ -307,6 +312,215 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
     throw std::runtime_error("MTP GPU result synchronization failed");
   }
   return CheckedSampleToken(result, config.vocab_size);
+}
+
+void QwenMtpGpuExecutor::EnsurePrimeScratch() {
+  if (d_prime_buffer_ != nullptr) {
+    return;
+  }
+  const auto& config = model_->GetConfig();
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t attention = config.AttentionSize();
+  const std::size_t kv =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  prime_buffer_elements_ =
+      kPrimeChunk * ((8 * hidden) + (3 * kv) + (2 * attention));
+  AllocateBuffer(d_prime_buffer_, prime_buffer_elements_);
+  AllocateBuffer(d_prime_tokens_, kPrimeChunk);
+  d_prime_bf16_ =
+      detail::AllocateDevice(kPrimeChunk * 2 * hidden * sizeof(std::uint16_t));
+  HIP_CHECK(
+      hipMemset(d_prime_buffer_, 0, prime_buffer_elements_ * sizeof(float)));
+}
+
+void QwenMtpGpuExecutor::PrimeBatch(
+    std::span<const tokenization::TokenId> tokens,
+    std::span<const float> hidden_rows, std::uint32_t start_position) {
+  const auto& weights = model_->GetWeights();
+  const auto& config = weights.config;
+  const auto& layer = weights.layer;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t attention = config.AttentionSize();
+  const std::size_t kv =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  const std::size_t total_kv =
+      static_cast<std::size_t>(config.num_key_value_heads) * max_context_ *
+      config.head_dim;
+  if (start_position != next_position_ ||
+      hidden_rows.size() != tokens.size() * hidden ||
+      static_cast<std::size_t>(start_position) + tokens.size() > max_context_) {
+    throw std::out_of_range("MTP batch priming range is invalid");
+  }
+  EnsurePrimeScratch();
+  float* cursor = d_prime_buffer_;
+  const auto take = [&cursor](std::size_t count) {
+    float* start = cursor;
+    cursor += count;
+    return start;
+  };
+  float* emb = take(kPrimeChunk * hidden);
+  float* hid = take(kPrimeChunk * hidden);
+  float* en = take(kPrimeChunk * hidden);
+  float* hn = take(kPrimeChunk * hidden);
+  float* cat = take(kPrimeChunk * 2 * hidden);
+  float* fused = take(kPrimeChunk * hidden);
+  float* normed = take(kPrimeChunk * hidden);
+  float* k = take(kPrimeChunk * kv);
+  float* v = take(kPrimeChunk * kv);
+  float* k_out = take(kPrimeChunk * kv);
+  float* q = take(kPrimeChunk * attention);
+  float* q_out = take(kPrimeChunk * attention);
+  for (std::size_t offset = 0; offset < tokens.size(); offset += kPrimeChunk) {
+    const std::size_t n = std::min(kPrimeChunk, tokens.size() - offset);
+    const std::uint32_t position =
+        start_position + static_cast<std::uint32_t>(offset);
+    std::vector<std::uint32_t> host_tokens(tokens.begin() + offset,
+                                           tokens.begin() + offset + n);
+    HIP_CHECK(hipMemcpyAsync(d_prime_tokens_, host_tokens.data(),
+                             n * sizeof(std::uint32_t), hipMemcpyHostToDevice,
+                             stream_));
+    HIP_CHECK(hipMemcpyAsync(hid, hidden_rows.data() + (offset * hidden),
+                             n * hidden * sizeof(float), hipMemcpyHostToDevice,
+                             stream_));
+    LaunchBatchedEmbeddingLookup(weights.token_embedding.data,
+                                 weights.token_embedding.type, d_prime_tokens_,
+                                 emb, n, hidden, stream_);
+    if (vision_input_) {
+      vision_input_->Inject(emb, position + 1, static_cast<std::uint32_t>(n),
+                            hidden, 1, stream_);
+    }
+    LaunchBatchedRMSNorm(emb,
+                         static_cast<const float*>(weights.embedding_norm.data),
+                         en, nullptr, n, hidden, 1.0e-6F, stream_);
+    LaunchBatchedRMSNorm(hid,
+                         static_cast<const float*>(weights.hidden_norm.data),
+                         hn, nullptr, n, hidden, 1.0e-6F, stream_);
+    LaunchConcatRows(en, hn, cat, n, hidden, stream_);
+    LaunchFloatToBfloat16(cat, d_prime_bf16_, n * 2 * hidden, stream_);
+    LaunchBatchedQuantGEMMBf16(weights.fusion_projection.type,
+                               weights.fusion_projection.data, d_prime_bf16_,
+                               fused, n, hidden, 2 * hidden, stream_);
+    LaunchBatchedRMSNorm(fused, static_cast<const float*>(layer.attn_norm.data),
+                         normed, d_prime_bf16_, n, hidden, 1.0e-6F, stream_);
+    LaunchBatchedQuantGEMMBf16(layer.attn_k.type, layer.attn_k.data,
+                               d_prime_bf16_, k, n, kv, hidden, stream_);
+    LaunchBatchedQuantGEMMBf16(layer.attn_v.type, layer.attn_v.data,
+                               d_prime_bf16_, v, n, kv, hidden, stream_);
+    LaunchBatchedFusedQKNormRoPEKvWrite(
+        q, k, v, static_cast<const float*>(layer.attn_q_norm.data),
+        static_cast<const float*>(layer.attn_k_norm.data), q_out, k_out,
+        d_kv_cache_, d_kv_cache_ + total_kv, d_kv_cache_f16_,
+        static_cast<std::uint16_t*>(d_kv_cache_f16_) + total_kv, 0, position, n,
+        max_context_, config.num_attention_heads, config.num_key_value_heads,
+        config.head_dim, config.rotary_dim, config.rope_theta, 1.0e-6F, stream_,
+        vision_input_ ? vision_input_->rope() : nullptr);
+  }
+  HIP_CHECK(hipStreamSynchronize(stream_));
+  next_position_ = start_position + static_cast<std::uint32_t>(tokens.size());
+}
+
+std::size_t QwenMtpGpuExecutor::StateBytes() const noexcept {
+  const auto& config = model_->GetConfig();
+  return sizeof(std::uint32_t) +
+         static_cast<std::size_t>(next_position_) * config.num_key_value_heads *
+             config.head_dim * 2 * (sizeof(float) + sizeof(std::uint16_t));
+}
+
+void QwenMtpGpuExecutor::SaveState(std::span<std::uint8_t> destination) const {
+  if (destination.size() != StateBytes()) {
+    throw std::invalid_argument("MTP state destination has the wrong size");
+  }
+  const auto& config = model_->GetConfig();
+  const std::size_t head_values =
+      static_cast<std::size_t>(next_position_) * config.head_dim;
+  const std::size_t head_stride =
+      static_cast<std::size_t>(max_context_) * config.head_dim;
+  const std::size_t total_kv = config.num_key_value_heads * head_stride;
+  std::uint8_t* out = destination.data();
+  std::memcpy(out, &next_position_, sizeof(next_position_));
+  out += sizeof(next_position_);
+  HIP_CHECK(hipStreamSynchronize(stream_));
+  for (std::size_t plane = 0; plane < 2; ++plane) {
+    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+      const std::size_t offset = (plane * total_kv) + (head * head_stride);
+      HIP_CHECK(hipMemcpy(out, d_kv_cache_ + offset,
+                          head_values * sizeof(float), hipMemcpyDeviceToHost));
+      out += head_values * sizeof(float);
+    }
+  }
+  for (std::size_t plane = 0; plane < 2; ++plane) {
+    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+      const std::size_t offset = (plane * total_kv) + (head * head_stride);
+      HIP_CHECK(hipMemcpy(
+          out, static_cast<const std::uint16_t*>(d_kv_cache_f16_) + offset,
+          head_values * sizeof(std::uint16_t), hipMemcpyDeviceToHost));
+      out += head_values * sizeof(std::uint16_t);
+    }
+  }
+}
+
+void QwenMtpGpuExecutor::LoadState(std::span<const std::uint8_t> source) {
+  if (source.size() < sizeof(std::uint32_t)) {
+    throw std::invalid_argument("MTP state payload is truncated");
+  }
+  std::uint32_t position = 0;
+  std::memcpy(&position, source.data(), sizeof(position));
+  const auto& config = model_->GetConfig();
+  const std::size_t expected =
+      sizeof(std::uint32_t) + static_cast<std::size_t>(position) *
+                                  config.num_key_value_heads * config.head_dim *
+                                  2 * (sizeof(float) + sizeof(std::uint16_t));
+  if (position > max_context_ || source.size() != expected) {
+    throw std::invalid_argument("MTP state payload does not match the cache");
+  }
+  const std::size_t head_values =
+      static_cast<std::size_t>(position) * config.head_dim;
+  const std::size_t head_stride =
+      static_cast<std::size_t>(max_context_) * config.head_dim;
+  const std::size_t total_kv = config.num_key_value_heads * head_stride;
+  const std::uint8_t* in = source.data() + sizeof(position);
+  HIP_CHECK(hipStreamSynchronize(stream_));
+  for (std::size_t plane = 0; plane < 2; ++plane) {
+    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+      const std::size_t offset = (plane * total_kv) + (head * head_stride);
+      HIP_CHECK(hipMemcpy(d_kv_cache_ + offset, in, head_values * sizeof(float),
+                          hipMemcpyHostToDevice));
+      in += head_values * sizeof(float);
+    }
+  }
+  for (std::size_t plane = 0; plane < 2; ++plane) {
+    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+      const std::size_t offset = (plane * total_kv) + (head * head_stride);
+      HIP_CHECK(hipMemcpy(static_cast<std::uint16_t*>(d_kv_cache_f16_) + offset,
+                          in, head_values * sizeof(std::uint16_t),
+                          hipMemcpyHostToDevice));
+      in += head_values * sizeof(std::uint16_t);
+    }
+  }
+  next_position_ = position;
+}
+
+QwenGpuMemoryUsage QwenMtpGpuExecutor::EstimateMemoryUsage(
+    const QwenMtpGpuModel& model, std::uint32_t max_context) {
+  const auto& config = model.GetConfig();
+  const std::size_t kv_values = 2 * static_cast<std::size_t>(max_context) *
+                                config.num_key_value_heads * config.head_dim;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t attention = config.AttentionSize();
+  const std::size_t scratch_floats =
+      kPrimeChunk *
+          ((8 * hidden) + (2 * config.num_key_value_heads * config.head_dim) +
+           (2 * attention)) +
+      config.vocab_size + (32 * hidden);
+  return {.request_state_bytes =
+              kv_values * (sizeof(float) + sizeof(std::uint16_t)),
+          .temporary_scratch_bytes =
+              (scratch_floats * sizeof(float)) +
+              (kPrimeChunk * 2 * hidden * sizeof(std::uint16_t))};
+}
+
+QwenGpuMemoryUsage QwenMtpGpuExecutor::GetMemoryUsage() const noexcept {
+  return EstimateMemoryUsage(*model_, max_context_);
 }
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastHidden() {

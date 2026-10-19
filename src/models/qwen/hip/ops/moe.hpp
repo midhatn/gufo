@@ -31,6 +31,11 @@ void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
                            float* shared_logit, std::size_t experts,
                            std::size_t hidden, hipStream_t stream = nullptr);
 
+/// out[r] = [a[r], b[r]] for rows of `cols` floats.
+void LaunchConcatRows(const float* a, const float* b, float* out,
+                      std::size_t rows, std::size_t cols,
+                      hipStream_t stream = nullptr);
+
 /// Rows of the split router weight matrix: experts, the shared-expert gate and
 /// padding to a multiple of eight.
 inline constexpr std::size_t kRouterSplitRows = 264;

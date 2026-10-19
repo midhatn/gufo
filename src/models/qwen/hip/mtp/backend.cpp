@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -77,13 +78,12 @@ bool QwenMtpGpuDraftBackend::PrimeTargetContext(
   }
 
   try {
-    for (std::size_t index = 0; index + 1 < context.prompt_tokens.size();
-         ++index) {
-      const auto hidden = context.prompt_hidden_states.subspan(
-          index * context.hidden_size, context.hidden_size);
-      (void)executor_->ForwardTargetHidden(
-          context.prompt_tokens[index + 1], hidden,
-          static_cast<std::uint32_t>(index), false);
+    if (context.prompt_tokens.size() > 1) {
+      executor_->PrimeBatch(
+          context.prompt_tokens.subspan(1),
+          context.prompt_hidden_states.first(
+              (context.prompt_tokens.size() - 1) * context.hidden_size),
+          0);
     }
     const std::size_t final_offset =
         (context.prompt_tokens.size() - 1) * context.hidden_size;
@@ -108,13 +108,21 @@ bool QwenMtpGpuDraftBackend::AppendTargetContext(
           context.prompt_tokens.size() * context.hidden_size) {
     return false;
   }
-  for (std::size_t row = 0; row < context.prompt_tokens.size(); ++row) {
-    (void)executor_->ForwardTargetHidden(
-        context.prompt_tokens[row], target_hidden_,
-        position + static_cast<std::uint32_t>(row) - 1, false);
-    UpdateTargetHidden(context.prompt_hidden_states.subspan(
-        row * context.hidden_size, context.hidden_size));
+  if (context.prompt_tokens.empty()) {
+    return true;
   }
+  // Row r pairs token r with the hidden state of the token before it: the
+  // carried frontier hidden for r == 0, then the supplied rows.
+  std::vector<float> paired(context.prompt_tokens.size() *
+                            target_hidden_.size());
+  std::ranges::copy(target_hidden_, paired.begin());
+  std::copy_n(
+      context.prompt_hidden_states.begin(),
+      (context.prompt_tokens.size() - 1) * target_hidden_.size(),
+      paired.begin() + static_cast<std::ptrdiff_t>(target_hidden_.size()));
+  executor_->PrimeBatch(context.prompt_tokens, paired, position - 1);
+  std::ranges::copy(context.prompt_hidden_states.last(target_hidden_.size()),
+                    target_hidden_.begin());
   return true;
 }
 
@@ -147,6 +155,9 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
   proposal_checkpoint_ = executor_->GetNextPosition();
   proposal_input_ = prompt_tokens.back();
   proposal_target_hidden_ = target_hidden_;
+  step_hidden_ = target_hidden_;
+  step_checkpoint_ = proposal_checkpoint_;
+  step_valid_ = true;
   committed_target_hidden_.clear();
   proposed_tokens_.clear();
   proposed_tokens_.reserve(count);
@@ -215,9 +226,107 @@ void QwenMtpGpuDraftBackend::Reset() noexcept {
   committed_target_hidden_.clear();
   proposal_input_ = 0;
   proposal_checkpoint_ = 0;
+  step_valid_ = false;
   primed_ = false;
   proposal_active_ = false;
   last_error_.clear();
+}
+
+void QwenMtpGpuDraftBackend::DiscardPendingTargetContext(
+    std::uint32_t position) {
+  if (proposal_active_ || !step_valid_ || step_checkpoint_ + 1 != position) {
+    throw std::logic_error("MTP cancellation frontier is not retained");
+  }
+  executor_->Rewind(step_checkpoint_);
+  target_hidden_ = step_hidden_;
+  proposed_tokens_.clear();
+  proposal_target_hidden_.clear();
+  committed_target_hidden_.clear();
+}
+
+std::vector<std::uint8_t> QwenMtpGpuDraftBackend::SerializeState() const {
+  const std::size_t state_bytes = executor_->StateBytes();
+  std::vector<std::uint8_t> payload(
+      state_bytes + (target_hidden_.size() * sizeof(float)) + 1);
+  executor_->SaveState(std::span(payload).first(state_bytes));
+  std::memcpy(payload.data() + state_bytes, target_hidden_.data(),
+              target_hidden_.size() * sizeof(float));
+  payload.back() = primed_ ? 1 : 0;
+  return payload;
+}
+
+void QwenMtpGpuDraftBackend::LoadSerializedState(
+    std::span<const std::uint8_t> payload) {
+  const std::size_t tail = (target_hidden_.size() * sizeof(float)) + 1;
+  if (payload.size() < tail + sizeof(std::uint32_t)) {
+    throw std::invalid_argument("MTP snapshot payload is truncated");
+  }
+  const std::size_t state_bytes = payload.size() - tail;
+  executor_->LoadState(payload.first(state_bytes));
+  std::memcpy(target_hidden_.data(), payload.data() + state_bytes,
+              target_hidden_.size() * sizeof(float));
+  primed_ = payload.back() != 0;
+  proposal_active_ = false;
+  step_valid_ = false;
+  proposed_tokens_.clear();
+  proposal_target_hidden_.clear();
+  committed_target_hidden_.clear();
+}
+
+namespace {
+class QwenMtpDraftSnapshot final : public speculative::IDraftBackendSnapshot {
+public:
+  explicit QwenMtpDraftSnapshot(std::vector<std::uint8_t> payload)
+      : payload_(std::move(payload)) {}
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return payload_.size();
+  }
+  [[nodiscard]] std::size_t PersistentPayloadBytes() const override {
+    return payload_.size();
+  }
+  [[nodiscard]] std::size_t SerializePersistent(
+      std::span<std::uint8_t> destination) const override {
+    if (destination.size() != payload_.size()) {
+      throw std::invalid_argument(
+          "MTP snapshot destination has the wrong size");
+    }
+    std::memcpy(destination.data(), payload_.data(), payload_.size());
+    return payload_.size();
+  }
+  [[nodiscard]] std::span<const std::uint8_t> Payload() const noexcept {
+    return payload_;
+  }
+
+private:
+  std::vector<std::uint8_t> payload_;
+};
+}  // namespace
+
+std::size_t QwenMtpGpuDraftBackend::SnapshotPayloadBytes() const {
+  return executor_->StateBytes() + (target_hidden_.size() * sizeof(float)) + 1;
+}
+
+std::unique_ptr<speculative::IDraftBackendSnapshot>
+QwenMtpGpuDraftBackend::Snapshot() const {
+  if (proposal_active_) {
+    throw std::logic_error(
+        "MTP snapshot requires a committed proposal boundary");
+  }
+  return std::make_unique<QwenMtpDraftSnapshot>(SerializeState());
+}
+
+void QwenMtpGpuDraftBackend::RestoreSnapshot(
+    const speculative::IDraftBackendSnapshot& snapshot) {
+  const auto* mtp = dynamic_cast<const QwenMtpDraftSnapshot*>(&snapshot);
+  if (mtp == nullptr) {
+    throw std::invalid_argument("snapshot does not belong to an MTP draft");
+  }
+  LoadSerializedState(mtp->Payload());
+}
+
+void QwenMtpGpuDraftBackend::RestorePersistentSnapshot(
+    std::span<const std::uint8_t> payload) {
+  LoadSerializedState(payload);
 }
 
 }  // namespace gufo::hip

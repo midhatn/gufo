@@ -207,6 +207,19 @@ public:
         "draft backend does not support persistent snapshot restore");
   }
 
+  /// Drops target features the draft has not consumed yet, or rewinds a draft
+  /// that consumed them, when the target returns to a saved verification
+  /// frontier at `position`.
+  virtual void DiscardPendingTargetContext(std::uint32_t position) {
+    (void)position;
+  }
+
+  /// Per-request device state and temporary scratch the draft keeps resident.
+  [[nodiscard]] virtual std::pair<std::size_t, std::size_t> RequestMemoryBytes()
+      const {
+    return {0, 0};
+  }
+
   /// Resets internal draft generator state
   virtual void Reset() noexcept {}
 

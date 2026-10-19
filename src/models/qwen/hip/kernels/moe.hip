@@ -334,6 +334,23 @@ void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
       experts, hidden);
 }
 
+__global__ void ConcatRowsKernel(const float* __restrict__ a,
+                                 const float* __restrict__ b,
+                                 float* __restrict__ out, std::size_t cols) {
+  const float* ra = a + (static_cast<std::size_t>(blockIdx.x) * cols);
+  const float* rb = b + (static_cast<std::size_t>(blockIdx.x) * cols);
+  float* ro = out + (static_cast<std::size_t>(blockIdx.x) * 2 * cols);
+  for (std::size_t i = threadIdx.x; i < cols; i += blockDim.x) {
+    ro[i] = ra[i];
+    ro[cols + i] = rb[i];
+  }
+}
+
+void LaunchConcatRows(const float* a, const float* b, float* out,
+                      std::size_t rows, std::size_t cols, hipStream_t stream) {
+  ConcatRowsKernel<<<dim3(rows), 256, 0, stream>>>(a, b, out, cols);
+}
+
 void LaunchRouterSplitActivations(const float* x, std::uint16_t* dst,
                                   std::size_t rows, std::size_t k,
                                   hipStream_t stream) {
