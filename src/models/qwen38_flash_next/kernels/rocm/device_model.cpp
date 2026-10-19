@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 #include "src/core/hip/weight_upload.hpp"
@@ -561,12 +562,15 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   // Decode reads each large dense matrix once per round, so its bytes set the
   // round's cost: a 4-bit (Q4_1) copy cuts them by 41% and a 5-bit copy by 29%.
-  // The copies re-quantize 8-bit weights and change the output, so they are off
-  // unless GUFO_DECODE_COPY=q4 or q5 asks for the faster, less precise decode.
-  const char* copy_mode = std::getenv("GUFO_DECODE_COPY");
-  const bool q4_on = copy_mode != nullptr && std::strcmp(copy_mode, "q4") == 0;
-  const bool q5_on =
-      q4_on || (copy_mode != nullptr && std::strcmp(copy_mode, "q5") == 0);
+  // The copies re-quantize 8-bit weights and change the output.
+  // GUFO_DECODE_COPY picks the trade: "balanced" (default) copies the
+  // projections that tolerate 4 bits, "q4" and "q5" copy every large matrix,
+  // "off" decodes from the exact Q8_0 weights.
+  const char* copy_env = std::getenv("GUFO_DECODE_COPY");
+  const std::string copy_mode = copy_env != nullptr ? copy_env : "balanced";
+  const bool balanced = copy_mode == "balanced";
+  const bool q4_on = balanced || copy_mode == "q4";
+  const bool q5_on = q4_on || copy_mode == "q5";
   if (q4_on || q5_on) {
     const std::size_t blk_bytes = q4_on ? 20 : 24;
     const auto dec_type = q4_on ? core::GgmlType::kQ4_1 : core::GgmlType::kQ5_1;
@@ -598,19 +602,36 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     // The four 320 x 10240 hyper-connection projections of every layer are
     // 14% of the bytes decode reads.
     constexpr std::size_t kHcElements = std::size_t{320} * 10240;
+    // GUFO_DECODE_COPY_CLASSES narrows the copies to a comma-separated subset
+    // of ssm_in, ssm_out, attn_qkv, attn_out, hc and shexp.
+    const char* classes = std::getenv("GUFO_DECODE_COPY_CLASSES");
+    if (classes == nullptr && balanced) {
+      classes = "ssm_in,ssm_out,attn_qkv,shexp";
+    }
+    const auto wants = [&](const char* name) {
+      return classes == nullptr || std::strstr(classes, name) != nullptr;
+    };
     for (auto& l : m->layers_) {
-      add(l.ssm_in, kMinElements);
-      add(l.ssm_out, kMinElements);
-      add(l.attn_qkv, kMinElements);
-      add(l.attn_out, kMinElements);
+      if (wants("ssm_in"))
+        add(l.ssm_in, kMinElements);
+      if (wants("ssm_out"))
+        add(l.ssm_out, kMinElements);
+      if (wants("attn_qkv"))
+        add(l.attn_qkv, kMinElements);
+      if (wants("attn_out"))
+        add(l.attn_out, kMinElements);
       if (q4_on) {
-        for (DeviceMixer* mixer : {&l.hc_attn, &l.hc_ffn}) {
-          add(mixer->down, kHcElements);
-          add(mixer->up, kHcElements);
+        if (wants("hc")) {
+          for (DeviceMixer* mixer : {&l.hc_attn, &l.hc_ffn}) {
+            add(mixer->down, kHcElements);
+            add(mixer->up, kHcElements);
+          }
         }
-        add(l.shexp_up, 1);
-        add(l.shexp_gate, 1);
-        add(l.shexp_down, 1);
+        if (wants("shexp")) {
+          add(l.shexp_up, 1);
+          add(l.shexp_gate, 1);
+          add(l.shexp_down, 1);
+        }
       }
     }
     if (hipDeviceSynchronize() != hipSuccess) {

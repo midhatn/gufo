@@ -140,8 +140,16 @@ With the shared expert also in Q4_1 (same method, NPU off): free-form departures
 
 Two-bank whole-projection prefill (`GUFO_TWO_BANK=1 GUFO_NPU_WHOLE=1`, NPU on): final-token KL divergence from the GPU-only prefill, four 16K-token windows of real text (a window must reach 16,384 tokens or the NPU path never runs), mean 0.0128 against 0.0165 for the slice mode and 0.0198 for the whole mode before the chunked gated delta rule; top-1 identical on three windows and one near-tie flip on the fourth. The chunked recurrence matches the exact one to 3–4e-4 relative on every layer of a pp16384 run. Greedy text is not identical to the single-bank path.
 
-## Exact by default
+## Decode copies and the F16 residual
 
-Measured against llama.cpp on the CPU (UD-IQ4_XS, 18.7K-token code prompt, 542 decode positions, perplexity on the true continuation): the exact path 1.5355 against 1.5363 for llama.cpp; the F16 residual +0.54%; the Q5_1 decode copy +1.79%; the Q4_1 decode copy +6.14% (KL 0.082, top-1 94.5%). Against the exact path on a 18.6K-token document prompt the Q4_1 copy has KL 0.20 and top-1 81%.
+Measured against llama.cpp on the CPU (UD-IQ4_XS, 18.7K-token code prompt, 542 decode positions, perplexity on the true continuation): exact path 1.5355 against 1.5363 for llama.cpp. Perplexity change against llama.cpp, KL against the exact path on a code / document prompt, and decode speed (AR / MTP, tok/s):
 
-The decode copies (`GUFO_DECODE_COPY=q4` or `q5`) and the F16 residual (`GUFO_F16_RESIDUAL=1`) are therefore off unless requested; the default output is byte-identical to the build with both disabled. The NPU stays opt-in through `GUFO_NPU_DIR`.
+| Decode mode | Perplexity | KL code / doc | AR | MTP |
+| --- | --- | --- | --- | --- |
+| `GUFO_DECODE_COPY=off` | -0.05% | 0 / 0 | 30.5 | 44.9 |
+| `balanced` (default) | +1.32% | 0.019 / 0.048 | 36.3 | 54.2 |
+| `q4`, all large matrices | +2.59% | 0.038 / 0.174 | 38.6 | 54.9 |
+
+`q4` previously used a plain min/max Q4_1 mapping (+6.14%, KL 0.082 / 0.200); the copy now searches the step and minimum per block. Alone, the hyper-connection and `attn_out` copies cost the most (document KL 0.084 and 0.076 against 0.022 to 0.033 for `ssm_in`, `ssm_out`, `attn_qkv` and the shared expert), so `balanced` leaves them in Q8_0 and keeps nearly all of the speed. `GUFO_DECODE_COPY_CLASSES` picks other subsets.
+
+The F16 residual (+0.54% perplexity) is off unless `GUFO_F16_RESIDUAL=1`. The NPU stays opt-in through `GUFO_NPU_DIR`.
