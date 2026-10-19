@@ -63,6 +63,11 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 `gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
 own repetitive context, where drafts are accepted easily).
 
+`GUFO_F16_RESIDUAL=1` keeps the prefill residual in F16 and adds about 1.5% with the
+NPU (2,125 tok/s at `-p 16384`) for +0.5% perplexity; it is off by default. The
+first NPU run after the machine has been idle can be much slower, so discard it
+when benchmarking.
+
 Prefill depends on the text as well as the length: code, markdown and prose
 route to experts differently, so the same length can vary by 20% or more.
 
