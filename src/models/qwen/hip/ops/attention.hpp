@@ -142,6 +142,52 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::span<float> packed_k_workspace = {},
     std::span<float> packed_v_workspace = {});
 
+/// Block-sparse prefill attention (opt-in, training-free): each 32-query tile
+/// attends to `sink_blocks` leading blocks, a window of `local_blocks` recent
+/// 64-token blocks and the `top_blocks` older blocks whose per-channel key
+/// min/max bound the tile's mean query best. `pooled_keys` holds those bounds
+/// per layer (`SparseAttentionPooledBytes` bytes), `block_lists` one list per
+/// tile and KV head (`SparseAttentionListInts` ints) and `pooled_valid_end` the
+/// key count the bounds already cover for this layer. The chunk's K and V must
+/// already be in the FP16 cache. Returns false for an unsupported shape.
+struct SparseAttentionConfig {
+  std::uint32_t sink_blocks{2};
+  std::uint32_t local_blocks{32};
+  std::uint32_t top_blocks{256};
+  std::uint32_t min_context{8192};
+};
+[[nodiscard]] constexpr std::size_t SparseAttentionPooledBytes(
+    std::uint32_t attention_layers, std::uint32_t kv_heads,
+    std::uint32_t max_context) noexcept {
+  return static_cast<std::size_t>(attention_layers) * kv_heads *
+         ((max_context + 63u) / 64u) * 512u * 2u;
+}
+[[nodiscard]] constexpr std::uint32_t SparseAttentionListStride(
+    const SparseAttentionConfig& config) noexcept {
+  return 1u + config.sink_blocks + config.local_blocks + config.top_blocks;
+}
+[[nodiscard]] constexpr std::size_t SparseAttentionListInts(
+    std::size_t batch_size, std::uint32_t kv_heads,
+    const SparseAttentionConfig& config) noexcept {
+  return ((batch_size + 31u) / 32u) * kv_heads *
+         SparseAttentionListStride(config);
+}
+[[nodiscard]] bool LaunchQwenSparseWmmaAttention(
+    const float* q, const float* gate, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, void* pooled_keys, std::int32_t* block_lists,
+    std::uint32_t* pooled_valid_end, std::uint32_t layer_idx,
+    std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    const SparseAttentionConfig& config, hipStream_t stream = nullptr,
+    float* split_k_scratch = nullptr);
+[[nodiscard]] bool LaunchQwenSparseDecodeAttention(
+    const float* q, const float* gate, const void* k_cache_f16,
+    const void* v_cache_f16, float* out_context, float* split_k_scratch,
+    const std::int32_t* block_list, std::uint32_t list_stride,
+    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream);
+
 /// Large-batch causal attention using float32 QK/PV GEMMs and one reusable
 /// [batch, context] score buffer.
 void LaunchBatchedAttentionGemm(

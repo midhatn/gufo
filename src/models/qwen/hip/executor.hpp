@@ -30,6 +30,7 @@
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/moe_prefill.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
+#include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
@@ -375,6 +376,16 @@ public:
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
+  /// Opt-in block-sparse attention (GUFO_QWEN_SPARSE_ATTN): per-layer key
+  /// bounds, per-tile block lists and how many keys each layer's bounds cover.
+  void* d_sparse_pooled{nullptr};
+  std::int32_t* d_sparse_lists{nullptr};
+  std::vector<std::uint32_t> sparse_pooled_end;
+  SparseAttentionConfig sparse_config{};
+  bool sparse_enabled{false};
+  void InvalidateSparseAttention() noexcept {
+    std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
+  }
   float* d_ssm_conv_state{nullptr};
   void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};

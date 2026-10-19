@@ -786,6 +786,132 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
   }
 }
 
+// Single-row decode over the 64-key blocks chosen by the sparse selector. One
+// workgroup holds the six query heads of a KV head and walks its share of the
+// selected blocks, staging four keys and values at a time.
+template<std::uint32_t kGroup>
+__launch_bounds__(32 * kGroup) __global__ void QwenSparseDecodePartialsKernel(
+    const float* __restrict__ q, const __half* __restrict__ k_cache,
+    const __half* __restrict__ v_cache, float* __restrict__ scratch,
+    const std::int32_t* __restrict__ block_list, std::uint32_t layer_idx,
+    std::uint32_t pos, std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t list_stride) {
+  constexpr std::uint32_t head_dim = 256;
+  constexpr std::uint32_t vector_width = head_dim / 4;
+  constexpr std::uint32_t vectors_per_lane = vector_width / 32;
+  constexpr std::uint32_t heads_per_block = kGroup;
+  constexpr std::uint32_t block_keys = 64;
+  constexpr std::size_t max_splits = detail::kSplitKDecodeAttentionMaxSplits;
+
+  const std::uint32_t kv_head = blockIdx.x;
+  const std::uint32_t split = blockIdx.z;
+  const std::uint32_t head = kv_head * heads_per_block + threadIdx.x / 32;
+  const std::uint32_t lane = threadIdx.x % 32;
+  const auto* query = reinterpret_cast<const float4*>(
+      q + (static_cast<std::size_t>(head) * head_dim));
+  const std::size_t kv_width =
+      static_cast<std::size_t>(num_kv_heads) * head_dim;
+  const std::size_t cache_head_offset =
+      (static_cast<std::size_t>(layer_idx) * max_context * kv_width) +
+      (static_cast<std::size_t>(kv_head) * head_dim);
+  const std::int32_t* list = block_list + (kv_head * list_stride);
+  const std::uint32_t slots = static_cast<std::uint32_t>(list[0]) * block_keys;
+  const std::uint32_t slot_begin = (slots / max_splits / 4) * 4 * split;
+  const std::uint32_t slot_span = (slots / max_splits / 4) * 4;
+  const std::uint32_t slot_end =
+      split + 1 == max_splits ? slots : slot_begin + slot_span;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+
+  float4 query_values[vectors_per_lane];
+  float4 output_values[vectors_per_lane] = {};
+#pragma unroll
+  for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+    query_values[vector] = query[lane + (vector * 32)];
+  }
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+
+  constexpr unsigned tile = 4;
+  __shared__ __align__(16) __half keys[tile][head_dim];
+  __shared__ __align__(16) __half values[tile][head_dim];
+  __shared__ std::size_t offsets[tile];
+  for (std::uint32_t begin = slot_begin; begin < slot_end; begin += tile) {
+    const unsigned count = min(tile, slot_end - begin);
+    if (threadIdx.x < count) {
+      const std::uint32_t slot = begin + threadIdx.x;
+      const std::uint32_t position =
+          (static_cast<std::uint32_t>(list[1 + slot / block_keys]) *
+           block_keys) +
+          (slot % block_keys);
+      offsets[threadIdx.x] = position <= pos
+                                 ? cache_head_offset + position * kv_width
+                                 : ~std::size_t{0};
+    }
+    __syncthreads();
+    for (unsigned vector = threadIdx.x; vector < count * 32; vector += 32 * kGroup) {
+      const unsigned token = vector / 32;
+      const unsigned dim = (vector % 32) * 8;
+      if (offsets[token] == ~std::size_t{0})
+        continue;
+      *reinterpret_cast<uint4*>(keys[token] + dim) =
+          *reinterpret_cast<const uint4*>(k_cache + offsets[token] + dim);
+      *reinterpret_cast<uint4*>(values[token] + dim) =
+          *reinterpret_cast<const uint4*>(v_cache + offsets[token] + dim);
+    }
+    __syncthreads();
+#pragma unroll 1
+    for (unsigned token = 0; token < count; ++token) {
+      if (offsets[token] == ~std::size_t{0})
+        continue;
+      float score = 0.0F;
+#pragma unroll
+      for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+        const float4 query_value = query_values[vector];
+        const float4 key_value =
+            LoadHalf4(keys[token] + ((lane + (vector * 32)) * 4));
+        score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
+                 (query_value.z * key_value.z) + (query_value.w * key_value.w);
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset /= 2) {
+        score += __shfl_down(score, offset, 32);
+      }
+      score = __shfl(score, 0, 32) * scale;
+      const float new_max = fmaxf(running_max, score);
+      const float previous_scale = expf(running_max - new_max);
+      const float value_scale = expf(score - new_max);
+      running_sum = (running_sum * previous_scale) + value_scale;
+      running_max = new_max;
+#pragma unroll
+      for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+        const float4 value_data =
+            LoadHalf4(values[token] + ((lane + (vector * 32)) * 4));
+        float4& output = output_values[vector];
+        output.x = (output.x * previous_scale) + (value_data.x * value_scale);
+        output.y = (output.y * previous_scale) + (value_data.y * value_scale);
+        output.z = (output.z * previous_scale) + (value_data.z * value_scale);
+        output.w = (output.w * previous_scale) + (value_data.w * value_scale);
+      }
+    }
+    __syncthreads();
+  }
+
+  const std::size_t partition_index =
+      (static_cast<std::size_t>(head) * max_splits) + split;
+  if (lane == 0) {
+    scratch[(partition_index * 2) + 0] = running_max;
+    scratch[(partition_index * 2) + 1] = running_sum;
+  }
+  const std::size_t stats_elements =
+      static_cast<std::size_t>(num_heads) * max_splits * 2;
+  auto* partial_outputs = reinterpret_cast<float4*>(scratch + stats_elements);
+  auto* partial_output = partial_outputs + (partition_index * vector_width);
+#pragma unroll
+  for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+    partial_output[lane + (vector * 32)] = output_values[vector];
+  }
+}
+
 __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionReduceKernel(
     const float* __restrict__ gate, const float* __restrict__ scratch,
     float* __restrict__ out_context, std::uint32_t num_heads,
@@ -1041,6 +1167,36 @@ void LaunchCausalDecodeAttention(
         start_pos + static_cast<std::uint32_t>(row), max_context, num_heads,
         num_kv_heads, head_dim, stream, split_k_scratch, true);
   }
+}
+
+bool LaunchQwenSparseDecodeAttention(
+    const float* q, const float* gate, const void* k_cache_f16,
+    const void* v_cache_f16, float* out_context, float* split_k_scratch,
+    const std::int32_t* block_list, std::uint32_t list_stride,
+    std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_kv_heads,
+    std::uint32_t head_dim, hipStream_t stream) {
+  const bool group6 = num_heads == 6 * num_kv_heads;
+  const bool group8 = num_heads == 8 * num_kv_heads;
+  if (head_dim != 256 || !(group6 || group8) || split_k_scratch == nullptr) {
+    return false;
+  }
+  constexpr std::uint32_t splits = detail::kSplitKDecodeAttentionMaxSplits;
+  const dim3 grid(num_kv_heads, 1, splits);
+  const auto* k_half = static_cast<const __half*>(k_cache_f16);
+  const auto* v_half = static_cast<const __half*>(v_cache_f16);
+  if (group6) {
+    QwenSparseDecodePartialsKernel<6><<<grid, 32 * 6, 0, stream>>>(
+        q, k_half, v_half, split_k_scratch, block_list, layer_idx, pos,
+        max_context, num_heads, num_kv_heads, list_stride);
+  } else {
+    QwenSparseDecodePartialsKernel<8><<<grid, 32 * 8, 0, stream>>>(
+        q, k_half, v_half, split_k_scratch, block_list, layer_idx, pos,
+        max_context, num_heads, num_kv_heads, list_stride);
+  }
+  QwenDecodeSplitKAttentionReduceKernel<<<num_heads, 32, 0, stream>>>(
+      gate, split_k_scratch, out_context, num_heads, splits);
+  return true;
 }
 
 }  // namespace gufo::hip

@@ -711,20 +711,40 @@ QwenGpuExecutor::ForwardVerificationBatch(
                 reinterpret_cast<float*>(scratch.decode.weight_bf16.data()),
                 sequence_size * attention_scratch.size()};
           }
-          LaunchCausalDecodeAttention(
-              (scratch.attention.q.data() + offset * attention_size),
-              (scratch.ssm.gate.data() + offset * attention_size),
-              state_arena.d_kv_cache,
-              OffsetIfPresent(state_arena.d_kv_cache, total_k),
-              state_arena.d_attention_kv_f16,
-              OffsetIfPresent(
-                  static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
-                  total_k),
-              (scratch.ssm.out.data() + offset * attention_size),
-              attention_layer, start_pos, sequence_size,
-              state_arena.GetMaxContext(), config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, arena_.stream,
-              attention_scratch);
+          const bool sparse_attention =
+              state_arena.sparse_enabled &&
+              static_cast<std::size_t>(start_pos) + sequence_size >
+                  state_arena.sparse_config.min_context &&
+              LaunchQwenSparseWmmaAttention(
+                  (scratch.attention.q.data() + offset * attention_size),
+                  (scratch.ssm.gate.data() + offset * attention_size),
+                  state_arena.d_attention_kv_f16,
+                  OffsetIfPresent(static_cast<std::uint16_t*>(
+                                      state_arena.d_attention_kv_f16),
+                                  total_k),
+                  (scratch.ssm.out.data() + offset * attention_size),
+                  state_arena.d_sparse_pooled, state_arena.d_sparse_lists,
+                  &state_arena.sparse_pooled_end[attention_layer],
+                  attention_layer, start_pos, sequence_size,
+                  state_arena.GetMaxContext(), config.num_attention_heads,
+                  config.num_key_value_heads, config.head_dim,
+                  state_arena.sparse_config, arena_.stream,
+                  attention_scratch.data());
+          if (!sparse_attention)
+            LaunchCausalDecodeAttention(
+                (scratch.attention.q.data() + offset * attention_size),
+                (scratch.ssm.gate.data() + offset * attention_size),
+                state_arena.d_kv_cache,
+                OffsetIfPresent(state_arena.d_kv_cache, total_k),
+                state_arena.d_attention_kv_f16,
+                OffsetIfPresent(
+                    static_cast<std::uint16_t*>(state_arena.d_attention_kv_f16),
+                    total_k),
+                (scratch.ssm.out.data() + offset * attention_size),
+                attention_layer, start_pos, sequence_size,
+                state_arena.GetMaxContext(), config.num_attention_heads,
+                config.num_key_value_heads, config.head_dim, arena_.stream,
+                attention_scratch);
         } else {
           for (std::size_t row = 0; row < sequence_size; ++row) {
             float* const query =

@@ -155,7 +155,23 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
 
       // Softmax Attention + Gating
-      if (use_split_k_decode) {
+      const bool sparse_decode =
+          use_split_k_decode && fused_qknorm_rope_kv && arena.sparse_enabled &&
+          sequence_length > arena.sparse_config.min_context &&
+          LaunchQwenSparseWmmaAttention(
+              attention_scratch.q.data(), ssm_scratch.gate.data(),
+              arena.d_attention_kv_f16,
+              OffsetIfPresent(
+                  static_cast<std::uint16_t*>(arena.d_attention_kv_f16),
+                  total_k),
+              ssm_scratch.out.data(), arena.d_sparse_pooled,
+              arena.d_sparse_lists, &arena.sparse_pooled_end[attn_layer_idx],
+              attn_layer_idx, pos, 1, arena.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, arena.sparse_config, arena.stream,
+              attention_scratch.split_k.data());
+      if (sparse_decode) {
+      } else if (use_split_k_decode) {
         LaunchAttention(
             attention_scratch.q.data(), attention_scratch.k.data(),
             attention_scratch.v.data(), ssm_scratch.gate.data(),
