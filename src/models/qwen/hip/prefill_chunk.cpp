@@ -156,10 +156,15 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   const bool npu_attn = half_prefill || npu_moe;
   QwenNpuFfn* const npu_ffn =
       (half_prefill || npu_moe) ? model_->NpuFfn() : nullptr;
-  if (npu_ffn != nullptr &&
-      npu_ffn->Accepts(static_cast<std::uint32_t>(batch_size))) {
-    npu_ffn->SetRows(static_cast<std::uint32_t>(batch_size));
-  }
+  // The other chunk of a pair may change the active rows while this one is
+  // suspended, so every resume point restores them.
+  const auto set_rows = [&] {
+    if (npu_ffn != nullptr &&
+        npu_ffn->Accepts(static_cast<std::uint32_t>(batch_size))) {
+      npu_ffn->SetRows(static_cast<std::uint32_t>(batch_size));
+    }
+  };
+  set_rows();
   // Which NPU stages hand over to the other chunk: 1 attention-linear, 2
   // ssm_out, 4 FFN gate/up, 8 down.
   // MoE layers have no dense FFN to hand over at, so they yield at the linear
@@ -535,8 +540,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
           npu_ffn->BeginLinear(l, bank, arena_.d_scratch_bf16, arena_.stream)) {
         npu_qkv = npu_ffn->QkvColumns(l);
         npu_gate = npu_ffn->GateColumns(l);
-        if ((yield_mask & 1U) != 0)
+        if ((yield_mask & 1U) != 0) {
           co_yield 0;
+          set_rows();
+        }
       }
       if (npu_lin || npu_qkv != 0 || npu_gate != 0) {
         LaunchBatchedQuantGEMMFp16Rows(layer.attn_qkv.type, layer.attn_qkv.data,
@@ -641,8 +648,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             npu_ffn->BeginSsmOut(l, bank, arena_.d_scratch_bf16,
                                  arena_.stream)) {
           npu_ssm_out = npu_ffn->SsmOutColumns(l);
-          if ((yield_mask & 2U) != 0)
+          if ((yield_mask & 2U) != 0) {
             co_yield 0;
+            set_rows();
+          }
         }
         if (npu_ssm_out != 0) {
           LaunchBatchedQuantGEMMResidualFp16Rows(
@@ -749,8 +758,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
                   /*dry_run=*/true) &&
               npu_ffn->Begin(l, bank, arena_.d_scratch_bf16, arena_.stream)) {
             npu_columns = npu_ffn->Columns(l);
-            if ((yield_mask & 4U) != 0)
+            if ((yield_mask & 4U) != 0) {
               co_yield 0;
+              set_rows();
+            }
           }
           const bool paired = TryLaunchBatchedDualQuantGEMMSwiGLUFp16(
               layer.ffn_gate.type, layer.ffn_up.type, layer.ffn_gate.data,
@@ -821,8 +832,10 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
             npu_ffn->DownColumns(l) != 0 &&
             npu_ffn->BeginDown(l, bank, ffn_down_input, arena_.stream)) {
           npu_down = npu_ffn->DownColumns(l);
-          if ((yield_mask & 8U) != 0)
+          if ((yield_mask & 8U) != 0) {
             co_yield 0;
+            set_rows();
+          }
         }
         if (npu_down != 0) {
           LaunchBatchedQuantGEMMResidualFp16Rows(

@@ -72,18 +72,29 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
                         vision_input_.rope() == nullptr &&
                         (lockstep_env == nullptr || lockstep_env[0] != '0');
 
+  static const std::size_t kMinPairedTokens = [] {
+    const char* v = std::getenv("GUFO_QWEN_PAIR_MIN");
+    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
+                        : std::size_t{5000};
+  }();
   tokenization::TokenId next_token = 0;
   for (std::size_t offset = 0; offset < prompt_tokens.size();
        offset += arena_.GetMaxBatch()) {
     CheckPrefillCancellation();
-    if (lockstep && prompt_tokens.size() - offset >= 2 * max_batch) {
-      const bool is_last = offset + 2 * max_batch == prompt_tokens.size();
-      next_token = ForwardPromptChunkPair(
-          prompt_tokens.subspan(offset, max_batch),
-          prompt_tokens.subspan(offset + max_batch, max_batch),
-          start_pos + static_cast<std::uint32_t>(offset),
-          compute_logits && is_last);
-      offset += max_batch;
+    const std::size_t remaining = prompt_tokens.size() - offset;
+    if (lockstep && remaining >= kMinPairedTokens) {
+      // Two full chunks, or one shorter run split in halves: either way the
+      // NPU stages of one chunk overlap the GPU work of the other.
+      const std::size_t first =
+          remaining >= 2 * max_batch ? max_batch : (remaining + 1) / 2;
+      const std::size_t second = std::min(max_batch, remaining - first);
+      const bool is_last = first + second == remaining;
+      next_token =
+          ForwardPromptChunkPair(prompt_tokens.subspan(offset, first),
+                                 prompt_tokens.subspan(offset + first, second),
+                                 start_pos + static_cast<std::uint32_t>(offset),
+                                 compute_logits && is_last);
+      offset += first + second - max_batch;
       continue;
     }
     const std::size_t chunk_size = std::min<std::size_t>(
