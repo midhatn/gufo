@@ -9,7 +9,7 @@
 # Required: GUFO_MODEL = the GGUF (for flash-next the first shard, ...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (flash-next: shared Q8_0 sidecar; 27b: MTP GGUF; 35b: "embedded" by default),
 #           GUFO_DFLASH (27b/35b: DFlash2 draft GGUF; with an MTP head the server picks per request),
-#           GUFO_BIN, PORT, JOBS, GUFO_CONTEXT (default 131072, 32768 for 27b and 35b), GUFO_EFFORT,
+#           GUFO_BIN, PORT, JOBS, GUFO_CONTEXT (default 131072 for flash-next, 262144 for 27b and 35b), GUFO_EFFORT,
 #           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 16384; 24576 is faster for 24K+ prompts, +6 GB RAM),
 #           GUFO_TWO_BANK (default 1; 0 turns the two-bank NPU prefill off)
 # NPU build: GUFO_NPU=0 forces GPU-only; XRT_DIR (default /opt/xilinx/xrt) holds the XRT libraries.
@@ -21,8 +21,8 @@ GUFO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 KIND=${GUFO_KIND:-flash-next}
 case "$KIND" in
   flash-next) SERVED_NAME="Qwen3.8 Flash Next"; DEFAULT_CONTEXT=131072 ;;
-  27b) SERVED_NAME="Qwen3.8 27B"; DEFAULT_CONTEXT=32768 ;;
-  35b) SERVED_NAME="Qwen3.6 35B-A3B"; DEFAULT_CONTEXT=32768 ;;
+  27b) SERVED_NAME="Qwen3.8 27B"; DEFAULT_CONTEXT=262144 ;;
+  35b) SERVED_NAME="Qwen3.6 35B-A3B"; DEFAULT_CONTEXT=262144 ;;
   *) echo "GUFO_KIND must be flash-next, 27b or 35b (got: $KIND)" >&2; exit 1 ;;
 esac
 GUFO_BIN=${GUFO_BIN:-}
