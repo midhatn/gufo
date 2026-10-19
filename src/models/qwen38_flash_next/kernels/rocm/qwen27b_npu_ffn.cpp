@@ -316,8 +316,9 @@ public:
     return rows >= kMinRows && rows <= kTokens;
   }
   void SetRows(std::uint32_t rows) noexcept override { rows_ = rows; }
+  void SetPaired(bool paired) noexcept override { paired_ = paired; }
   std::uint32_t Columns(std::uint32_t layer) const noexcept override {
-    return layer < columns_.size() ? Scaled(columns_[layer]) : 0;
+    return layer < columns_.size() ? FfnUsed() * kSliceColumns : 0;
   }
 
   bool Begin(std::uint32_t layer, int bank, const void* normed,
@@ -329,7 +330,7 @@ public:
     NpuEncodeActivations(static_cast<const __half*>(normed), hidden_, rows_,
                          hidden_, 0, hidden_, npu_->Device(slot.a), stream);
     const auto& full = b_[layer];
-    const std::uint32_t used = Used(slices_);
+    const std::uint32_t used = FfnUsed();
     std::vector<int> b(full.begin(), full.begin() + used);
     b.insert(b.end(), full.begin() + slices_, full.begin() + slices_ + used);
     if (!npu_->Submit(stream, slot.a, b.data(), slot.c.data(),
@@ -346,7 +347,7 @@ public:
     (void)layer;
     Slot& slot = slots_[bank];
     npu_->Wait(stream, slot.ticket);
-    const std::uint32_t used = Used(slices_);
+    const std::uint32_t used = FfnUsed();
     for (std::uint32_t i = 0; i < used; ++i) {
       NpuSwiglu(npu_->Staged(stream, slot.c[i]),
                 npu_->Staged(stream, slot.c[used + i]), nullptr, nullptr,
@@ -502,6 +503,11 @@ private:
     return std::max<std::uint32_t>(1,
                                    (slices * rows_ + (kTokens / 2)) / kTokens);
   }
+  /// A lone chunk cannot hide the NPU's wait behind a partner's GPU work, so
+  /// it hands the FFN one slice less than a paired chunk does.
+  [[nodiscard]] std::uint32_t FfnUsed() const noexcept {
+    return Used(slices_ > 1 && !paired_ ? slices_ - 1 : slices_);
+  }
   [[nodiscard]] std::uint32_t Scaled(std::uint32_t columns) const noexcept {
     return Used(columns / kSliceColumns) * kSliceColumns;
   }
@@ -527,6 +533,7 @@ private:
   std::unique_ptr<NpuGemm> npu_;
   std::uint32_t hidden_{0};
   std::uint32_t rows_{kTokens};
+  bool paired_{false};
   std::uint32_t ssm_inner_{0};
   std::uint32_t slices_{0};
   std::uint32_t down_slices_{0};

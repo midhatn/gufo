@@ -80,6 +80,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunkPair(
   // The first chunk runs on the spare scratch and NPU buffers, the second on
   // the arena's own, so the last chunk's hidden state ends up where the rest
   // of the executor looks for it. The first chunk is always one stage ahead.
+  QwenNpuFfn* const pair_npu = model_->NpuFfn();
+  struct PairedFlag {
+    QwenNpuFfn* npu;
+    explicit PairedFlag(QwenNpuFfn* n) : npu(n) {
+      if (npu != nullptr)
+        npu->SetPaired(true);
+    }
+    ~PairedFlag() {
+      if (npu != nullptr)
+        npu->SetPaired(false);
+    }
+  } paired_flag{pair_npu};
   auto first = PrefillChunkTask(first_tokens, start_pos, false, 1);
   auto second = PrefillChunkTask(
       second_tokens,

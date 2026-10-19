@@ -30,6 +30,8 @@ public:
   [[nodiscard]] virtual bool Accepts(std::uint32_t rows) const noexcept = 0;
   /// Active rows of the chunk the following stages belong to.
   virtual void SetRows(std::uint32_t rows) noexcept = 0;
+  /// Whether the chunk runs beside a partner whose GPU work hides NPU waits.
+  virtual void SetPaired(bool paired) noexcept = 0;
   /// Leading FFN columns the NPU computes for `layer`; 0 when the layer stays
   /// on the GPU.
   [[nodiscard]] virtual std::uint32_t Columns(
