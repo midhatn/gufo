@@ -162,9 +162,14 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
   }
   // Which NPU stages hand over to the other chunk: 1 attention-linear, 2
   // ssm_out, 4 FFN gate/up, 8 down.
-  static const unsigned yield_mask = [] {
+  // MoE layers have no dense FFN to hand over at, so they yield at the linear
+  // projections and the output projection instead.
+  const unsigned yield_mask = [&] {
     const char* v = std::getenv("GUFO_QWEN_LOCKSTEP_YIELDS");
-    return v != nullptr ? static_cast<unsigned>(std::atoi(v)) : 4U;
+    if (v != nullptr) {
+      return static_cast<unsigned>(std::atoi(v));
+    }
+    return config.IsMoe() ? 3U : 4U;
   }();
   const auto gemm_weight = [&](const models::QwenTensorRef& w,
                                const void* bf16_input, const float* fp32_input,

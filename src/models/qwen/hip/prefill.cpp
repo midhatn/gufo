@@ -68,7 +68,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   const char* lockstep_env = std::getenv("GUFO_QWEN_LOCKSTEP");
   QwenNpuFfn* const npu_ffn = model_->NpuFfn();
   const bool lockstep = npu_ffn != nullptr && npu_ffn->Tokens() == max_batch &&
-                        !weights_.config.IsMoe() && !capture_prompt_hidden_ &&
+                        !capture_prompt_hidden_ &&
                         vision_input_.rope() == nullptr &&
                         (lockstep_env == nullptr || lockstep_env[0] != '0');
 
