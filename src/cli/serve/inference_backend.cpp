@@ -449,6 +449,7 @@ public:
             hip::QwenMtpGpuDraftConfig{
                 .max_context = max_context,
                 .max_draft_tokens = speculative_options.max_draft_tokens,
+                .vision_input = &executor_->VisionInput(),
             },
             &error);
         if (mtp_backend == nullptr) {

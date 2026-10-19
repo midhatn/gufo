@@ -396,16 +396,17 @@ void QwenMtpGpuExecutor::PrimeBatch(
                          static_cast<const float*>(weights.hidden_norm.data),
                          hn, nullptr, n, hidden, 1.0e-6F, stream_);
     LaunchConcatRows(en, hn, cat, n, hidden, stream_);
-    LaunchFloatToBfloat16(cat, d_prime_bf16_, n * 2 * hidden, stream_);
-    LaunchBatchedQuantGEMMBf16(weights.fusion_projection.type,
-                               weights.fusion_projection.data, d_prime_bf16_,
-                               fused, n, hidden, 2 * hidden, stream_);
+    // Decode-equivalent FP32-activation GEMMs: the cache entries match what
+    // the single-token path would have written.
+    LaunchBatchedQuantGEMMFp32(weights.fusion_projection.type,
+                               weights.fusion_projection.data, cat, fused, n,
+                               hidden, 2 * hidden, stream_);
     LaunchBatchedRMSNorm(fused, static_cast<const float*>(layer.attn_norm.data),
-                         normed, d_prime_bf16_, n, hidden, 1.0e-6F, stream_);
-    LaunchBatchedQuantGEMMBf16(layer.attn_k.type, layer.attn_k.data,
-                               d_prime_bf16_, k, n, kv, hidden, stream_);
-    LaunchBatchedQuantGEMMBf16(layer.attn_v.type, layer.attn_v.data,
-                               d_prime_bf16_, v, n, kv, hidden, stream_);
+                         normed, nullptr, n, hidden, 1.0e-6F, stream_);
+    LaunchBatchedQuantGEMMFp32(layer.attn_k.type, layer.attn_k.data, normed, k,
+                               n, kv, hidden, stream_);
+    LaunchBatchedQuantGEMMFp32(layer.attn_v.type, layer.attn_v.data, normed, v,
+                               n, kv, hidden, stream_);
     LaunchBatchedFusedQKNormRoPEKvWrite(
         q, k, v, static_cast<const float*>(layer.attn_q_norm.data),
         static_cast<const float*>(layer.attn_k_norm.data), q_out, k_out,
