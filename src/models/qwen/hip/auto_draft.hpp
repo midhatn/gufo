@@ -88,9 +88,11 @@ private:
   [[nodiscard]] Which Choose();
   void RecordStep(Which which, std::size_t committed_tokens);
   std::size_t pending_committed_{0};
-  [[nodiscard]] std::vector<float> Columns(
-      std::span<const float> rows, std::size_t row_count,
-      std::span<const std::size_t> columns) const;
+  void Columns(std::span<const float> rows, std::size_t row_count,
+               std::span<const std::size_t> columns,
+               std::vector<float>& out) const;
+  std::vector<float> dflash_columns_scratch_;
+  std::vector<float> mtp_columns_scratch_;
 
   std::unique_ptr<QwenDFlashGpuDraftBackend> dflash_;
   std::unique_ptr<QwenMtpGpuDraftBackend> mtp_;

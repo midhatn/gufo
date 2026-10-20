@@ -109,11 +109,12 @@ std::unique_ptr<QwenAutoDraftBackend> QwenAutoDraftBackend::Create(
       std::move(dflash_columns), mtp_column, hidden));
 }
 
-std::vector<float> QwenAutoDraftBackend::Columns(
-    std::span<const float> rows, std::size_t row_count,
-    std::span<const std::size_t> columns) const {
+void QwenAutoDraftBackend::Columns(std::span<const float> rows,
+                                   std::size_t row_count,
+                                   std::span<const std::size_t> columns,
+                                   std::vector<float>& out) const {
   const std::size_t width = layer_ids_.size() * hidden_size_;
-  std::vector<float> out(row_count * columns.size() * hidden_size_);
+  out.resize(row_count * columns.size() * hidden_size_);
   float* destination = out.data();
   for (std::size_t row = 0; row < row_count; ++row) {
     for (const std::size_t column : columns) {
@@ -123,7 +124,6 @@ std::vector<float> QwenAutoDraftBackend::Columns(
       destination += hidden_size_;
     }
   }
-  return out;
 }
 
 bool QwenAutoDraftBackend::PrimeTargetContext(
@@ -136,11 +136,13 @@ bool QwenAutoDraftBackend::PrimeTargetContext(
   }
   Reset();
   const std::size_t rows = context.prompt_tokens.size();
-  const auto dflash_states =
-      Columns(context.prompt_hidden_states, rows, dflash_columns_);
   const std::size_t mtp_columns[] = {mtp_column_};
-  const auto mtp_states =
-      Columns(context.prompt_hidden_states, rows, mtp_columns);
+  Columns(context.prompt_hidden_states, rows, dflash_columns_,
+          dflash_columns_scratch_);
+  Columns(context.prompt_hidden_states, rows, mtp_columns,
+          mtp_columns_scratch_);
+  const auto& dflash_states = dflash_columns_scratch_;
+  const auto& mtp_states = mtp_columns_scratch_;
   speculative::DraftTargetContext dflash_context = context;
   dflash_context.prompt_hidden_states = dflash_states;
   dflash_context.hidden_size = dflash_columns_.size() * hidden_size_;
@@ -160,11 +162,13 @@ bool QwenAutoDraftBackend::AppendTargetContext(
     return false;
   }
   const std::size_t rows = context.prompt_tokens.size();
-  const auto dflash_states =
-      Columns(context.prompt_hidden_states, rows, dflash_columns_);
   const std::size_t mtp_columns[] = {mtp_column_};
-  const auto mtp_states =
-      Columns(context.prompt_hidden_states, rows, mtp_columns);
+  Columns(context.prompt_hidden_states, rows, dflash_columns_,
+          dflash_columns_scratch_);
+  Columns(context.prompt_hidden_states, rows, mtp_columns,
+          mtp_columns_scratch_);
+  const auto& dflash_states = dflash_columns_scratch_;
+  const auto& mtp_states = mtp_columns_scratch_;
   speculative::DraftTargetContext dflash_context = context;
   dflash_context.prompt_hidden_states = dflash_states;
   dflash_context.hidden_size = dflash_columns_.size() * hidden_size_;
@@ -263,7 +267,8 @@ void QwenAutoDraftBackend::UpdateTargetHidden(std::span<const float> hidden) {
   if (hidden.size() != width) {
     throw std::invalid_argument("auto draft target hidden width is invalid");
   }
-  const auto dflash_row = Columns(hidden, 1, dflash_columns_);
+  std::vector<float> dflash_row;
+  Columns(hidden, 1, dflash_columns_, dflash_row);
   dflash_->UpdateTargetHidden(dflash_row);
   const auto* mtp_row = hidden.data() + (mtp_column_ * hidden_size_);
   if (proposal_open_ && proposer_ == Which::kMtp) {
