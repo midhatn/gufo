@@ -108,6 +108,14 @@ public:
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
+  /// Frontier of the target residual rows captured by the most recent
+  /// forward, valid only while `rows` is nonzero.
+  [[nodiscard]] std::uint32_t dflash_capture_position() const noexcept {
+    return dflash_capture_pos_;
+  }
+  [[nodiscard]] std::uint32_t dflash_capture_rows() const noexcept {
+    return dflash_capture_rows_;
+  }
   /// Drops every token; the next Forward starts at position 0.
   void Reset();
   void SetCancellationCheck(std::function<bool()> check);
@@ -176,8 +184,13 @@ private:
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
+  /// Speculative session with an MTP predictor loaded; the MTP block state is
+  /// only meaningful when this is set.
+  bool mtp_head_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
+  std::uint32_t dflash_capture_pos_{0};
+  std::uint32_t dflash_capture_rows_{0};
   ContinuationHooks* continuation_hooks_{nullptr};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
@@ -230,6 +243,12 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Last trunk residual rows kept for a block-diffusion drafter. Zero
+    /// disables the capture.
+    std::uint32_t dflash_rows{0};
+    /// Zero-based completed trunk layers whose residual mean is captured, in
+    /// the drafter's feature order.
+    std::vector<std::uint32_t> dflash_layers;
   };
 
   ~Executor();
@@ -252,6 +271,11 @@ public:
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
+  /// Mean residual rows captured for the block-diffusion drafter, laid out as
+  /// [row][dflash_layers in order][hidden]. Null when capture is disabled.
+  [[nodiscard]] const float* dflash_capture() const noexcept {
+    return dflash_capture_;
+  }
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
   [[nodiscard]] std::unique_ptr<PrefillCheckpoint> MakePrefillCheckpoint(
@@ -716,6 +740,11 @@ private:
   mutable GdnBatchItem* batch_gdn_{nullptr};
   mutable std::uint32_t batch_rows_{0};
   mutable const float* selected_logits_{nullptr};
+  /// Last `dflash_rows` trunk residual means, sized once at Create.
+  float* dflash_capture_{nullptr};
+  std::uint32_t dflash_capture_rows_{0};
+  bool dflash_captures_last_layer_{false};
+  std::vector<std::uint32_t> dflash_taps_;
   [[nodiscard]] const float* VerificationLogits() const {
     return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
   }

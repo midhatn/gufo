@@ -189,7 +189,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     const auto& item = items[i];
     const auto n = item.tokens.size();
     if (item.session == nullptr || item.session->owner_ != this ||
-        !item.session->mtp_enabled_ || n == 0 || n > kDecodeRows ||
+        !item.session->mtp_head_ || n == 0 || n > kDecodeRows ||
         (item.hidden_row < 0 &&
          (n != 1 || !item.session->mtp_.residual_valid)) ||
         (item.hidden_row >= 0 &&
@@ -417,7 +417,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
-        !item.session->mtp_enabled_ || item.session->mtp_.position == 0 ||
+        !item.session->mtp_head_ || item.session->mtp_.position == 0 ||
         !item.session->mtp_.residual_valid || item.output.kv_only ||
         item.output.trace != nullptr ||
         (item.output.token == nullptr && item.output.candidates == nullptr)) {
@@ -977,7 +977,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
-      if (!items[i].session->Cancelled() && items[i].session->mtp_enabled_ &&
+      if (!items[i].session->Cancelled() && items[i].session->mtp_head_ &&
           !Check(GuardedMemcpyAsync(
                      GUFO_SITE, items[i].session->mtp_.target_hidden, s_.res,
                      static_cast<std::size_t>(n) * c.HcDim() * sizeof(float),

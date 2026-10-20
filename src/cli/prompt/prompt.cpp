@@ -652,11 +652,15 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
   std::string error;
-  if (opt.force_cpu ||
-      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp") ||
-      (opt.speculative_backend == "mtp" && opt.min_draft_tokens != 1)) {
-    std::cerr << "Flash-Next requires ROCm and supports MTP with "
-                 "--min-draft-tokens 1\n";
+  const bool supported_backend = opt.speculative_backend.empty() ||
+                                 opt.speculative_backend == "mtp" ||
+                                 opt.speculative_backend == "dflash2";
+  if (opt.force_cpu || !supported_backend ||
+      ((opt.speculative_backend == "mtp" ||
+        opt.speculative_backend == "dflash2") &&
+       opt.min_draft_tokens != 1)) {
+    std::cerr << "Flash-Next requires ROCm and supports MTP or DFlash2 "
+                 "with --min-draft-tokens 1\n";
     return nullptr;
   }
   if (opt.use_chat_template &&
@@ -669,6 +673,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
       {.max_context = kDefaultContext,
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
+       .dflash_model_path =
+           opt.speculative_backend == "dflash2" ? opt.dflash_model_path : "",
        .max_draft_tokens = opt.draft_tokens,
        .vision_model_path = opt.vision_model_path},
       &error);
