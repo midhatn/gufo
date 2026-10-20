@@ -49,6 +49,12 @@ export LD_LIBRARY_PATH="${ROCM_PATH:-/opt/rocm}/lib${LD_LIBRARY_PATH:+:$LD_LIBRA
 export GUFO_PREFILL_TILE=${GUFO_PREFILL_TILE:-16384}
 
 NPU_ENV=()
+# Block-sparse attention keeps 27b / 35b prefill and decode nearly flat with depth
+# (approximate; GUFO_SPARSE=0 restores exact dense attention).
+SPARSE_ENV=()
+if [ "$KIND" != flash-next ] && [ "${GUFO_SPARSE:-1}" != 0 ]; then
+  SPARSE_ENV=(GUFO_QWEN_SPARSE_ATTN=1)
+fi
 if [ "${GUFO_NPU:-1}" != 0 ] && [ -e /dev/accel/accel0 ] && [ -d "$GUFO_DIR/tools/npu" ]; then
   XRT_DIR=${XRT_DIR:-/opt/xilinx/xrt}
   if ! "$GUFO_DIR/tools/npu/fabric-clock.sh" status > /dev/null 2>&1; then
@@ -98,7 +104,7 @@ else
   fi
 fi
 
-env "${NPU_ENV[@]}" "$GUFO_BIN" serve llm \
+env "${NPU_ENV[@]}" "${SPARSE_ENV[@]}" "$GUFO_BIN" serve llm \
   -m "$GUFO_MODEL" \
   --served-model-name "$SERVED_NAME" \
   --port "$PORT" \

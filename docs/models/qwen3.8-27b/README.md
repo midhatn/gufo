@@ -88,3 +88,21 @@ Pairs of 4096-token chunks (or two halves of a prompt of 5000 tokens or more)
 advance in lock-step so the NPU waits of one chunk overlap the GPU work of the
 other. Prefill rises by 10% to 28%; decode is unchanged. Options are in
 [docs/NPU.md](../../NPU.md#qwen38-27b-and-qwen36-35b-a3b).
+
+## Block-sparse attention (opt-in)
+
+`GUFO_QWEN_SPARSE_ATTN=1` replaces full attention beyond 8192 tokens with block-sparse
+attention: each query reads 2 sink blocks, a 32-block local window and the 256
+best-scoring older 64-token blocks (per-block Quest key bounds, scored per head).
+Prefill, plain decode and speculative verification use it. It is approximate:
+`GUFO_QWEN_SPARSE_TOPK`, `GUFO_QWEN_SPARSE_LOCAL`, `GUFO_QWEN_SPARSE_SINK` and
+`GUFO_QWEN_SPARSE_MIN_CONTEXT` tune it, and it is off unless the flag is set.
+`scripts/run-gufo.sh` enables it for the 27B and 35B-A3B (`GUFO_SPARSE=0` disables).
+Needle-in-a-haystack at 32k, 64k and 120k matches dense attention on every case dense passes.
+
+| 27B at 128k depth, NPU on | Dense | Sparse |
+| --- | --- | --- |
+| pp4096 | 318 | 545 |
+| tg, plain decode | 8.5 | 10.7 |
+| tg, MTP | 8.7 | 10.5 |
+| tg, DFlash2 | 18.0 | 17.7 |

@@ -39,3 +39,21 @@ DFlash2, the draft that reports its proposal distribution.
   top-k routing, quantized expert vector kernels and the gated shared expert.
 - **Verification** of drafted tokens batches up to 64 rows through the same
   expert kernels.
+
+## Block-sparse attention (opt-in)
+
+`GUFO_QWEN_SPARSE_ATTN=1` replaces full attention beyond 8192 tokens with block-sparse
+attention: each query reads 2 sink blocks, a 32-block local window and the 256
+best-scoring older 64-token blocks (per-block Quest key bounds, scored per head).
+Prefill, plain decode and speculative verification use it. It is approximate:
+`GUFO_QWEN_SPARSE_TOPK`, `GUFO_QWEN_SPARSE_LOCAL`, `GUFO_QWEN_SPARSE_SINK` and
+`GUFO_QWEN_SPARSE_MIN_CONTEXT` tune it, and it is off unless the flag is set.
+`scripts/run-gufo.sh` enables it for the 27B and 35B-A3B (`GUFO_SPARSE=0` disables).
+Needle-in-a-haystack at 32k, 64k and 120k matches dense attention on every case dense passes.
+
+| 35B-A3B at 128k depth, NPU on | Dense | Sparse |
+| --- | --- | --- |
+| pp4096 | 893 | 2,112 |
+| tg, plain decode | 24.4 | 43.2 |
+| tg, MTP | 25.7 | 32.4 |
+| tg, DFlash2 | 19.4 | 43.9 |
