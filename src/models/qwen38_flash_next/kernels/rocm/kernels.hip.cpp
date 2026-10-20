@@ -3134,7 +3134,8 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, float* scores,
                                  std::uint32_t first_token, std::uint32_t ratio,
                                  std::uint32_t budget, std::uint32_t mask_words,
                                  std::uint32_t max_blocks, const float* q,
-                                 const __half* keys, float* limits) {
+                                 const __half* keys, float* limits,
+                                 float margin_rel, float margin_abs) {
   __shared__ std::uint32_t candidates[4096];
   __shared__ std::uint32_t hist[256];
   __shared__ std::uint32_t candidate_count;
@@ -3157,7 +3158,7 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, float* scores,
     // The matrix-core scores differ from the F32 ones by a few parts in 1e6,
     // so only scores that close to the cut-off can change the selection.
     const float limit = limits[2 * t];
-    const float margin = 1e-4F * limit + 1e-5F * limits[2 * t + 1];
+    const float margin = margin_rel * limit + margin_abs * limits[2 * t + 1];
     for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
       if (fabsf(row_scores[b] - limit) <= margin)
         row_scores[b] = ExactSelectScore(q, keys, t, b);
@@ -9716,12 +9717,13 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
   const std::uint32_t grid_blocks =
       live_blocks != 0 ? std::min(live_blocks, max_blocks) : max_blocks;
   static const std::uint32_t wmma_parts = [] {
-    // Matrix-core scoring is the default; GUFO_SELECT_WMMA=0 restores the
-    // F32 scorer and h scores from the F16-rounded query alone.
+    // Matrix-core scoring is the default (F16 query, reconciled in F32);
+    // GUFO_SELECT_WMMA=0 restores the F32 scorer and 2 adds the low half of
+    // the query for a tighter pre-selection.
     const char* mode = std::getenv("GUFO_SELECT_WMMA");
     if (mode != nullptr && mode[0] == '0')
       return 0U;
-    return mode != nullptr && mode[0] == 'h' ? 1U : 2U;
+    return mode != nullptr && mode[0] == '2' ? 2U : 1U;
   }();
   const bool wmma_scores = wmma_parts != 0;
   if (n_tokens >= 32 && wmma_scores) {
@@ -9745,6 +9747,11 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
   if (n_tokens >= 32 && wmma_scores) {
     // Two passes: find each row's cut-off on the matrix-core scores, then
     // re-score in F32 whatever lies within the scorer's error of it and mark.
+    // Error of the F16 query scorer (one part) or the hi+lo one (two parts),
+    // with generous headroom: re-scoring a few extra blocks per row costs
+    // almost nothing next to scoring them all.
+    const float margin_rel = wmma_parts == 1 ? 3e-3F : 1e-4F;
+    const float margin_abs = wmma_parts == 1 ? 1e-3F : 1e-5F;
     static float* limits = nullptr;
     static std::size_t limit_capacity = 0;
     if (std::size_t{n_tokens} * 2 > limit_capacity) {
@@ -9756,16 +9763,16 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
     hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<true, false>),
                        dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
                        start_pos, first_token, ratio, budget, mask_words,
-                       max_blocks, q, blocks, limits);
+                       max_blocks, q, blocks, limits, margin_rel, margin_abs);
     hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, true>),
                        dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
                        start_pos, first_token, ratio, budget, mask_words,
-                       max_blocks, q, blocks, limits);
+                       max_blocks, q, blocks, limits, margin_rel, margin_abs);
   } else {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, false>),
                        dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
                        start_pos, first_token, ratio, budget, mask_words,
-                       max_blocks, q, blocks, scores);
+                       max_blocks, q, blocks, scores, 0.0F, 0.0F);
   }
   static const bool check = std::getenv("GUFO_SELECT_CHECK") != nullptr;
   if (check && n_tokens >= 32 && wmma_scores) {
@@ -9799,7 +9806,8 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
     hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, false>),
                        dim3(n_tokens), dim3(kThreads), 0, stream, exact_mask,
                        exact_scores, start_pos, first_token, ratio, budget,
-                       mask_words, max_blocks, q, blocks, exact_scores);
+                       mask_words, max_blocks, q, blocks, exact_scores, 0.0F,
+                       0.0F);
     hipLaunchKernelGGL(SelectCompareKernel, dim3(n_tokens), dim3(kThreads), 0,
                        stream, mask, exact_mask, scores, exact_scores,
                        start_pos, first_token, ratio, budget, mask_words,
