@@ -84,6 +84,9 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
 /// Fits the drafter's top-k distribution into the compact proposal form used
 /// by verification: integer masses sum to 2^24, so the F32 q sums to exactly
 /// one and matches the distribution the block drew from.
+// One block forward serves every slot, so a slot only adds its verification.
+constexpr float kDflashSlotScale = 0.5F;
+
 MtpProposal MakeDflashProposal(std::span<const sampling::TokenId> ids,
                                std::span<const float> probabilities,
                                sampling::TokenId token) {
@@ -377,6 +380,7 @@ bool Session::InitDflash(std::string* error_msg) {
   }
   dflash_ = std::make_unique<DflashState>();
   dflash_->executor = std::move(executor);
+  draft_length_.SetSlotScale(kDflashSlotScale);
   return true;
 }
 
@@ -881,8 +885,9 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     off += n;
   }
   // Only the final attention window of the prompt reaches the drafter; the
-  // capture buffer holds it after the last forward.
-  if (!DflashPrime(error_msg)) {
+  // capture buffer holds it after the last forward. A following chunk will
+  // overwrite it, so only the last chunk primes.
+  if (!(prefill && !after.empty()) && !DflashPrime(error_msg)) {
     return false;
   }
   return true;
