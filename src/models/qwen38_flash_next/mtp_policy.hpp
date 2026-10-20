@@ -28,6 +28,10 @@ inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 /// was tuned at 0.45, which GUFO_MTP_MIN_CONF restores.
 inline constexpr float kMinDraftConfidence = 0.60F;
 
+/// Conditional acceptance above which the length controller keeps adding draft
+/// slots regardless of the cost model; 2 disables the rule.
+inline constexpr float kChainFloor = 0.40F;
+
 /// Runtime override of kMinDraftConfidence via GUFO_MTP_MIN_CONF. Comparing
 /// targets at one gate needs no rebuild; 0 disables the gate entirely. An
 /// unparseable or out-of-range value falls back to kMinDraftConfidence.
@@ -66,15 +70,30 @@ public:
     Reset();
   }
 
+  /// `cohort` is the number of requests actually decoding together; 0 keeps
+  /// the configured concurrency (sampled requests use it for reproducibility).
   [[nodiscard]] std::uint32_t Choose(std::uint32_t budget,
-                                     std::uint32_t context = 0) const noexcept {
+                                     std::uint32_t context = 0,
+                                     std::uint32_t cohort = 0) const noexcept {
+    const auto concurrency = cohort != 0 ? cohort : concurrency_;
     const auto cap = std::min(budget, limit_);
     if (cap == 0 || state_.retry_tokens != 0) {
       return 0;
     }
     // After a bounded AR interval, try one proposal to detect recovery.
-    return std::min(
-        cap, std::max({1U, BestLength(cap, context), state_.probe_depth}));
+    // The cost model is conservative about long chains: measured code decode
+    // gains 10% from drafting every slot the head is still likely to win, so
+    // extend while the observed conditional acceptance stays above a floor.
+    static const float floor = [] {
+      const char* v = std::getenv("GUFO_MTP_CHAIN_FLOOR");
+      return v == nullptr ? kChainFloor : static_cast<float>(std::atof(v));
+    }();
+    // Wider cohorts pay far more per slot, so only a single request takes it.
+    std::uint32_t likely = 0;
+    while (concurrency <= 1 && likely < cap && Probability(likely) >= floor)
+      ++likely;
+    return std::min(cap, std::max({1U, BestLength(cap, context, concurrency),
+                                   state_.probe_depth, likely}));
   }
 
   [[nodiscard]] float ExpectedTokens(std::uint32_t drafts) const noexcept {
@@ -114,7 +133,7 @@ public:
         std::max<std::uint32_t>(state_.explored_depth, observed);
     if (accepted < drafted)
       state_.failed_depths |= 1U << accepted;
-    if (BestLength(limit_, context) == 0)
+    if (BestLength(limit_, context, concurrency_) == 0)
       state_.retry_tokens = 16;
   }
 
@@ -160,9 +179,10 @@ private:
                : state_.successes[depth] /
                      (state_.successes[depth] + state_.failures[depth]);
   }
-  [[nodiscard]] std::uint32_t BestLength(std::uint32_t cap,
-                                         std::uint32_t context) const noexcept {
-    const auto costs = MtpCycleCosts(context, concurrency_);
+  [[nodiscard]] std::uint32_t BestLength(
+      std::uint32_t cap, std::uint32_t context,
+      std::uint32_t concurrency) const noexcept {
+    const auto costs = MtpCycleCosts(context, concurrency);
     float survival = 1.0F;
     float expected_tokens = 1.0F;  // The sampled target anchor.
     float best_score = 1.0F;       // Ordinary target decoding.

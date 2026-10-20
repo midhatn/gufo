@@ -1042,10 +1042,14 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
   const std::size_t width =
       MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size())))
+          ? 1 + (batch_drafts
+                     ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+                     : draft_length_.Choose(
+                           static_cast<std::uint32_t>(cap - 1),
+                           static_cast<std::uint32_t>(tokens_.size()),
+                           // A lone greedy request pays the cohort-1
+                           // cost, not the configured capacity's.
+                           sampler.config().uses_random_sampling() ? 0U : 1U))
           : cap;
   if (width == 0) {
     result->stop = true;
