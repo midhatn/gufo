@@ -2834,6 +2834,8 @@ __device__ __forceinline__ v8f WmmaBf16(v16h a, v16h b, v8f c) {
 // tree: even tiny changes can exchange blocks at the top-k boundary.
 constexpr std::uint32_t kSelectHeads = 4;
 constexpr std::uint32_t kSelectDim = 128;
+// Query rows scored per key load by the wide-prefill selector.
+constexpr std::uint32_t kSelectTile = 8;
 
 // F16 fragments are used by attention and projection kernels below.
 __device__ __forceinline__ v16h LoadFrag(const __half* p) {
@@ -2896,6 +2898,144 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
     total += fmaxf(partial[0], 0.0F);
   }
   scores[std::size_t{t0} * max_blocks + b] = total;
+}
+
+// Wide prefill scores many query rows against the same keys. A thread converts
+// its key to F32 once and scores kTokens consecutive query rows with it, so the
+// 128 F16 conversions and the key load are shared. Every product and sum keeps
+// the order of SelectScoreKernel, so the scores are bit-identical.
+template<std::uint32_t kTokens>
+__global__ __launch_bounds__(kThreads) void SelectScoreTiledKernel(
+    const float* q, const __half* blocks, float* scores, std::uint32_t n_tokens,
+    const std::uint32_t* start_pos, std::uint32_t first_token,
+    std::uint32_t ratio, std::uint32_t budget, std::uint32_t max_blocks) {
+#pragma clang fp reassociate(off)
+  const auto first = blockIdx.x * kTokens;
+  const auto last = min(first + kTokens, n_tokens) - 1;
+  const auto b = blockIdx.y * blockDim.x + threadIdx.x;
+  const auto complete_last = (*start_pos + first_token + last + 1) / ratio;
+  if (first >= n_tokens || complete_last <= budget || b >= complete_last)
+    return;
+  float key[kSelectDim];
+  {
+    const auto* packed = reinterpret_cast<const std::uint32_t*>(blocks) +
+                         std::size_t{b} * kSelectDim / 2;
+#pragma unroll
+    for (unsigned i = 0; i < kSelectDim / 2; ++i) {
+      const std::uint32_t pair = packed[i];
+      key[i * 2] =
+          __half2float(__ushort_as_half(static_cast<unsigned short>(pair)));
+      key[i * 2 + 1] = __half2float(
+          __ushort_as_half(static_cast<unsigned short>(pair >> 16)));
+    }
+  }
+  for (std::uint32_t t0 = first; t0 <= last; ++t0) {
+    const auto complete = (*start_pos + first_token + t0 + 1) / ratio;
+    if (complete <= budget || b >= complete)
+      continue;
+    float total = 0.0F;
+#pragma unroll
+    for (unsigned h = 0; h < kSelectHeads; ++h) {
+      __builtin_amdgcn_sched_barrier(0);
+      const auto* query = q + (std::size_t{t0} * kSelectHeads + h) * kSelectDim;
+      float partial[32];
+#pragma unroll
+      for (unsigned lane = 0; lane < 32; ++lane) {
+        float dot = 0.0F;
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i)
+          dot = fmaf(query[lane + i * 32], key[lane + i * 32], dot);
+        partial[lane] = dot;
+        if ((lane + 1) % 16 == 0)
+          __builtin_amdgcn_sched_barrier(0);
+      }
+#pragma unroll
+      for (unsigned delta = 16; delta; delta >>= 1) {
+#pragma unroll
+        for (unsigned lane = 0; lane < delta; ++lane)
+          partial[lane] += partial[lane + delta];
+      }
+      total += fmaxf(partial[0], 0.0F);
+    }
+    scores[std::size_t{t0} * max_blocks + b] = total;
+  }
+}
+
+// Wide prefill scoring on the matrix cores. The F32 query is split into two
+// F16 halves (hi + lo carries about 22 bits); the stored keys are exact F16, so
+// every product is exact in F32 and only the accumulation order differs from
+// SelectScoreKernel. Tokens of a tile share one key fragment per 16 blocks.
+constexpr std::uint32_t kSelWmmaTokens = 16;
+constexpr std::uint32_t kSelWmmaWaves = 8;
+constexpr std::uint32_t kSelWmmaKeyTiles = 4;
+constexpr std::uint32_t kSelWmmaBlocks = kSelWmmaWaves * kSelWmmaKeyTiles * 16;
+constexpr std::uint32_t kSelQStride = kSelectDim + 8;
+
+__global__ __launch_bounds__(kThreads) void SelectScoreWmmaKernel(
+    const float* q, const __half* blocks, float* scores, std::uint32_t n_tokens,
+    const std::uint32_t* start_pos, std::uint32_t first_token,
+    std::uint32_t ratio, std::uint32_t budget, std::uint32_t max_blocks,
+    std::uint32_t parts) {
+  __shared__ __half qs[kSelectHeads][2][kSelWmmaTokens][kSelQStride];
+  const std::uint32_t tile0 = blockIdx.x * kSelWmmaTokens;
+  const std::uint32_t last = min(tile0 + kSelWmmaTokens, n_tokens) - 1;
+  const std::uint32_t complete_last =
+      (*start_pos + first_token + last + 1) / ratio;
+  const std::uint32_t block0 = blockIdx.y * kSelWmmaBlocks;
+  if (tile0 >= n_tokens || complete_last <= budget || block0 >= complete_last)
+    return;
+  for (std::uint32_t idx = threadIdx.x;
+       idx < kSelWmmaTokens * kSelectHeads * kSelectDim; idx += kThreads) {
+    const std::uint32_t t = idx / (kSelectHeads * kSelectDim);
+    const std::uint32_t rem = idx % (kSelectHeads * kSelectDim);
+    const std::uint32_t h = rem / kSelectDim;
+    const std::uint32_t d = rem % kSelectDim;
+    const float v =
+        tile0 + t <= last
+            ? q[(std::size_t{tile0 + t} * kSelectHeads) * kSelectDim + rem]
+            : 0.0F;
+    const __half hi = __float2half_rn(v);
+    qs[h][0][t][d] = hi;
+    qs[h][1][t][d] = __float2half_rn(v - __half2float(hi));
+  }
+  __syncthreads();
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4;
+  for (std::uint32_t kt = 0; kt < kSelWmmaKeyTiles; ++kt) {
+    const std::uint32_t b0 = block0 + (wave * kSelWmmaKeyTiles + kt) * 16;
+    if (b0 >= complete_last)
+      break;
+    const std::uint32_t row = min(b0 + sub, complete_last - 1);
+    v16h kf[kSelectDim / 16];
+#pragma unroll
+    for (unsigned s = 0; s < kSelectDim / 16; ++s)
+      kf[s] = LoadFrag(blocks + std::size_t{row} * kSelectDim + s * 16);
+    v8f total = {};
+#pragma unroll
+    for (unsigned h = 0; h < kSelectHeads; ++h) {
+      v8f acc = {};
+#pragma unroll
+      for (unsigned part = 0; part < parts; ++part)
+#pragma unroll
+        for (unsigned s = 0; s < kSelectDim / 16; ++s)
+          acc = Wmma(LoadFrag(&qs[h][part][sub][s * 16]), kf[s], acc);
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i)
+        total[i] += fmaxf(acc[i], 0.0F);
+    }
+    const std::uint32_t b = b0 + sub;
+#pragma unroll
+    for (unsigned i = 0; i < 8; ++i) {
+      const std::uint32_t t = tile0 + 2 * i + half_id;
+      if (t > last)
+        continue;
+      const std::uint32_t complete = (*start_pos + first_token + t + 1) / ratio;
+      if (b < complete)
+        scores[std::size_t{t} * max_blocks + b] = total[i];
+    }
+  }
 }
 
 /// Locate a descending histogram rank cooperatively. Each thread owns
@@ -9454,10 +9594,33 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
   // launch passes its live range, sparing the empty workgroups.
   const std::uint32_t grid_blocks =
       live_blocks != 0 ? std::min(live_blocks, max_blocks) : max_blocks;
-  const dim3 grid(n_tokens, (grid_blocks + kThreads - 1) / kThreads);
-  hipLaunchKernelGGL(SelectScoreKernel, grid, dim3(kThreads), 0, stream, q,
-                     blocks, scores, n_tokens, start_pos, first_token, ratio,
-                     budget, max_blocks);
+  static const std::uint32_t wmma_parts = [] {
+    // Matrix-core scoring is the default; GUFO_SELECT_WMMA=0 restores the
+    // F32 scorer and h scores from the F16-rounded query alone.
+    const char* mode = std::getenv("GUFO_SELECT_WMMA");
+    if (mode != nullptr && mode[0] == '0')
+      return 0U;
+    return mode != nullptr && mode[0] == 'h' ? 1U : 2U;
+  }();
+  const bool wmma_scores = wmma_parts != 0;
+  if (n_tokens >= 32 && wmma_scores) {
+    const dim3 wmma((n_tokens + kSelWmmaTokens - 1) / kSelWmmaTokens,
+                    (grid_blocks + kSelWmmaBlocks - 1) / kSelWmmaBlocks);
+    hipLaunchKernelGGL(SelectScoreWmmaKernel, wmma, dim3(kThreads), 0, stream,
+                       q, blocks, scores, n_tokens, start_pos, first_token,
+                       ratio, budget, max_blocks, wmma_parts);
+  } else if (n_tokens >= 32) {
+    const dim3 tiled((n_tokens + kSelectTile - 1) / kSelectTile,
+                     (grid_blocks + kThreads - 1) / kThreads);
+    hipLaunchKernelGGL(SelectScoreTiledKernel<kSelectTile>, tiled,
+                       dim3(kThreads), 0, stream, q, blocks, scores, n_tokens,
+                       start_pos, first_token, ratio, budget, max_blocks);
+  } else {
+    const dim3 grid(n_tokens, (grid_blocks + kThreads - 1) / kThreads);
+    hipLaunchKernelGGL(SelectScoreKernel, grid, dim3(kThreads), 0, stream, q,
+                       blocks, scores, n_tokens, start_pos, first_token, ratio,
+                       budget, max_blocks);
+  }
   hipLaunchKernelGGL(SelectMarkKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, mask, scores, start_pos, first_token, ratio,
                      budget, mask_words, max_blocks);
