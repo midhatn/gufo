@@ -911,6 +911,43 @@ struct TextRunnerPool::Request::Impl {
     }
   }
 
+  bool ReserveDiskCheckpoint(std::size_t bytes) noexcept {
+    try {
+      const auto identity = InputIdentity(snapshot_tokens.size());
+      if (disk_store->WithinCheckpointStep(*runner, snapshot_tokens, identity))
+        return false;
+      disk_capture = disk_store->ReserveCapture(*runner, snapshot_tokens.size(),
+                                                bytes, identity);
+    } catch (...) {
+      return false;
+    }
+    if (!disk_capture)
+      return false;
+    snapshot_bytes = bytes;
+    retain_snapshot = false;
+    prompt_snapshot_attempted = true;
+    return true;
+  }
+
+  void PersistPromptSnapshot() noexcept {
+    if (disk_store) {
+      const auto started = std::chrono::steady_clock::now();
+      try {
+        const auto identity = InputIdentity(snapshot_tokens.size());
+        snapshot_metrics.disk_queued_bytes += disk_store->SaveAsync(
+            runner, snapshot_tokens, prompt_snapshot,
+            {identity.begin(), identity.end()}, std::move(disk_capture));
+      } catch (...) {
+        // Earlier checkpoints may already be queued.
+      }
+      snapshot_metrics.disk_enqueue_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - started)
+              .count();
+    }
+    disk_capture.reset();
+  }
+
   void FinishPromptSnapshot() noexcept {
     try {
       prompt_snapshot = snapshot_future.get();
@@ -1289,7 +1326,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
 
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   bool in_pass = false;
-  if (!impl_->disk_store && !impl_->prompt_snapshot_attempted &&
+  if (!impl_->prompt_snapshot_attempted &&
       impl_->prefill_offset < snapshot_position &&
       snapshot_position < impl_->prompt.size() &&
       impl_->runner->Descriptor().capabilities.in_pass_checkpoint) {
@@ -1305,6 +1342,8 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         impl_->snapshot_bytes = *bytes;
         impl_->retain_snapshot = true;
         impl_->prompt_snapshot_attempted = true;
+      } else if (impl_->disk_store) {
+        in_pass = impl_->ReserveDiskCheckpoint(*bytes);
       }
     }
   }
@@ -1327,11 +1366,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
       std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
   std::unique_ptr<TextRunnerSnapshot> captured;
   auto step =
-      in_pass ? impl_->runner->PrefillThrough(
-                    state, model_prompt, impl_->prefill_offset,
-                    max_input_tokens, snapshot_position, &captured)
-              : impl_->runner->Prefill(state, model_prompt,
-                                       impl_->prefill_offset, max_input_tokens);
+      in_pass
+          ? impl_->runner->PrefillThrough(
+                state, model_prompt, impl_->prefill_offset, max_input_tokens,
+                snapshot_position, &captured, impl_->disk_store != nullptr)
+          : impl_->runner->Prefill(state, model_prompt, impl_->prefill_offset,
+                                   max_input_tokens);
   const std::size_t maximum_consumed = std::min(remaining, max_input_tokens);
   if (step.consumed_tokens == 0 || step.consumed_tokens > maximum_consumed) {
     throw std::runtime_error(
@@ -1351,12 +1391,15 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     impl_->snapshot_metrics.snapshot_ms += step.checkpoint_ms;
     if (!captured || impl_->prefill_offset <= snapshot_position ||
         captured->PayloadBytes() != impl_->snapshot_bytes) {
-      impl_->lease.SkipSnapshot(SnapshotEventReason::kReservationMismatch,
-                                captured ? captured->PayloadBytes() : 0,
-                                snapshot_position);
+      if (impl_->retain_snapshot)
+        impl_->lease.SkipSnapshot(SnapshotEventReason::kReservationMismatch,
+                                  captured ? captured->PayloadBytes() : 0,
+                                  snapshot_position);
       impl_->retain_snapshot = false;
+      impl_->disk_capture.reset();
     } else {
       impl_->prompt_snapshot = std::move(captured);
+      impl_->PersistPromptSnapshot();
     }
     impl_->AdvancePromptTarget();
   }

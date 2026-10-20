@@ -141,7 +141,8 @@ public:
                                  std::uint32_t boundary,
                                  std::unique_ptr<SessionSnapshot>* checkpoint,
                                  std::string* error_msg = nullptr,
-                                 double* capture_ms = nullptr);
+                                 double* capture_ms = nullptr,
+                                 bool materialize = false);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
   struct DecodeResult {
@@ -252,12 +253,13 @@ private:
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
             double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {});
+            std::span<const std::int32_t> after = {}, bool materialize = false);
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
                 double* capture_ms = nullptr,
-                std::span<const std::int32_t> next = {});
+                std::span<const std::int32_t> next = {},
+                bool materialize = false);
   std::unique_ptr<SessionSnapshot> SaveSnapshotImpl(
       const rocm::Session& state, std::span<const std::int32_t> tokens,
       std::span<const float> logits, std::uint32_t hidden_rows,

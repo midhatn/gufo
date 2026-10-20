@@ -639,7 +639,8 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                    bool prefill, std::uint32_t boundary,
                    std::unique_ptr<SessionSnapshot>* checkpoint,
-                   double* capture_ms, std::span<const std::int32_t> after) {
+                   double* capture_ms, std::span<const std::int32_t> after,
+                   bool materialize) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size();) {
     const auto remaining = tokens.size() - off;
@@ -708,7 +709,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
           *capture->state,
           std::span<const std::int32_t>(tokens_).first(boundary),
           capture->logits, capture->hidden_rows, error_msg,
-          SnapshotMode::kBorrowed);
+          materialize ? SnapshotMode::kMaterialized : SnapshotMode::kBorrowed);
       if (capture_ms)
         *capture_ms += std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - started)
@@ -731,7 +732,8 @@ bool Session::Sync(std::span<const std::int32_t> prompt, std::string* error_msg,
 bool Session::SyncThrough(std::span<const std::int32_t> prompt,
                           std::uint32_t boundary,
                           std::unique_ptr<SessionSnapshot>* checkpoint,
-                          std::string* error_msg, double* capture_ms) {
+                          std::string* error_msg, double* capture_ms,
+                          bool materialize) {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!checkpoint || boundary == 0 || boundary > prompt.size() ||
@@ -743,13 +745,15 @@ bool Session::SyncThrough(std::span<const std::int32_t> prompt,
   checkpoint->reset();
   if (capture_ms)
     *capture_ms = 0;
-  return SyncImpl(prompt, error_msg, boundary, checkpoint, capture_ms);
+  return SyncImpl(prompt, error_msg, boundary, checkpoint, capture_ms, {},
+                  materialize);
 }
 
 bool Session::SyncImpl(std::span<const std::int32_t> prompt,
                        std::string* error_msg, std::uint32_t boundary,
                        std::unique_ptr<SessionSnapshot>* checkpoint,
-                       double* capture_ms, std::span<const std::int32_t> next) {
+                       double* capture_ms, std::span<const std::int32_t> next,
+                       bool materialize) {
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -776,7 +780,7 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   }
   valid_ = false;
   const bool ok = Feed(prompt.subspan(common), error_msg, true, boundary,
-                       checkpoint, capture_ms, next);
+                       checkpoint, capture_ms, next, materialize);
   valid_ = ok;
   return ok;
 }

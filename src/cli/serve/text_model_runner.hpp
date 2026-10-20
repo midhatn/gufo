@@ -353,9 +353,12 @@ public:
       std::size_t, std::size_t) const {
     return std::nullopt;
   }
+  /// `materialize` asks for a snapshot that owns its bytes, as persistence
+  /// requires, instead of one borrowing device state.
   [[nodiscard]] virtual TextPrefillStep PrefillThrough(
       TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
-      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*) const {
+      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*,
+      bool) const {
     throw std::logic_error("runner does not support in-pass checkpoints");
   }
   [[nodiscard]] virtual TextDecodeSelection SelectNext(

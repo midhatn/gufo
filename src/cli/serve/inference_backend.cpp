@@ -2783,7 +2783,8 @@ public:
   [[nodiscard]] TextPrefillStep PrefillThrough(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t budget, std::size_t boundary,
-      std::unique_ptr<TextRunnerSnapshot>* checkpoint) const override {
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
+      bool materialize) const override {
     auto& qfn = RequireQwenFlashNextState(state);
     if (offset != qfn.position())
       throw std::logic_error("in-pass checkpoint offset does not match state");
@@ -2795,7 +2796,8 @@ public:
     std::string error;
     double capture_ms = 0;
     if (!qfn.session().SyncThrough(prefix, static_cast<std::uint32_t>(boundary),
-                                   &captured, &error, &capture_ms)) {
+                                   &captured, &error, &capture_ms,
+                                   materialize)) {
       qfn.set_position(0);
       throw std::runtime_error("in-pass checkpoint failed: " + error);
     }
