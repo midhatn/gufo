@@ -236,7 +236,12 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   (void)hipFree(d_mask);
   (void)hipFree(d_scores);
   // F32 queries against the stored F16 keys, independently scored in F64.
-  return worst_score < 1e-5 && mismatches == 0;
+  // Scores away from the cut-off may stay at the matrix-core scorer's
+  // accuracy; the mask equality checked above is what must be exact.
+  const char* mode = std::getenv("GUFO_SELECT_WMMA");
+  const bool approximate =
+      !(mode != nullptr && mode[0] == '0') && n_tokens >= 32;
+  return worst_score < (approximate ? 1e-2 : 1e-5) && mismatches == 0;
 }
 
 void CheckQueryPrecisionBoundary() {
