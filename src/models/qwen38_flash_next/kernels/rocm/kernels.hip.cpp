@@ -3086,16 +3086,61 @@ __device__ void FindHistogramThreshold(const std::uint32_t* histogram,
 /// window; a clipped threshold falls back to the full key range. At most
 /// 4096 candidates are refined in LDS; larger bins use the original scores.
 /// Every score participates, and the final mask keeps lowest-index ties.
-__global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
+/// One query row's score for one block, in the order of SelectScoreKernel:
+/// the reference arithmetic the matrix-core scorer is reconciled against.
+__device__ float ExactSelectScore(const float* q, const __half* blocks,
+                                  std::uint32_t t0, std::uint32_t b) {
+#pragma clang fp reassociate(off)
+  std::uint32_t key[kSelectDim / 2];
+#pragma unroll
+  for (unsigned i = 0; i < kSelectDim / 2; ++i)
+    key[i] = reinterpret_cast<const std::uint32_t*>(
+        blocks)[std::size_t{b} * kSelectDim / 2 + i];
+  float total = 0.0F;
+#pragma unroll
+  for (unsigned h = 0; h < kSelectHeads; ++h) {
+    const auto* query = q + (std::size_t{t0} * kSelectHeads + h) * kSelectDim;
+    float partial[32];
+#pragma unroll
+    for (unsigned lane = 0; lane < 32; ++lane) {
+      float dot = 0.0F;
+#pragma unroll
+      for (unsigned i = 0; i < 4; ++i) {
+        const auto bits = static_cast<unsigned short>(
+            key[(lane + i * 32) / 2] >> ((lane & 1) * 16));
+        dot = fmaf(query[lane + i * 32], __half2float(__ushort_as_half(bits)),
+                   dot);
+      }
+      partial[lane] = dot;
+    }
+#pragma unroll
+    for (unsigned delta = 16; delta; delta >>= 1) {
+#pragma unroll
+      for (unsigned lane = 0; lane < delta; ++lane)
+        partial[lane] += partial[lane + delta];
+    }
+    total += fmaxf(partial[0], 0.0F);
+  }
+  return total;
+}
+
+// kThresholdOnly stops after finding the budget-th score and records it (and
+// the row maximum) in `limits`. kReconcile first recomputes, in F32, every
+// score within the matrix-core scorer's error of that threshold, so the final
+// mask is the one the F32 scorer would have produced.
+template<bool kThresholdOnly, bool kReconcile>
+__global__ void SelectMarkKernel(std::uint32_t* mask, float* scores,
                                  const std::uint32_t* start_pos,
                                  std::uint32_t first_token, std::uint32_t ratio,
                                  std::uint32_t budget, std::uint32_t mask_words,
-                                 std::uint32_t max_blocks) {
+                                 std::uint32_t max_blocks, const float* q,
+                                 const __half* keys, float* limits) {
   __shared__ std::uint32_t candidates[4096];
   __shared__ std::uint32_t hist[256];
   __shared__ std::uint32_t candidate_count;
   __shared__ std::uint32_t wave_ties[kThreads / 32];
   __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
+  __shared__ std::uint32_t row_max_bits;
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
   const std::uint32_t complete = (pos + 1) / ratio;
@@ -3106,8 +3151,24 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   if (complete <= budget) {
     return;
   }
-  const auto* sc = reinterpret_cast<const std::uint32_t*>(
-      scores + static_cast<std::size_t>(t) * max_blocks);
+  float* row_scores = scores + static_cast<std::size_t>(t) * max_blocks;
+  const auto* sc = reinterpret_cast<const std::uint32_t*>(row_scores);
+  if constexpr (kReconcile) {
+    // The matrix-core scores differ from the F32 ones by a few parts in 1e6,
+    // so only scores that close to the cut-off can change the selection.
+    const float limit = limits[2 * t];
+    const float margin = 1e-4F * limit + 1e-5F * limits[2 * t + 1];
+    for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
+      if (fabsf(row_scores[b] - limit) <= margin)
+        row_scores[b] = ExactSelectScore(q, keys, t, b);
+    }
+    __syncthreads();
+  }
+  if constexpr (kThresholdOnly) {
+    if (threadIdx.x == 0)
+      row_max_bits = 0;
+  }
+  std::uint32_t local_max = 0;
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t wave = threadIdx.x >> 5;
   // Short rows already fit the original histogram cheaply.
@@ -3147,11 +3208,18 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
         atomicAdd(&candidates[bin(v.y)], 1u);
         atomicAdd(&candidates[bin(v.z)], 1u);
         atomicAdd(&candidates[bin(v.w)], 1u);
+        if constexpr (kThresholdOnly)
+          local_max = max(local_max, max(max(v.x, v.y), max(v.z, v.w)));
       } else {
-        for (unsigned j = 0; j < 4 && b + j < complete; ++j)
+        for (unsigned j = 0; j < 4 && b + j < complete; ++j) {
           atomicAdd(&candidates[bin(sc[b + j])], 1u);
+          if constexpr (kThresholdOnly)
+            local_max = max(local_max, sc[b + j]);
+        }
       }
     }
+    if constexpr (kThresholdOnly)
+      atomicMax(&row_max_bits, local_max);
     __syncthreads();
     FindHistogramThreshold<16>(candidates, budget, wave_ties, state);
     if (!windowed || attempt != 0 ||
@@ -3196,6 +3264,13 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
     __syncthreads();
   }
   const std::uint32_t threshold = prefix;
+  if constexpr (kThresholdOnly) {
+    if (threadIdx.x == 0) {
+      limits[2 * t] = __uint_as_float(threshold);
+      limits[2 * t + 1] = __uint_as_float(row_max_bits);
+    }
+    return;
+  }
   // Blocks strictly above the threshold are in; the first `remaining` ties
   // in index order fill the budget. Ties are ranked with a wave ballot and
   // a per-chunk scan over the eight waves.
@@ -9579,6 +9654,52 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                      rope);
 }
 
+// Debug aid (GUFO_SELECT_CHECK=1): compares the shipped masks and scores with
+// an F32-scored rerun and reports the differences on stderr.
+__global__ void SelectCompareKernel(
+    const std::uint32_t* mask_a, const std::uint32_t* mask_b,
+    const float* scores_a, const float* scores_b,
+    const std::uint32_t* start_pos, std::uint32_t first_token,
+    std::uint32_t ratio, std::uint32_t budget, std::uint32_t mask_words,
+    std::uint32_t max_blocks, unsigned long long* stats) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t complete = (*start_pos + first_token + t + 1) / ratio;
+  if (complete <= budget)
+    return;
+  unsigned diff_bits = 0;
+  for (std::uint32_t w = threadIdx.x; w < mask_words; w += blockDim.x)
+    diff_bits += __popc(mask_a[std::size_t{t} * mask_words + w] ^
+                        mask_b[std::size_t{t} * mask_words + w]);
+  float worst = 0.0F;
+  __shared__ unsigned positives;
+  if (threadIdx.x == 0)
+    positives = 0;
+  __syncthreads();
+  unsigned local_positives = 0;
+  for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
+    const float exact = scores_b[std::size_t{t} * max_blocks + b];
+    const float got = scores_a[std::size_t{t} * max_blocks + b];
+    if (exact > 0.0F) {
+      worst = fmaxf(worst, fabsf(got - exact) / exact);
+      ++local_positives;
+    }
+  }
+  atomicAdd(&positives, local_positives);
+  __syncthreads();
+  if (threadIdx.x == 0 && positives < budget)
+    atomicAdd(&stats[7], 1ULL);
+  atomicAdd(&stats[0], static_cast<unsigned long long>(diff_bits));
+  if (diff_bits != 0 && threadIdx.x == 0) {
+    atomicAdd(&stats[1], 1ULL);
+    stats[4] = t;
+    stats[5] = complete;
+    stats[6] = diff_bits;
+  }
+  atomicMax(&stats[2], static_cast<unsigned long long>(__float_as_uint(worst)));
+  if (threadIdx.x == 0)
+    atomicAdd(&stats[3], 1ULL);
+}
+
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
@@ -9621,9 +9742,89 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                        blocks, scores, n_tokens, start_pos, first_token, ratio,
                        budget, max_blocks);
   }
-  hipLaunchKernelGGL(SelectMarkKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, mask, scores, start_pos, first_token, ratio,
-                     budget, mask_words, max_blocks);
+  if (n_tokens >= 32 && wmma_scores) {
+    // Two passes: find each row's cut-off on the matrix-core scores, then
+    // re-score in F32 whatever lies within the scorer's error of it and mark.
+    static float* limits = nullptr;
+    static std::size_t limit_capacity = 0;
+    if (std::size_t{n_tokens} * 2 > limit_capacity) {
+      (void)hipFree(limits);
+      limit_capacity = std::size_t{n_tokens} * 2;
+      if (hipMalloc(&limits, limit_capacity * sizeof(float)) != hipSuccess)
+        throw std::runtime_error("selector limit allocation failed");
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<true, false>),
+                       dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
+                       start_pos, first_token, ratio, budget, mask_words,
+                       max_blocks, q, blocks, limits);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, true>),
+                       dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
+                       start_pos, first_token, ratio, budget, mask_words,
+                       max_blocks, q, blocks, limits);
+  } else {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, false>),
+                       dim3(n_tokens), dim3(kThreads), 0, stream, mask, scores,
+                       start_pos, first_token, ratio, budget, mask_words,
+                       max_blocks, q, blocks, scores);
+  }
+  static const bool check = std::getenv("GUFO_SELECT_CHECK") != nullptr;
+  if (check && n_tokens >= 32 && wmma_scores) {
+    static float* exact_scores = nullptr;
+    static std::uint32_t* exact_mask = nullptr;
+    static unsigned long long* stats = nullptr;
+    constexpr int kStats = 8;
+    static std::size_t score_capacity = 0;
+    static std::size_t mask_capacity = 0;
+    const std::size_t score_count = std::size_t{n_tokens} * max_blocks;
+    const std::size_t mask_count = std::size_t{n_tokens} * mask_words;
+    if (score_count > score_capacity) {
+      (void)hipFree(exact_scores);
+      (void)hipMalloc(&exact_scores, score_count * sizeof(float));
+      score_capacity = score_count;
+    }
+    if (mask_count > mask_capacity) {
+      (void)hipFree(exact_mask);
+      (void)hipMalloc(&exact_mask, mask_count * sizeof(std::uint32_t));
+      mask_capacity = mask_count;
+    }
+    if (stats == nullptr)
+      (void)hipMalloc(&stats, kStats * sizeof(unsigned long long));
+    (void)hipMemsetAsync(stats, 0, kStats * sizeof(unsigned long long), stream);
+    const dim3 tiled((n_tokens + kSelectTile - 1) / kSelectTile,
+                     (grid_blocks + kThreads - 1) / kThreads);
+    hipLaunchKernelGGL(SelectScoreTiledKernel<kSelectTile>, tiled,
+                       dim3(kThreads), 0, stream, q, blocks, exact_scores,
+                       n_tokens, start_pos, first_token, ratio, budget,
+                       max_blocks);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(SelectMarkKernel<false, false>),
+                       dim3(n_tokens), dim3(kThreads), 0, stream, exact_mask,
+                       exact_scores, start_pos, first_token, ratio, budget,
+                       mask_words, max_blocks, q, blocks, exact_scores);
+    hipLaunchKernelGGL(SelectCompareKernel, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, mask, exact_mask, scores, exact_scores,
+                       start_pos, first_token, ratio, budget, mask_words,
+                       max_blocks, stats);
+    unsigned long long host[kStats] = {};
+    (void)hipMemcpyAsync(host, stats, sizeof(host), hipMemcpyDeviceToHost,
+                         stream);
+    (void)hipStreamSynchronize(stream);
+    float worst = 0.0F;
+    const auto worst_bits = static_cast<std::uint32_t>(host[2]);
+    std::memcpy(&worst, &worst_bits, sizeof(worst));
+    std::fprintf(stderr,
+                 "[select-check] rows=%llu rows_with_diff=%llu bits_diff=%llu "
+                 "max_rel_score_err=%g\n",
+                 host[3], host[1], host[0], static_cast<double>(worst));
+    std::fprintf(stderr,
+                 "[select-check]   rows with fewer positive scores than the "
+                 "budget: %llu\n",
+                 host[7]);
+    if (host[1] != 0)
+      std::fprintf(stderr,
+                   "[select-check]   diff row t=%llu complete=%llu bits=%llu "
+                   "start=%u first=%u n=%u\n",
+                   host[4], host[5], host[6], 0U, first_token, n_tokens);
+  }
 }
 
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,

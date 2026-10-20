@@ -139,21 +139,9 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
                     mask_words, compact_stride, nullptr,
                     (start_pos + first + count) / kRatio);
   }
-  const char* wmma_env = std::getenv("GUFO_SELECT_WMMA");
-  if (!(wmma_env != nullptr && wmma_env[0] == '0') && n_tokens >= 32) {
-    // The chunked rerun above scores 31-row chunks with the exact kernel, so
-    // this counts how often the matrix-core scorer exchanges a boundary block.
-    const auto exact_mask = Download(d_mask, mask.size());
-    std::size_t swapped = 0;
-    for (std::size_t i = 0; i < mask.size(); ++i)
-      swapped +=
-          static_cast<std::size_t>(__builtin_popcount(mask[i] ^ exact_mask[i]));
-    std::cout << "matrix-core scoring n=" << n_tokens << " start=" << start_pos
-              << ": " << swapped << " mask bits differ from exact scoring over "
-              << n_tokens << " rows ("
-              << static_cast<double>(swapped) / 2.0 / n_tokens
-              << " swapped blocks per row)\n";
-  } else if (Download(d_mask, mask.size()) != mask) {
+  // The wide batch runs the matrix-core scorer and the 31-row chunks the F32
+  // one; reconciliation must make their masks identical.
+  if (Download(d_mask, mask.size()) != mask) {
     throw std::runtime_error("chunked selection changed the mask");
   }
   CheckHip(hipFree(d_chunk_scores), "free chunk scores");

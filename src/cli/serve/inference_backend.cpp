@@ -2534,6 +2534,63 @@ public:
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
     }
+    Warmup();
+  }
+
+  /// Runs one throwaway prefill of more than a full chunk plus a few decode
+  /// steps on a short-lived session, so the first real request does not pay
+  /// for lazy kernel, scratch and NPU start-up. GUFO_WARMUP=0 skips it.
+  void Warmup() const {
+    const char* disabled = std::getenv("GUFO_WARMUP");
+    if (disabled != nullptr && disabled[0] == '0')
+      return;
+    try {
+      constexpr std::size_t kTail = 4096;
+      const std::size_t room = max_context_ > 128 ? max_context_ - 128 : 0;
+      const std::size_t length =
+          std::min<std::size_t>(model_->PrefillCapacity() + kTail, room);
+      if (length < kTail)
+        return;
+      const auto started = std::chrono::steady_clock::now();
+      std::string error;
+      auto session = model_->CreateSession(
+          use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                   : gufo::core::SessionMode::kAutoregressive,
+          static_cast<std::uint32_t>(length + 64), &error);
+      if (session == nullptr) {
+        Logger::Warn("loader", "event=warmup_skipped reason=" + error);
+        return;
+      }
+      const auto unit = model_->Tokenize(
+          "The quick brown fox jumps over the lazy dog while the engine warms "
+          "its kernels. ");
+      if (unit.empty())
+        return;
+      std::vector<std::int32_t> prompt;
+      prompt.reserve(length);
+      for (std::size_t i = 0; i < length; ++i)
+        prompt.push_back(unit[i % unit.size()]);
+      if (!session->Sync(prompt, &error)) {
+        Logger::Warn("loader", "event=warmup_failed reason=" + error);
+        return;
+      }
+      sampling::SamplerState sampler;
+      for (int step = 0; step < 4; ++step) {
+        QwenFlashNextSession::DecodeResult decoded;
+        if (!session->DecodeStep(use_mtp_ ? max_draft_tokens_ + 1 : 1, sampler,
+                                 &decoded, &error, false))
+          break;
+      }
+      const auto elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+      Logger::Info("loader",
+                   "event=warmup_completed tokens=" + std::to_string(length) +
+                       " elapsed_s=" + std::to_string(elapsed));
+    } catch (const std::exception& failure) {
+      Logger::Warn("loader",
+                   std::string("event=warmup_failed reason=") + failure.what());
+    }
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
