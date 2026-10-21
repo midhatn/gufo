@@ -283,6 +283,9 @@ private:
   std::size_t scratch_bytes_{0};
   void* d_batch_scratch_{nullptr};
   std::size_t batch_scratch_bytes_{0};
+  std::uint32_t draft_head_rows_{0};
+  std::uint32_t draft_tail_rows_{0};
+  std::uint32_t draft_tail_base_{0};
 };
 
 struct QwenDFlashGpuDraftConfig {

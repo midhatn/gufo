@@ -14,6 +14,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
@@ -249,6 +250,24 @@ void QwenDFlashGpuExecutor::Allocate() {
   const std::size_t enc_in_dim = df_cfg.target_layer_ids.size() * hidden_size;
   const std::size_t dynamic_size =
       2U * df_cfg.conv_kernel_size * (hidden_size / df_cfg.conv_group_size);
+
+  const char* dflash_vocab = std::getenv("GUFO_DFLASH_VOCAB");
+  if (dflash_vocab == nullptr) {
+    dflash_vocab = std::getenv("GUFO_MTP_VOCAB");
+  }
+  constexpr int kDefaultDraftVocab = 163840;
+  const int vocab_rows =
+      dflash_vocab != nullptr ? std::atoi(dflash_vocab) : kDefaultDraftVocab;
+  if (vocab_rows > 0) {
+    constexpr std::uint32_t kTailBase = 248044;  // first special token id
+    const auto rows = static_cast<std::uint32_t>(vocab_rows);
+    const std::uint32_t vocab = static_cast<std::uint32_t>(cfg.vocab_size);
+    if (vocab > kTailBase && rows % 256 == 0 && rows + 512 < kTailBase) {
+      draft_head_rows_ = rows;
+      draft_tail_base_ = kTailBase;
+      draft_tail_rows_ = vocab - kTailBase;
+    }
+  }
 
   const auto error = hipStreamCreate(&stream_);
   if (error != hipSuccess) {
@@ -1204,9 +1223,40 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   TraceTensor(trace, "selector_hidden", d_selector_hidden_,
               draft_count * df_cfg.selector_rank, stream_);
 
-  RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
-               draft_count, vocab_size, hidden_size);
-  TraceTensor(trace, "logits", d_logits_, draft_count * vocab_size, stream_);
+  const float* head_logits = d_logits_;
+  const float* tail_logits = nullptr;
+  if (draft_head_rows_ != 0) {
+    const std::size_t row_bytes =
+        quant::EncodedSizeBytes(weights.output.type, hidden_size);
+    if (row_bytes != 0) {
+      models::QwenTensorRef first_output = weights.output;
+      first_output.num_elements =
+          static_cast<std::size_t>(draft_head_rows_) * hidden_size;
+
+      models::QwenTensorRef tail_output = weights.output;
+      tail_output.data = static_cast<const std::uint8_t*>(weights.output.data) +
+                         row_bytes * draft_tail_base_;
+      tail_output.num_elements =
+          static_cast<std::size_t>(draft_tail_rows_) * hidden_size;
+
+      float* tail_dst = d_logits_ + df_cfg.block_size * draft_head_rows_;
+      RunBlockGemm(first_output, d_block_normed_ + hidden_size, d_logits_,
+                   draft_count, draft_head_rows_, hidden_size);
+      RunBlockGemm(tail_output, d_block_normed_ + hidden_size, tail_dst,
+                   draft_count, draft_tail_rows_, hidden_size);
+      tail_logits = tail_dst;
+    } else {
+      RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
+                   draft_count, vocab_size, hidden_size);
+    }
+  } else {
+    RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
+                 draft_count, vocab_size, hidden_size);
+  }
+  TraceTensor(
+      trace, "logits", d_logits_,
+      draft_count * (draft_head_rows_ != 0 ? draft_head_rows_ : vocab_size),
+      stream_);
 
   if (temperature > 0.0F) {
     const auto uniform_copy = hipMemcpyAsync(
@@ -1221,7 +1271,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   const std::array sequences{
       kernels::DFlashSelectorSequence{draft_count, temperature}};
   kernels::LaunchDFlashSelectorBatch(
-      d_logits_, d_selector_hidden_, weights.selector_predecessor.data,
+      head_logits, d_selector_hidden_, weights.selector_predecessor.data,
       weights.selector_successor.data, d_out_token_, d_confidences_,
       d_ffn_gate_, reinterpret_cast<std::uint32_t*>(d_ffn_up_),
       temperature > 0.0F ? d_selector_uniforms_ : nullptr,
@@ -1230,7 +1280,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
           ? d_selector_candidate_probabilities_
           : nullptr,
       sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
-      stream_);
+      stream_, tail_logits, draft_head_rows_, draft_tail_rows_,
+      draft_tail_base_);
 
   const auto token_copy =
       hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,

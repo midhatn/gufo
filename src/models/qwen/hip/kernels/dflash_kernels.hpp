@@ -88,7 +88,9 @@ void LaunchDFlashSelectorBatch(
     std::uint32_t* candidate_ids, float* candidate_probabilities,
     std::span<const DFlashSelectorSequence> sequences, std::uint32_t vocab_size,
     std::uint32_t selector_rank, std::uint32_t selector_top_k,
-    hipStream_t stream);
+    hipStream_t stream, const float* tail_logits = nullptr,
+    std::uint32_t draft_head_rows = 0, std::uint32_t draft_tail_rows = 0,
+    std::uint32_t draft_tail_base = 0);
 
 }  // namespace gufo::hip::kernels
 #endif  // defined(ENGINE_ENABLE_HIP)

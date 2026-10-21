@@ -484,11 +484,16 @@ __device__ void MergeSelectorLists(float* scores, uint32_t* ids,
   __syncthreads();
 }
 
+__device__ __forceinline__ uint32_t RemapSelectorTokenId(
+    uint32_t id, uint32_t head_rows, uint32_t tail_base) {
+  return head_rows != 0 && id >= head_rows ? id - head_rows + tail_base : id;
+}
+
 __global__ void dflash_selector_partial_topk_kernel(
-    const float* __restrict__ logits, float* __restrict__ partial_scores,
-    uint32_t* __restrict__ partial_ids, uint32_t vocab_size,
+    const float* __restrict__ logits, const float* __restrict__ tail_logits,
+    float* __restrict__ partial_scores, uint32_t* __restrict__ partial_ids,
+    uint32_t head_rows, uint32_t tail_rows, uint32_t head_partial_count,
     uint32_t selector_top_k) {
-  logits += uint64_t(blockIdx.y) * vocab_size;
   partial_scores += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
   partial_ids += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
@@ -502,12 +507,25 @@ __global__ void dflash_selector_partial_topk_kernel(
     local_ids[index] = 0;
   }
 
-  const uint32_t begin = blockIdx.x * kSelectorTokensPerBlock;
-  const uint32_t requested_end = begin + kSelectorTokensPerBlock;
-  const uint32_t end = requested_end < vocab_size ? requested_end : vocab_size;
-  for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
-    InsertSelectorCandidate(logits[token], token, local_scores, local_ids,
-                            selector_top_k);
+  if (blockIdx.x < head_partial_count) {
+    const float* row_logits = logits + uint64_t(blockIdx.y) * head_rows;
+    const uint32_t begin = blockIdx.x * kSelectorTokensPerBlock;
+    const uint32_t requested_end = begin + kSelectorTokensPerBlock;
+    const uint32_t end = requested_end < head_rows ? requested_end : head_rows;
+    for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
+      InsertSelectorCandidate(row_logits[token], token, local_scores, local_ids,
+                              selector_top_k);
+    }
+  } else if (tail_logits != nullptr && tail_rows != 0) {
+    const float* row_logits = tail_logits + uint64_t(blockIdx.y) * tail_rows;
+    const uint32_t tail_block = blockIdx.x - head_partial_count;
+    const uint32_t begin = tail_block * kSelectorTokensPerBlock;
+    const uint32_t requested_end = begin + kSelectorTokensPerBlock;
+    const uint32_t end = requested_end < tail_rows ? requested_end : tail_rows;
+    for (uint32_t token = begin + threadIdx.x; token < end; token += blockDim.x) {
+      InsertSelectorCandidate(row_logits[token], head_rows + token, local_scores,
+                              local_ids, selector_top_k);
+    }
   }
 
   const uint32_t shared_offset = threadIdx.x * kMaxSelectorTopK;
@@ -538,7 +556,8 @@ __device__ __forceinline__ void FinalizeSelector(
     float temperature, const float* __restrict__ sample_uniform,
     uint32_t* __restrict__ candidate_ids,
     float* __restrict__ candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k) {
+    uint32_t selector_rank, uint32_t selector_top_k, uint32_t head_rows,
+    uint32_t tail_base) {
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
   __shared__ float
@@ -578,7 +597,8 @@ __device__ __forceinline__ void FinalizeSelector(
     const uint32_t candidate_index = threadIdx.x / kSelectorTransitionLanes;
     const uint32_t part = threadIdx.x % kSelectorTransitionLanes;
     if (candidate_index < selector_top_k) {
-      const uint32_t candidate = shared_ids[candidate_index];
+      const uint32_t candidate = RemapSelectorTokenId(
+          shared_ids[candidate_index], head_rows, tail_base);
       const hip_bfloat16* successor_row =
           successor_codebook + (uint64_t)candidate * selector_rank;
       float partial = 0.0F;
@@ -626,7 +646,8 @@ __device__ __forceinline__ void FinalizeSelector(
 
   if (candidate_ids != nullptr) {
     for (uint32_t index = 0; index < selector_top_k; ++index) {
-      candidate_ids[index] = top_ids[index];
+      candidate_ids[index] =
+          RemapSelectorTokenId(top_ids[index], head_rows, tail_base);
     }
   }
 
@@ -655,12 +676,14 @@ __device__ __forceinline__ void FinalizeSelector(
         sampled_index = index;
       }
     }
-    *output_token = top_ids[sampled_index];
+    *output_token =
+        RemapSelectorTokenId(top_ids[sampled_index], head_rows, tail_base);
     if (output_confidence != nullptr) {
       *output_confidence = path_scores[sampled_index] * inverse_denominator;
     }
   } else {
-    *output_token = top_ids[best_index];
+    *output_token =
+        RemapSelectorTokenId(top_ids[best_index], head_rows, tail_base);
     if (candidate_probabilities != nullptr) {
       for (uint32_t index = 0; index < selector_top_k; ++index)
         candidate_probabilities[index] = index == best_index ? 1.0F : 0.0F;
@@ -678,18 +701,21 @@ __global__ void dflash_selector_finalize_kernel(
     uint32_t* output_token, float* output_confidence, float temperature,
     const float* sample_uniform, uint32_t* candidate_ids,
     float* candidate_probabilities, uint32_t partial_count,
-    uint32_t selector_rank, uint32_t selector_top_k) {
+    uint32_t selector_rank, uint32_t selector_top_k, uint32_t head_rows,
+    uint32_t tail_base) {
   FinalizeSelector(partial_scores, partial_ids, projected_hidden,
                    predecessor_codebook, successor_codebook, predecessor_token,
                    output_token, output_confidence, temperature, sample_uniform,
                    candidate_ids, candidate_probabilities, partial_count,
-                   selector_rank, selector_top_k);
+                   selector_rank, selector_top_k, head_rows, tail_base);
 }
 
 struct SelectorBatch {
   DFlashSelectorSequence sequences[8];
   uint32_t row_offsets[8];
   uint32_t token_offsets[8];
+  uint32_t head_rows;
+  uint32_t tail_base;
 };
 
 __global__ void dflash_selector_finalize_batch_kernel(
@@ -719,7 +745,8 @@ __global__ void dflash_selector_finalize_batch_kernel(
         candidate_ids != nullptr ? candidate_ids + candidate : nullptr,
         candidate_probabilities != nullptr ? candidate_probabilities + candidate
                                            : nullptr,
-        partial_count, selector_rank, selector_top_k);
+        partial_count, selector_rank, selector_top_k, batch.head_rows,
+        batch.tail_base);
     // Thread zero publishes the predecessor for this sequence's next step.
     // Other sequences own separate token, probability and partial buffers.
     if (threadIdx.x == 0U)
@@ -865,14 +892,15 @@ void LaunchDFlashSelectorStep(
       (vocab_size + kSelectorTokensPerBlock - 1U) / kSelectorTokensPerBlock;
   dflash_selector_partial_topk_kernel<<<partial_count, kSelectorThreads, 0,
                                         stream>>>(
-      logits, partial_scores, partial_ids, vocab_size, selector_top_k);
+      logits, nullptr, partial_scores, partial_ids, vocab_size, 0,
+      partial_count, selector_top_k);
   dflash_selector_finalize_kernel<<<1, kSelectorThreads, 0, stream>>>(
       partial_scores, partial_ids, projected_hidden,
       static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
       static_cast<const hip_bfloat16*>(successor_codebook_bf16),
       predecessor_token, output_token, output_confidence, temperature,
       sample_uniform, candidate_ids, candidate_probabilities, partial_count,
-      selector_rank, selector_top_k);
+      selector_rank, selector_top_k, 0, 0);
 }
 
 void LaunchDFlashSelectorBatch(
@@ -883,7 +911,8 @@ void LaunchDFlashSelectorBatch(
     std::uint32_t* candidate_ids, float* candidate_probabilities,
     std::span<const DFlashSelectorSequence> sequences, std::uint32_t vocab_size,
     std::uint32_t selector_rank, std::uint32_t selector_top_k,
-    hipStream_t stream) {
+    hipStream_t stream, const float* tail_logits, std::uint32_t draft_head_rows,
+    std::uint32_t draft_tail_rows, std::uint32_t draft_tail_base) {
   if (sequences.empty() || sequences.size() > 8 || logits == nullptr ||
       projected_hidden == nullptr || predecessor_codebook_bf16 == nullptr ||
       successor_codebook_bf16 == nullptr || tokens == nullptr ||
@@ -892,6 +921,8 @@ void LaunchDFlashSelectorBatch(
       selector_top_k > kMaxSelectorTopK || selector_top_k > vocab_size)
     throw std::invalid_argument("invalid DFlash selector batch or scratch");
   SelectorBatch batch{};
+  batch.head_rows = draft_head_rows;
+  batch.tail_base = draft_tail_base;
   std::uint32_t rows = 0;
   for (std::size_t index = 0; index < sequences.size(); ++index) {
     const auto sequence = sequences[index];
@@ -906,12 +937,22 @@ void LaunchDFlashSelectorBatch(
     batch.token_offsets[index] = rows + static_cast<std::uint32_t>(index);
     rows += sequence.count;
   }
-  const auto partial_count = static_cast<std::uint32_t>(
-      (static_cast<std::uint64_t>(vocab_size) + kSelectorTokensPerBlock - 1U) /
+  const uint32_t effective_head_rows =
+      draft_head_rows != 0 ? draft_head_rows : vocab_size;
+  const auto head_partial_count = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(effective_head_rows) +
+       kSelectorTokensPerBlock - 1U) /
       kSelectorTokensPerBlock);
+  const auto tail_partial_count = static_cast<std::uint32_t>(
+      draft_tail_rows != 0 ? (static_cast<std::uint64_t>(draft_tail_rows) +
+                              kSelectorTokensPerBlock - 1U) /
+                                 kSelectorTokensPerBlock
+                           : 0U);
+  const auto partial_count = head_partial_count + tail_partial_count;
   dflash_selector_partial_topk_kernel<<<dim3(partial_count, rows),
                                         kSelectorThreads, 0, stream>>>(
-      logits, partial_scores, partial_ids, vocab_size, selector_top_k);
+      logits, tail_logits, partial_scores, partial_ids, effective_head_rows,
+      draft_tail_rows, head_partial_count, selector_top_k);
   dflash_selector_finalize_batch_kernel<<<sequences.size(), kSelectorThreads, 0,
                                           stream>>>(
       partial_scores, partial_ids, projected_hidden,
