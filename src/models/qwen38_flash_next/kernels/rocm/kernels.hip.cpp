@@ -8797,71 +8797,11 @@ void SsmConvTail(const float* qkvz, const float* conv_w, const float* history,
       channels, stride, c_begin);
 }
 
-/// F16 rows read as 16-byte chunks (eight weights per lane and step); each
-/// token sums its eight products in a fixed order, so every width shares
-/// one arithmetic. Requires k to be a multiple of 256.
-template<unsigned tokens>
-__global__ void SmallGemmHalfKernel(const __half* __restrict__ w,
-                                    const float* __restrict__ x,
-                                    float* __restrict__ out, std::uint32_t m,
-                                    std::uint32_t k) {
-  const std::uint32_t lane = threadIdx.x % warpSize;
-  const std::uint32_t row =
-      blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
-  if (row >= m) {
-    return;
-  }
-  const auto* wrow = reinterpret_cast<const uint4*>(w + std::size_t{row} * k);
-  float acc[tokens] = {};
-  for (std::uint32_t c = lane; c < k / 8; c += warpSize) {
-    const uint4 raw = wrow[c];
-    const __half2* h = reinterpret_cast<const __half2*>(&raw);
-    float wv[8];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float2 f = __half22float2(h[i]);
-      wv[2 * i] = f.x;
-      wv[2 * i + 1] = f.y;
-    }
-#pragma unroll
-    for (unsigned j = 0; j < tokens; ++j) {
-      const auto* xr = reinterpret_cast<const float4*>(
-          x + static_cast<std::size_t>(j) * k + std::size_t{c} * 8);
-      const float4 a = xr[0];
-      const float4 b = xr[1];
-      float dot = wv[0] * a.x;
-      dot = __fmaf_rn(wv[1], a.y, dot);
-      dot = __fmaf_rn(wv[2], a.z, dot);
-      dot = __fmaf_rn(wv[3], a.w, dot);
-      dot = __fmaf_rn(wv[4], b.x, dot);
-      dot = __fmaf_rn(wv[5], b.y, dot);
-      dot = __fmaf_rn(wv[6], b.z, dot);
-      dot = __fmaf_rn(wv[7], b.w, dot);
-      acc[j] += dot;
-    }
-  }
-#pragma unroll
-  for (unsigned j = 0; j < tokens; ++j) {
-    const float total = WaveSum(acc[j]);
-    if (lane == 0) {
-      out[static_cast<std::size_t>(j) * m + row] = total;
-    }
-  }
-}
-
 template<WeightType type, unsigned tokens>
 void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
                      std::uint32_t k, hipStream_t stream) {
-  if constexpr (type == WeightType::kF16) {
-    if (k % 256 == 0) {
-      hipLaunchKernelGGL((SmallGemmHalfKernel<tokens>),
-                         dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
-                         dim3(kSmallGemmRows * 32), 0, stream,
-                         static_cast<const __half*>(w), x, out, m, k);
-      return;
-    }
-  }
-  if constexpr (type == WeightType::kF32 || type == WeightType::kBF16) {
+  if constexpr (type == WeightType::kF32 || type == WeightType::kF16 ||
+                type == WeightType::kBF16) {
     // Rows of whole four-step passes (K 2560: router and GDN alpha/beta in
     // F16, indexer in BF16) take the unchecked vector loads, four steps at a
     // time at any width: the same products in the same order.
