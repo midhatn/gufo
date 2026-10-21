@@ -338,7 +338,9 @@ struct ComponentTextCache::Impl {
             if (!success) {
               Logger::Info(
                   "cache",
-                  "schema=component-cache-v1 event=persistence_incomplete");
+                  "schema=component-cache-v1 event=persistence_incomplete "
+                  "checkpoint_id=" +
+                      std::to_string(id.value));
               return;
             }
             catalog->Track(id);
@@ -1148,29 +1150,38 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   }
 }
 
-bool ComponentTextCache::PublicationPending(
-    std::span<const ContinuationToken> prompt,
-    const TextPromptContext* context) const {
-  // A disk job still writing a much deeper prefix of this prompt usually
-  // finishes sooner than prefilling the difference again (#562, step E2):
-  // a conversation larger than the RAM budget has no RAM copy.
-  constexpr std::size_t kWaitGainTokens = 4096;
+std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
+    std::span<const ContinuationToken> prompt, const TextPromptContext* context,
+    std::uint64_t checkpoint_id) const {
   if (!impl_->queue)
-    return false;
+    return std::nullopt;
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
   const std::size_t best = found.selected ? found.selected->boundary : 0;
-  return std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
+  std::optional<TextPendingPublication> selected;
+  for (const auto& capture : impl_->pending_durable) {
     if (!capture)
-      return false;
+      continue;
+    const auto id = capture->manifest.checkpoint.value;
+    if (checkpoint_id && id != checkpoint_id)
+      continue;
     const auto& tokens = capture->manifest.tokens;
-    return tokens.size() > best + kWaitGainTokens &&
-           tokens.size() <= prompt.size() &&
-           capture->manifest.input == At(input, tokens.size()) &&
-           std::equal(tokens.begin(), tokens.end(), prompt.begin());
-  });
+    if (tokens.size() > prompt.size() ||
+        capture->manifest.input != At(input, tokens.size()) ||
+        !std::equal(tokens.begin(), tokens.end(), prompt.begin()))
+      continue;
+    TextPendingPublication candidate{id, best, tokens.size()};
+    if (!checkpoint_id &&
+        candidate.Gain() <= TextPendingPublication::kMinimumGainTokens)
+      continue;
+    if (!selected || candidate.pending_tokens > selected->pending_tokens ||
+        (candidate.pending_tokens == selected->pending_tokens &&
+         id < selected->checkpoint_id))
+      selected = candidate;
+  }
+  return selected;
 }
 
 std::size_t ComponentTextCache::CachedPrefixTokens(
