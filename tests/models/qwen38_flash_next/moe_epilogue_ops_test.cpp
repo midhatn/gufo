@@ -146,7 +146,8 @@ int main() {
     Upload(&d_res_separate, residual);
     Upload(&d_inject, MakeValues(kTokens * 4 * parts, 0x24680U, 0.5F));
     Upload(&d_gamma, MakeValues(4 * kHidden, 0x98765U, 0.5F, 1.0F));
-    q::NarrowActivations(d_expert.get(), d_half.get(), false, kExpert, nullptr);
+    q::NarrowActivations(d_expert.get(), d_half.get(), false, kExpert, kExpert,
+                         "moe_epilogue_ops", "expert", "f16", kExpert, 0, 0);
     for (bool normalize : {true, false}) {
       if (!q::HcCombineMoeF16(normalize ? d_res_norm.get() : d_res_only.get(),
                               d_half.get(), d_weights.get(), d_shared.get(),
