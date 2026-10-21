@@ -85,6 +85,7 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+constexpr std::uint32_t kWidePrefillRows = 256;
 constexpr std::uint32_t kRoutedWideTokens =
     3072;  ///< per-expert wide gate/up and down tiles from here
 constexpr std::uint32_t kRoutedGateWideMin =
@@ -116,6 +117,13 @@ bool MatrixRows(std::uint32_t rows) {
 }
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
+}
+/// Prefill passes wider than kWidePrefillRows take the fused projections and
+/// the paired routed expert tiles: measured against the narrow routes they are
+/// 4% slower at 128 rows, equal at 256 and 4% to 17% faster from 300 to 768.
+/// Decode and verification batches keep their single-token arithmetic.
+bool WidePrefill(std::uint32_t rows) {
+  return prefill_phase && rows > kWidePrefillRows;
 }
 
 /// Whether mmq's Q8_1 rows of width k carry no padding, so a producer's
@@ -2212,8 +2220,11 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // launches on the same stream.
   std::uint32_t max_rows = 0;
   std::uint32_t n_tiles = 0;
-  routed_tile_rows_ = RoutedTileRows(
-      static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
+  routed_tile_rows_ =
+      WidePrefill(n_tokens)
+          ? kRoutedTileRowsWide
+          : RoutedTileRows(
+                static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
@@ -2227,7 +2238,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // Append the 64-token map for gate/up and eligible down projections.
   // Wide expert buckets also get a 128-token gate/up map: it amortizes
   // weight decoding, while short buckets retain the cheaper 64-token tile.
-  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
+  if (WidePrefill(n_tokens) && routed_tile_rows_ == kRoutedTileRowsWide) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
@@ -2885,7 +2896,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       NpuGemm* npu = model_->npu();
@@ -2959,7 +2970,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
             n_tokens, l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel,
             stream_, checkpoint.tokens);
       }
-    } else if (!projections_ready && !speculative && n_tokens >= 1024 &&
+    } else if (!projections_ready && !speculative && WidePrefill(n_tokens) &&
                n_tokens <= options_.max_batch && Expandable(l.ssm_in)) {
       const __half* weights = ExpandHalf(l.ssm_in);
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
@@ -3136,7 +3147,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   std::array<std::uint64_t, 16> npu_gate_tickets{};
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !projections_ready && WidePrefill(n_tokens) &&
         n_tokens <= options_.max_batch &&
         (DenseF16Route(l.attn_qkv, n_tokens) || Expandable(l.attn_qkv)) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
@@ -3624,7 +3635,7 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                                 c.hidden_size, stream_);
     };
     const bool gated_ok =
-        n_tokens >= 1024 && routed_tile_rows_ == 48 &&
+        WidePrefill(n_tokens) && routed_tile_rows_ == 48 &&
                 gate_type != WeightType::kIQ4_XS &&
                 (gate_type != WeightType::kIQ3_S || wide_gate_up)
             ? ((routed_gate_tiles_[0] + routed_gate_tiles_[1] != 0)
@@ -4026,20 +4037,19 @@ bool Executor::ForwardBodyRange(
         return false;
       }
     }
-    const bool half_only =
-        prefill_phase && n >= 1024 && n <= options_.max_batch && l.linear &&
-        DenseF16Route(l.ssm_in, n) && l.ssm_alpha_beta.type == GgmlType::kF16 &&
-        l.ssm_alpha_beta.cols == l.ssm_in.cols;
+    const bool half_only = WidePrefill(n) && n <= options_.max_batch &&
+                           l.linear && DenseF16Route(l.ssm_in, n) &&
+                           l.ssm_alpha_beta.type == GgmlType::kF16 &&
+                           l.ssm_alpha_beta.cols == l.ssm_in.cols;
     if (!premixed) {
       if (!HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error_msg,
                  half_only)) {
         return false;
       }
     }
-    const bool last_attention = prefill_phase && !session.mtp_head_ &&
-                                !dflash_captures_last_layer_ &&
-                                il + 1 == c.num_layers && n >= 1024 &&
-                                n_logits == 1 && checkpoint == nullptr;
+    const bool last_attention =
+        WidePrefill(n) && !session.mtp_head_ && !dflash_captures_last_layer_ &&
+        il + 1 == c.num_layers && n_logits == 1 && checkpoint == nullptr;
     const bool prepared_layer =
         prepared != nullptr && prepared->valid && prepared->groups != 0 &&
         prepared->slices != 0 && prepared->c_ids != nullptr &&
