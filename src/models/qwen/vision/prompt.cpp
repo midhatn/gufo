@@ -8,7 +8,6 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/models/qwen/control_tokens.hpp"
-#include "src/models/qwen/vision/image_cache.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -251,8 +250,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
                std::span<const tokenization::ChatMessage> messages,
                std::span<const tokenization::ChatTool> tools,
                const tokenization::ChatTemplateOptions& options,
-               std::string_view encoder_identity, std::uint32_t max_context,
-               ImageCache* image_cache) {
+               std::string_view encoder_identity, std::uint32_t max_context) {
   std::vector<std::size_t> offsets;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
@@ -278,7 +276,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
     prompt.tokens.insert(prompt.tokens.end(), tokens.begin(), tokens.end());
   };
   crypto::Sha256Hasher identity;
-  constexpr auto version = kImagePreprocessingVersion;
+  constexpr std::string_view version = "qwen38-image-bicubic-rgb8-bf16-v1";
   identity.Update(
       {reinterpret_cast<const std::uint8_t*>(version.data()), version.size()});
   identity.Update(
@@ -295,13 +293,10 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       if (index >= offsets.size())
         throw std::logic_error("image rendering lost a part");
       append(cursor, offsets[index]);
-      auto pixels = image_cache
-                        ? image_cache->Get(image.bytes)
-                        : std::make_shared<const core::Image>(
-                              ResizeImage(core::DecodeImage(*image.bytes)));
+      auto pixels = ResizeImage(core::DecodeImage(*image.bytes));
       const ImageGrid grid{static_cast<std::uint32_t>(prompt.tokens.size()),
-                           pixels->height / kResizeFactor,
-                           pixels->width / kResizeFactor};
+                           pixels.height / kResizeFactor,
+                           pixels.width / kResizeFactor};
       const auto count = std::size_t{grid.height} * grid.width;
       if (count > max_context - prompt.tokens.size()) {
         throw std::length_error("image tokens exceed model context");
@@ -309,7 +304,7 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       HashU32(identity, grid.offset);
       HashU32(identity, grid.height);
       HashU32(identity, grid.width);
-      identity.Update(pixels->pixels);
+      identity.Update(pixels.pixels);
       prompt.tokens.insert(prompt.tokens.end(), count, kImageToken);
       prompt.rope.images.push_back(grid);
       prompt.images.push_back({std::move(pixels), grid, identity.Digest()});

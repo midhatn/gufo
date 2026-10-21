@@ -14,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -187,7 +186,6 @@ public:
   };
 
   struct Result {
-    std::optional<ComponentCacheMetrics> component_cache;
     std::string text;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};

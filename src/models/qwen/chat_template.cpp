@@ -253,7 +253,8 @@ void AppendJsonString(std::string& output, std::string_view value) {
   output.push_back('"');
 }
 
-void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools) {
+void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
+                       bool require_tool_call) {
   if (tools.empty()) {
     return;
   }
@@ -294,6 +295,11 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools) {
       "there is no function call available, answer the question like normal "
       "with your current knowledge and do not tell the user about function "
       "calls\n</IMPORTANT>");
+  if (require_tool_call) {
+    output.append(
+        "\n\nYou must call at least one available function. Do not answer the "
+        "user directly.");
+  }
 }
 
 void AppendToolCalls(std::string& output,
@@ -497,7 +503,7 @@ std::optional<std::string> QwenChatTemplate::Render(
   std::string system_prefix;
   std::vector<ContentSpan> system_spans;
   AppendReasoningInstruction(system_prefix, options);
-  AppendToolsPrompt(system_prefix, tools);
+  AppendToolsPrompt(system_prefix, tools, options.require_tool_call);
   if (!system_prefix.empty() && !system_content.empty()) {
     system_prefix.append("\n\n");
   }

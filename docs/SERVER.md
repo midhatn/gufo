@@ -193,21 +193,6 @@ prefill about 3% slower in aggregate (the second request's passes stay below the
 paired-bank size), 16384 recovers the rest but lets a running decode wait about
 one 16K pass.
 
-Qwen image requests reuse decoded and resized RGB pixels using a fast lookup
-hash and exact encoded-byte comparison under the preprocessing version. Each
-loaded Qwen runner retains up to 128 MiB of encoded bytes and resized pixel
-vectors combined, evicting least-recently-used images; entry metadata is also
-bounded. `cache_prompt: false` bypasses this reuse as well as continuation reuse.
-Requests share immutable buffers, so eviction does not invalidate an in-flight
-request. This CPU cache is separate from the snapshot budget below and is not
-written to disk. A resized 1920×1080 screenshot takes about 6 MiB of RGB storage,
-plus its encoded bytes. The compressible test screenshots fit 21 entries in
-this budget; larger encoded files reduce that count. Warm history still pays
-for prompt rendering, tokenization and the existing pixel/position identity
-hash; a new screenshot still needs vision encoding and prefill. Debug logs
-expose `event=image_cache` with whether reuse is enabled, entries, retained
-pixel/encoded bytes, hits, misses and evictions.
-
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
 container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA
@@ -216,19 +201,11 @@ movable pages, not GPU allocations. 27B also checks HIP free memory. A
 positive value sets a byte cap that may exceed the automatic budget, up to the
 available host RAM minus 4 GiB; the startup line reports both as
 `automatic_bytes` and `max_bytes`.
-On Flash-Next, the pinned disk staging buffer comes out of that ceiling, and
-`max_bytes` excludes it. Other models' disk staging and temporary disk-save
-buffers are separate from this RAM budget.
+Disk staging and temporary disk-save buffers are separate from this RAM budget.
 The 128 checkpoint records are independent of `--sessions`; more than one can
 belong to a conversation.
-Qwen3.8-Flash-Next pins pages for up to about 89% of its budget as captures
-need them, about 1 GiB at a time, and keeps them; the rest covers cache metadata as
-it grows. A step takes about 60 ms while the host has free pages and longer when
-the kernel must reclaim page cache. Growth stops early while the host would keep
-less than 4 GiB available. The pages hold checkpoint state and KV rows, partial
-tails and idle-session spill; there is no separate spill option.
-Other models allocate payloads only when captured. Under pressure, optional
-copies give way before another conversation's last useful checkpoint.
+Payloads are allocated only when captured. Under pressure, optional copies
+give way before another conversation's last useful checkpoint.
 
 Prompt reuse is enabled by default; how the cache finds, retains and
 evicts that state is described in [the KV cache](KV-CACHE.md).
@@ -258,35 +235,18 @@ its changed suffix again.
 
 `SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
 before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
+`--cache-disk-staging-bytes 0` (the default) selects the smaller of one eighth
+of available host RAM after model/session loading (including cgroup limits) and
+the disk budget. This bounds queued captures/writes and each disk read
+separately; it allocates nothing upfront. Live model state and retained RAM
+snapshots have separate budgets.
 
-On Flash-Next, `--cache-disk-bytes` counts every file the cache manages,
-including temporary files of unfinished writes and files a crash left
-unreferenced. Restarting with a lower budget removes those first, then the
-oldest checkpoints by creation order, until the directory fits; use history does not
-survive a restart. One Flash-Next server owns the directory: a second one fails
-at startup, after loading its model but before committing its RAM budget, with
-an ownership error naming the directory. The lock does not wait: a restarted
-server fails if its predecessor is still draining disk writes when the new one
-finishes loading its model. Other models do not take this lock.
-The first start on a directory written by an earlier release removes its old
-checkpoint files (`*.kvc`), and the cache refills as conversations run. Do not
-share a directory between Flash-Next and other models; Flash-Next removes
-their checkpoint and temporary files too, including writes in progress.
-Flash-Next ignores `--cache-disk-staging-bytes` and logs
-`event=option_ignored`. Writes and restores stream each checkpoint through an
-internal 1 MiB pinned buffer, piece by piece; a larger buffer did not change
-restore or write speed and took pinned RAM and device heap from the cache and
-the sessions. Remove the option from Flash-Next command lines.
-
-For the other models, `--cache-disk-staging-bytes 0` (the default) selects the
-smaller of one eighth of available host RAM after model/session loading
-(including cgroup limits) and the disk budget. This bounds queued
-captures/writes and each disk read separately; it allocates nothing upfront.
-Live model state and retained RAM snapshots have separate budgets.
 Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
+For Flash-Next (DFlash2 or MTP) at full 262K context, explicitly set
+`--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
 Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
 use the required size reported in the skip log.
 
@@ -830,8 +790,7 @@ keys last. Impossible strict schemas are rejected before generation.
 call, with the same argument syntax as `auto`. Where
 the backend cannot constrain sampling, an unmet `required` choice still returns
 `tool_choice_unsatisfied` (HTTP 502, or an SSE error after streaming starts).
-Stops and token limits terminate normally. Responses streams may retain a partial
-call with `status: "incomplete"`; clients must execute only completed calls.
+Stops and token limits terminate normally without emitting incomplete calls.
 With no tools or `tool_choice:"none"`, tool markers are ordinary text and do
 not interrupt reasoning or delay streaming.
 

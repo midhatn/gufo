@@ -147,7 +147,8 @@ std::string PythonJsonSpacing(std::string_view value) {
   return output;
 }
 
-void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools) {
+void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
+                       bool require_tool_call) {
   if (tools.empty()) {
     return;
   }
@@ -199,6 +200,10 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools) {
   output.append(
       "\n\nYou MUST strictly follow the above defined tool name and parameter "
       "schemas to invoke tool calls.\n");
+  if (require_tool_call) {
+    output.append(
+        "\n\nYou MUST invoke at least one available tool before answering.");
+  }
 }
 
 void AppendToolCalls(std::string& output,
@@ -291,7 +296,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       }
     }
     if (tool_host_index == messages.size()) {
-      AppendToolsPrompt(output, tools);
+      AppendToolsPrompt(output, tools, options.require_tool_call);
     }
   }
 
@@ -305,7 +310,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
         if (!message.content.empty()) {
           output.append("\n\n");
         }
-        AppendToolsPrompt(output, tools);
+        AppendToolsPrompt(output, tools, options.require_tool_call);
       }
       continue;
     }
@@ -320,7 +325,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
         if (!message.content.empty()) {
           output.append("\n\n");
         }
-        AppendToolsPrompt(output, tools);
+        AppendToolsPrompt(output, tools, options.require_tool_call);
       }
       continue;
     }

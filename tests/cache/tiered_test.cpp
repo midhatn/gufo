@@ -463,14 +463,11 @@ void EvictionDoesNotWaitForYieldingWriter() {
   manifest.components.resize(1);
   std::promise<void> yielding;
   std::atomic<bool> observed{};
-  PersistenceQueue queue(
-      f.ledger, f.streams, 1, 1,
-      [&] {
-        if (!observed.exchange(true))
-          yielding.set_value();
-        return false;
-      },
-      {}, {}, std::chrono::hours(1));
+  PersistenceQueue queue(f.ledger, f.streams, 1, 1, [&] {
+    if (!observed.exchange(true))
+      yielding.set_value();
+    return false;
+  });
   assert(queue.TrySubmit(
       PersistenceJob(f.ledger, TieredFile(4, 999), manifest, {})));
   yielding.get_future().wait();
