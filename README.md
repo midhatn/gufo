@@ -8,7 +8,7 @@ speculative decoding on top. Fork of [gufo-org/gufo](https://github.com/gufo-org
 | --- | --- | --- | --- |
 | Qwen3.6-35B-A3B | UD-Q4_K_XL | linear-attention and attention projections | MTP (embedded head), DFlash2, auto |
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
-| Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | MTP |
+| Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
 
 ## Speed
 
@@ -50,15 +50,20 @@ text, with greedy chat requests to `gufo serve`. NPU numbers need the setup in
 
 | Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
 | --- | --- | --- |
-| `-p 8192` | 1,814 | **2,121** (+16.9%) |
-| `-p 16384` | 1,786 | **2,125** (+19.0%) |
-| `-p 32768` | 1,760 | **2,070** (+17.6%) |
+| `-p 8192` | 1,814 | **2,128** (+17.3%) |
+| `-p 16384` | 1,786 | **2,142** (+19.9%) |
+| `-p 32768` | 1,760 | **2,109** (+19.8%) |
 
-| Decode, tok/s | plain | MTP |
-| --- | --- | --- |
-| code | 36.6 | **76.5** |
-| prose | 36.5 | **47.2** |
-| JSON | 36.7 | **99.8** |
+| Decode, tok/s | plain | MTP | DFlash2 |
+| --- | --- | --- | --- |
+| code | 36.6 | 76.5 | **102.4** |
+| prose | 36.5 | **47.2** | 45.2 |
+| JSON | 36.7 | 99.8 | **118.3** |
+
+The DFlash2 column comes from a different set of greedy chat prompts than the first
+two; MTP on that set measured 83.5 / 46.0 / 106.9 tok/s. Prose is a tie within
+run-to-run noise (about 3 to 5%); DFlash2 also skips the MTP head's prompt
+priming, which is why its prefill is about 3% faster.
 
 `gufo bench -n 96`: 35.9 tok/s plain, 54.2 tok/s with MTP (on the benchmark's
 own repetitive context, where drafts are accepted easily).
@@ -117,6 +122,11 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
 | `--speculative dflash2 --dflash-model PATH` | DFlash2 draft model |
 | `--speculative auto --dflash-model PATH --mtp-model embedded` | both drafts; each request uses whichever commits more tokens per second, with sampled requests on DFlash2 |
 
+Flash-Next defaults to DFlash2 (`--speculative dflash2 --dflash-model <Qwen3.8-Flash-Next-DFlash2 GGUF>`),
+which drafts a block of up to seven tokens in one pass and needs no MTP priming of the prompt; MTP
+(`--speculative mtp --mtp-model <shared Q8_0 sidecar>`) remains available. The DFlash2 head covers the
+first 163,840 vocabulary rows plus the special tokens (`GUFO_DFLASH_VOCAB=0` reads the whole vocabulary).
+
 The 35B-A3B runs MTP at three draft tokens (verifying more rows reads more
 experts); DFlash2 wins on code and JSON, MTP on prose, and auto lands within a few
 percent of the better one on each. On the 27B DFlash2 is far better than its MTP
@@ -158,7 +168,8 @@ head, so use `--speculative dflash2` there (auto costs 5% to 15% against it).
 
    The NPU run prints which projections it took while loading. For the
    Flash-Next server, run
-   `GUFO_MODEL=<first shard> GUFO_MTP=<mtp sidecar> scripts/run-gufo.sh`. It
+   `GUFO_MODEL=<first shard> GUFO_DFLASH=<dflash2 draft> scripts/run-gufo.sh`
+   (`GUFO_MTP=<mtp sidecar> GUFO_FN_SPEC=mtp` selects MTP). It
    enables the NPU only when the fabric clock is held and the NPU is not in turbo
    mode (`GUFO_NPU=0` forces GPU-only) and reads the options listed at the top of
    the script.

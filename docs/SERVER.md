@@ -176,7 +176,10 @@ checkpoint. Fixed-length benchmarks may continue through EOS.
 See the [DS4 benchmark and quality contract](models/deepseek-v4-flash/BENCHMARKS.md).
 
 Qwen3.8-Flash-Next uses the same scheduler, with independent recurrent, KV,
-indexer, sampling and MTP state per session. Prefix snapshots retain complete
+indexer, sampling and draft state per session. It accepts `--speculative
+dflash2 --dflash-model <GGUF>` (the launcher's default: one block forward drafts up
+to seven tokens, sampled requests use its candidate distribution for exact p/q
+acceptance) or `--speculative mtp`. Prefix snapshots retain complete
 state; `--cache-disk` adds restart-safe reuse. MTP draft length adapts within the
 configured ceiling. Sampled MTP proposals use p/q acceptance and residual
 correction; greedy verification follows target argmax. Draft and verification
@@ -185,6 +188,10 @@ work can batch across ready requests. See the
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
+`scripts/run-gufo.sh` sets 8192: with 4096 two long prompts arriving together
+prefill about 3% slower in aggregate (the second request's passes stay below the
+paired-bank size), 16384 recovers the rest but lets a running decode wait about
+one 16K pass.
 
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
@@ -238,7 +245,7 @@ Snapshots that exceed either limit are skipped with their required size and
 available budget logged; live conversation reuse remains available. Existing
 files that exceed the current staging limit are preserved subject to disk LRU
 eviction and can be reused after restarting with sufficient staging.
-For Flash-Next/MTP at full 262K context, explicitly set
+For Flash-Next (DFlash2 or MTP) at full 262K context, explicitly set
 `--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
 Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
 use the required size reported in the skip log.

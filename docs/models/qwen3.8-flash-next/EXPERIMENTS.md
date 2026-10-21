@@ -129,3 +129,13 @@ not unprofiled throughput measurements.
 Next: improve prefill at depth and target/draft batch projection reuse while
 preserving [quality](QUALITY.md). The 1750 tok/s PP and flat d0–d128K
 objectives remain unmet; see [current benchmarks](BENCHMARKS.md).
+| DFlash2 draft block instead of MTP | Retained as the launcher default: greedy output byte-equal on 16 prompts, code 102 against 83 tok/s, JSON 118 against 107, prose and math tie within noise, prefill about 3% faster because no MTP priming. The sampled path uses the block's top-16 candidates for exact p/q acceptance. |
+| Draft slot cost scale 0.5 for block drafting | Retained: a block forward serves every slot, so a slot only adds its verification; scale 0.7 / 0.5 / 0.3 gave 44.2 / 44.8 / 44.5 tok/s on prose against 39.4 priced as MTP. A fixed per-round drafter cost term was rejected (41.4 tok/s, chains too short). |
+| DFlash2 head over the first 163,840 vocabulary rows | Retained: byte-equal text on 16 prompts; 131,072 rows lowered math acceptance 0.70 → 0.65, 196,608 rows saved nothing. |
+| Q4_K_M requantization of the DFlash2 draft | Optional file only: about +1% decode with identical acceptance; Q5_K_M does not load. |
+| Auto selection between MTP and DFlash2 on Flash-Next | Not built: MTP wins nowhere by more than noise, and keeping both costs the MTP priming (about 5.5% of prefill) plus about 1 ms per round for catch-up. |
+| `GUFO_NPU_WHOLE=0` for decode quality | Rejected: MTP acceptance 0.52 → 0.55 (+5% decode) at −6% prefill; no effect with DFlash2. |
+| `GUFO_TWO_BANK=2` (unequal pairs) | Rejected: 32K prefill 1,952 → 1,848 tok/s. |
+| Prefix checkpoint inside the prefill pass with the disk cache on | Retained: removes the second pass for short prompts (first token 269 → 188 ms); cold and restored outputs can differ at near-ties, which matched the earlier split-chunk behaviour only by construction. |
+| `--prefill-chunk` 4096 / 8192 / 16384 with two long prompts | Launcher default 8192: aggregate prefill 1,842 / 1,898 / 1,928 tok/s; larger chunks make a running decode wait longer for the next pass. |
+| Gate/up rows per wave 8 → 1 | Retained: bit-identical, width-1 cost −1.5%, no measurable end-to-end change. |

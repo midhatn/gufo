@@ -2,13 +2,15 @@
 # Serve a Qwen model with speculative decoding and, when set up, the NPU.
 #
 # GUFO_KIND selects the model family (default flash-next):
-#   flash-next  Qwen3.8 Flash-Next UD-IQ4_XS, MTP sidecar, two-bank NPU prefill
+#   flash-next  Qwen3.8 Flash-Next UD-IQ4_XS, DFlash2 draft (or MTP sidecar), two-bank NPU prefill
 #   27b         Qwen3.8-27B, DFlash2 and/or MTP
 #   35b         Qwen3.6-35B-A3B, embedded MTP head and/or DFlash2
 #
 # Required: GUFO_MODEL = the GGUF (for flash-next the first shard, ...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (flash-next: shared Q8_0 sidecar; 27b: MTP GGUF; 35b: "embedded" by default),
-#           GUFO_DFLASH (27b/35b: DFlash2 draft GGUF; with an MTP head the server picks per request),
+#           GUFO_DFLASH (DFlash2 draft GGUF. flash-next uses it alone when set, unless GUFO_FN_SPEC=mtp;
+#                        27b/35b: with an MTP head the server picks per request),
+#           GUFO_PREFILL_CHUNK (default 8192; the pass size while another request is decoding or waiting),
 #           GUFO_BIN, PORT, JOBS, GUFO_CONTEXT (default 131072 for flash-next, 262144 for 27b and 35b), GUFO_EFFORT,
 #           GUFO_CACHE_DIR, GUFO_CACHE_BYTES, GUFO_LOG, GUFO_PREFILL_TILE (default 16384; 24576 is faster for 24K+ prompts, +6 GB RAM),
 #           GUFO_TWO_BANK (default 1; 0 turns the two-bank NPU prefill off)
@@ -84,10 +86,12 @@ mkdir -p "$CACHE_DIR" "$(dirname "$LOG")"
 
 SPEC=()
 if [ "$KIND" = flash-next ]; then
-  if [ -n "$MTP" ] && [ -f "$MTP" ]; then
+  if [ "${GUFO_FN_SPEC:-dflash2}" = dflash2 ] && [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
+    SPEC=(--speculative dflash2 --dflash-model "$DFLASH")
+  elif [ -n "$MTP" ] && [ -f "$MTP" ]; then
     SPEC=(--speculative mtp --mtp-model "$MTP")
   else
-    echo "WARNING: no MTP sidecar (set GUFO_MTP to the unsloth shared Q8_0 file): running without speculative decoding." >&2
+    echo "WARNING: no DFlash2 draft or MTP sidecar (set GUFO_DFLASH or GUFO_MTP): running without speculative decoding." >&2
   fi
 else
   if [ "$KIND" = 35b ] && [ -z "$MTP" ]; then MTP=embedded; fi
@@ -111,7 +115,7 @@ env "${NPU_ENV[@]}" "${SPARSE_ENV[@]}" "$GUFO_BIN" serve llm \
   -c "$CONTEXT" \
   -n 16384 \
   -j "$JOBS" \
-  --prefill-chunk 4096 \
+  --prefill-chunk "${GUFO_PREFILL_CHUNK:-8192}" \
   "${SPEC[@]}" \
   --cache-disk "$CACHE_DIR" \
   --cache-disk-bytes "$CACHE_BYTES" \

@@ -153,3 +153,16 @@ Measured against llama.cpp on the CPU (UD-IQ4_XS, 18.7K-token code prompt, 542 d
 `q4` previously used a plain min/max Q4_1 mapping (+6.14%, KL 0.082 / 0.200); the copy now searches the step and minimum per block. Alone, the hyper-connection and `attn_out` copies cost the most (document KL 0.084 and 0.076 against 0.022 to 0.033 for `ssm_in`, `ssm_out`, `attn_qkv` and the shared expert), so `balanced` leaves them in Q8_0 and keeps nearly all of the speed. `GUFO_DECODE_COPY_CLASSES` picks other subsets.
 
 The F16 residual (+0.54% perplexity) is on only in the two-bank NPU mode (`GUFO_TWO_BANK=1`), where it adds about 1.5% prefill (2,125 against 2,085 tok/s at 16,384 tokens); `GUFO_F16_RESIDUAL=0` or `1` overrides, and GPU-only prefill is exact. The NPU stays opt-in through `GUFO_NPU_DIR`.
+
+## DFlash2 draft
+
+The draft was compared with the upstream `DFlash2DraftModel` (pinned revision `07ebd93d`, source SHA-256 `f55b7fe0`) run on CPU from the unquantized `model.safetensors`. Both receive the same captured target features (36 prompt rows), the anchor token and the mask embeddings. Gufo uses the Q8_0 draft.
+
+| Check | Result |
+| --- | --- |
+| Input embeddings | identical |
+| Final normalized hidden, 8 rows | cosine 0.99985, relative RMSE 1.5e-2 |
+| Logits, 7 positions | cosine at least 0.99985; same top-1 token and the same top-16 candidates at every position |
+| Selector path | identical: 12305, 198, 727, 369, 70817, 34864, 1104 |
+
+This checks the draft given its inputs, not the choice of target layers that feed it. Sixteen fresh 32K needle prompts pass 15 of 16 with DFlash2, MTP, the exact indexer scorer and speculation off alike (the same prompt refuses in all four), so the failure belongs to the model, not to a draft or kernel change.

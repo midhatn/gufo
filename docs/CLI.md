@@ -94,11 +94,11 @@ must reproduce the target's tokens; sampled decoding must preserve the target's
 distribution, but need not match an autoregressive run's sequence for the same
 seed. Speed depends on acceptance and verification cost.
 
-- `speculative` — `dflash2` for Qwen3.8-27B and Qwen3.6-35B-A3B, `dspark` for
-  DeepSeek V4 Flash, `mtp` for models with a supported MTP head, `auto` for
-  Qwen models with both a DFlash2 draft and an MTP head, or `off`. HTTP serving
-  supports all of them for the Qwen GPU models, plus `dspark` and Flash-Next
-  `mtp`.
+- `speculative` — `dflash2` for Qwen3.8-27B, Qwen3.6-35B-A3B and Qwen3.8
+  Flash-Next, `dspark` for DeepSeek V4 Flash, `mtp` for models with a supported
+  MTP head, `auto` for Qwen3.8-27B and Qwen3.6-35B-A3B with both a DFlash2 draft
+  and an MTP head, or `off`. HTTP serving supports all of them for the Qwen GPU
+  models, plus `dspark`. Flash-Next takes `dflash2` or `mtp`, not `auto`.
 - `dflashModel` — path to the DFlash2 companion draft.
 - `dsparkModel` — path to the DSpark support GGUF.
 - `mtpModel` — path to the MTP draft model, or `embedded` for a head stored in
@@ -108,7 +108,7 @@ seed. Speed depends on acceptance and verification cost.
 - `draftPolicy` (`"fixed"` / `"adaptive"`) — DFlash2 block-length policy;
   defaults to adaptive.
 - `minDraftTokens` — minimum draft length where supported. DFlash2, DSpark,
-  and Flash-Next MTP require the default of one.
+  and Flash-Next MTP and DFlash2 require the default of one.
 
 **Server limits (protecting the machine from clients)**
 

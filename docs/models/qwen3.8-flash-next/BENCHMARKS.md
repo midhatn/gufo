@@ -90,6 +90,26 @@ request decode rates. C1 cross-checks the single-user table.
 
 ![Multiple users, MTP](artifacts/charts/multi-mtp.svg)
 
+## Single user, DFlash2 and MTP
+
+October 21, 2026, Unsloth `UD-IQ4_XS` target, two-bank NPU prefill, `gufo bench`
+(`-p 2048,16384 -n 128`, one run per cell; pp16384 at depth 0 is the mean of three
+runs, because the first cell of a cold process includes kernel loading). DFlash2 uses
+`Qwen3.8-Flash-Next-DFlash2-Q8_0.gguf`, MTP the shared Q8_0 sidecar. Decode on
+the synthetic benchmark prompt depends on acceptance and is not comparable across rows;
+real-text decode is in the [README](../../../README.md#qwen38-flash-next).
+
+| Depth (tokens) | DFlash2 pp2048 | DFlash2 pp16384 | MTP pp2048 | MTP pp16384 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 1,466 | 2,142 | 1,609 | 2,098 |
+| 32,768 | 1,481 | 2,043 | 1,461 | 1,997 |
+| 131,072 | 1,415 | 1,920 | 1,459 | 1,885 |
+
+pp2048 is below the 8192-token minimum of the paired-bank mode, so it reads the same
+expert weights for a quarter of the tokens. A 65-request server suite
+(greedy, thinking off) gives cold prefill of 1,918 to 1,953 tok/s for 22K to 60K prompts
+and 1,927 tok/s at 112K on an idle machine.
+
 ## Loading time
 
 C1, context capacity 262144, MTP. Cold target/sidecar files to HTTP readiness.
