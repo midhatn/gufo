@@ -1408,7 +1408,7 @@ void mul_mat_vec_iq3s_gated_f16(const void* gate, const void* up,
   if (tokens > 1)
     group_moe_slots<<<1, (anchors + 31) / 32 * 32, 0, stream>>>(
         ids, groups, tokens, experts_used, false);
-  constexpr int kRowsPerWave = 8;
+  constexpr int kRowsPerWave = 1;
   const dim3 grid((rows + 8 * kRowsPerWave - 1) / (8 * kRowsPerWave),
                   tokens * experts_used);
   // Decode instantiates one token's registers; the per-token instruction
