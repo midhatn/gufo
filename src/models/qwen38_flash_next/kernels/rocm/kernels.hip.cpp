@@ -8861,7 +8861,7 @@ void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
       return;
     }
   }
-  if constexpr (type != WeightType::kQ8_0) {
+  if constexpr (type == WeightType::kF32 || type == WeightType::kBF16) {
     // Rows of whole four-step passes (K 2560: router and GDN alpha/beta in
     // F16, indexer in BF16) take the unchecked vector loads, four steps at a
     // time at any width: the same products in the same order.
