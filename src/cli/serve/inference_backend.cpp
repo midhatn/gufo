@@ -3479,7 +3479,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+    if ((speculative_config.backend == TextSpeculativeBackend::kMtp ||
+        speculative_config.backend == TextSpeculativeBackend::kDFlash) &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
             mtp ? "Qwen3.8-Flash-Next MTP" : "Qwen3.8-Flash-Next DFlash2",
