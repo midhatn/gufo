@@ -313,7 +313,8 @@ void CheckHcDownProjection(const void* w, const void* tiled,
                      hipMemcpyDeviceToDevice),
            "HC projection copy");
   q::SiluScale(activated, 0.25F, count, nullptr);
-  q::NarrowActivations(activated, reference + 8, false, count, nullptr);
+  q::NarrowActivations(activated, reference + 8, false, count, count,
+                       "projection_ops", "hc", "f16", count, 0, 0);
   std::vector<__half> expected(count + 16), actual(count + 16);
   CheckHip(hipMemcpy(expected.data(), reference,
                      expected.size() * sizeof(__half), hipMemcpyDeviceToHost),
@@ -475,7 +476,8 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
     throw std::runtime_error("W8A8 GEMM rejected the shape");
   }
-  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), x.size(),
+                       "projection_ops", "narrow", "f16", x.size(), 0, 0);
   if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
     throw std::runtime_error("dense F16 GEMM rejected the shape");
   }
