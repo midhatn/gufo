@@ -114,7 +114,9 @@ class FunctionalRunnerTest(unittest.TestCase):
             ({"resume_equal": False, "followup_equal": None}, None),
             ({"temperature": 0}, None),
             ({"prefill": 0}, None),
-            ({"followup_cached": 671}, "disk-restored third turn differs"),
+            ({"followup_cached": 513}, None),
+            ({"followup_cached": 512}, "disk-restored third turn differs"),
+            ({"followup_cached": 0}, "disk-restored third turn differs"),
             ({"prefill": 2048}, "disk restore lost too much"),
             ({"disk": False}, "restart did not restore disk state"),
             ({"cached": 0}, "restart did not restore disk state"),
@@ -125,7 +127,7 @@ class FunctionalRunnerTest(unittest.TestCase):
         for changes, error in cases:
             settings = {"temperature": .8, "prefill": 37, "cached": 672, "disk": True,
                         "resume_equal": True, "followup_equal": True, "followup_cached": 672,
-                        **changes}
+                        "followup_live": 2560, **changes}
             with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 output = root / "restored.json"
@@ -135,7 +137,8 @@ class FunctionalRunnerTest(unittest.TestCase):
                                   settings["prefill"], settings["cached"], settings["disk"])]
                 if settings["followup_equal"] is not None:
                     previous["followup"] = {"request": {"temperature": settings["temperature"]},
-                                            "sha256": continuation.digest(result("seven"))}
+                                            "sha256": continuation.digest(result("seven")),
+                                            "cached": settings["followup_live"]}
                     replies.append(result("seven" if settings["followup_equal"] else "eight",
                                           cached=settings["followup_cached"]))
                 source = root / "previous.json"
@@ -438,6 +441,58 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(label), self.assertRaises(ValueError):
                 check_disk_spacing(grown_log, restored_log, report)
 
+    def test_pressure_retry_respects_the_counted_mutable_user_suffix(self):
+        from cache_growth import check_unchanged_retry
+        retry = {"usage": {"prompt_tokens": 1346}}
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            log.write_text("schema=component-cache-v1 event=capture_refused "
+                           "reason=byte_capacity tokens=1346\n")
+            end = log.stat().st_size
+            check_unchanged_retry("history", retry, 24, log, 0, end,
+                                  mutable_suffix_tokens=24)
+            # The generic assistant opening remains bounded at 16; an extra
+            # lost history token cannot hide behind the independently counted 24.
+            for actual, bound in ((24, 16), (25, 24)):
+                with self.subTest(prefill=actual, bound=bound), self.assertRaises(AssertionError):
+                    check_unchanged_retry("history", retry, actual, log, 0, end,
+                                          mutable_suffix_tokens=bound)
+            log.write_text("schema=component-cache-v1 event=capture_failed "
+                           "reason=unknown tokens=1346\n")
+            with self.assertRaises(AssertionError):
+                check_unchanged_retry("history", retry, 24, log, 0, log.stat().st_size,
+                                      mutable_suffix_tokens=24)
+
+    def test_disk_spacing_uses_capture_ids_for_delayed_publications(self):
+        totals = (2400, 2680, 2960, 3240, 3520, 5960, 6240)
+        report = {"turns": [{"measured": {"total": total, "checkpoint_ids": [i + 1]}}
+                            for i, total in enumerate(totals)]}
+        restored_report = {"replayed": {"checkpoint_ids": [40]},
+                           "branched": {"checkpoint_ids": [41]}}
+
+        def event(id_, tokens, skipped=False):
+            action = "persistence_refused reason=min_step" if skipped else "published"
+            return (f"[cache] schema=component-cache-v1 event={action} "
+                    f"tokens={tokens} checkpoint_id={id_} payload_bytes=1\n")
+
+        skips = "".join(event(i + 1, totals[i] - 4, True) for i in (1, 2, 3, 4, 6))
+        grown = event(1, 2396) + skips + event(6, 5956)
+        restored = event(41, 3012)
+        # Earlier requests can finish writes after the fixture's log offset,
+        # including publications at the exact same token count.
+        foreign = event(90, 5413) + event(91, 2396) + event(92, 5956)
+        result = check_disk_spacing(grown + foreign, restored + event(93, 2700),
+                                    report, restored_report)
+        self.assertEqual(result["stored_tokens"], [2396, 5956])
+        self.assertEqual(result["shared_boundary_tokens"], [3012])
+        self.assertEqual(result["min_step_skips"], 5)
+        # Ownership must still reject a real too-close fixture checkpoint and
+        # duplicate publications. Foreign refusals cannot satisfy coverage.
+        for bad in (grown + event(3, 2956), grown + event(1, 2396),
+                    event(1, 2396) + event(6, 5956) + event(90, 2680, True) * 5):
+            with self.subTest(log=bad), self.assertRaises(ValueError):
+                check_disk_spacing(bad, restored, report, restored_report)
+
     def run_cache_depth(self, lost=False, retry_work=False, contaminated=False,
                         recorder=None, concurrency=4):
         owner = threading.get_ident()
@@ -479,10 +534,12 @@ class FunctionalRunnerTest(unittest.TestCase):
 
     def test_cache_depth_replays_branches_before_cold_controls(self):
         requests, checks = self.run_cache_depth()
-        self.assertEqual(len(checks), 17)
-        self.assertEqual(len(requests), 16)
+        self.assertEqual(len(checks), 16)
+        self.assertEqual(len(requests), 15)
         self.assertTrue(all(body.get("extra_body", {}).get("cache_prompt") is False
-                            for body in requests[-7:]))
+                            for body in requests[-6:]))
+        # The first turn is uncached already; no control repeats it.
+        self.assertNotIn("depth_cold_turn_0", checks)
         for code in ("RED", "GREEN", "BLUE"):
             self.assertEqual(checks["depth_branch_" + code]["text"], code)
         self.assertEqual(requests[7]["messages"], requests[8]["messages"])
@@ -574,9 +631,11 @@ class FunctionalRunnerTest(unittest.TestCase):
             else:
                 cached = 2995 if pinned and "drop_reasoning" in label else last - 5
             previous[label] = total
+            thinking = body["extra_body"].get("thinking", {}).get("type")
+            enabled = (thinking == "enabled" if thinking is not None else
+                       body.get("reasoning_effort", "low") != "none")
             return {"text": "BETA", "reasoning": "The code word is BETA."
-                    if body.get("reasoning_effort", "low") != "none"
-                    and not missing_reasoning else "",
+                    if enabled and not missing_reasoning else "",
                     "tools": [], "finish": "stop", "usage": {
                         "prompt_tokens": total, "cached_tokens": cached,
                         "completion_tokens": 8,
@@ -1586,6 +1645,18 @@ class FunctionalRunnerTest(unittest.TestCase):
         self.assertEqual(error.exception.code, 2)
         start.assert_not_called()
 
+    def test_invalid_request_deadline_does_not_start_server(self):
+        for timeout in ("0", "-1", "nan", "inf"):
+            args = ["run.py", "--record-baseline", "--output", "/unused",
+                    "--sampling-preset", "qwen38", "--suite", "responses",
+                    "--request-timeout", timeout, "--", "gufo", "serve", "llm"]
+            with self.subTest(timeout=timeout), patch.object(sys, "argv", args), \
+                 patch.object(functional, "server") as start, \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                functional.main()
+            self.assertEqual(error.exception.code, 2)
+            start.assert_not_called()
+
     def test_runner_inconclusive_is_nonzero_and_correctness_still_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1623,11 +1694,39 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
             self.assertEqual(code, 1)
             self.assertEqual(report["status"], "failed")
 
+    def test_runner_skips_suites_their_selected_parent_already_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "openai_sdk.py").write_text('''import json,sys
+from pathlib import Path
+p = Path(sys.argv[sys.argv.index("--output") + 1])
+p.write_text(json.dumps({"status": "passed"}))
+p.with_suffix(".requests.json").write_text(json.dumps({"version": 1, "requests": [{
+    "index": 0, "case": "reply", "status": "complete", "endpoint": "/v1/chat/completions",
+    "wall_ms": 1, "request_sha256": "same", "output_sha256": "same"}]}))
+''')
+            args = ["run.py", "--output", str(root / "out"), "--sampling-preset", "qwen38",
+                    "--record-baseline"]
+            for suite in ("auto-tools", "tools", "tool-native-types", "tool-native-schemas",
+                          "tool-native-types"):
+                args += ["--suite", suite]
+            args += ["--", sys.executable, "serve", "llm", "--model", "fixture.gguf"]
+            with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
+                 patch.object(functional, "server", return_value=contextlib.nullcontext()), \
+                 patch.object(functional, "provenance", return_value={}), \
+                 patch.object(functional, "join_server_timings"), \
+                 patch.object(functional, "execution_coverage", return_value={}), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(functional.main(), 0)
+            report = json.loads((root / "out" / "report.json").read_text())
+            self.assertEqual(list(report["suites"]), ["tools", "tool-native-schemas"])
+
     def test_failed_or_incomplete_child_is_not_reported_as_a_pass(self):
+        hung = 'import time; time.sleep(10)'
         for child, expected in (
             ('import sys; sys.exit(7)', "failed"),
             ('pass', "failed"),
-            ('import time; time.sleep(10)', "failed"),
+            (hung, "failed"),
             ('import json,sys; from pathlib import Path; '
              'Path(sys.argv[sys.argv.index("--output")+1]).write_text('
              'json.dumps({"status":"failed"}))', "failed"),
@@ -1645,10 +1744,13 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
         ):
             with self.subTest(child=child), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                (root / "openai_sdk.py").write_text(child)
+                (root / "openai_sdk.py").write_text(
+                    'import sys; assert sys.argv[sys.argv.index("--request-timeout") + 1] == "360.0"\n' + child)
                 args = ["run.py", "--record-baseline", "--output", str(root / "report"),
                         "--sampling-preset", "qwen38", "--suite", "responses",
-                        "--suite-timeout", ".2", "--",
+                        # Only the hung child relies on the timeout; the others need time
+                        # to start Python on a loaded host.
+                        "--suite-timeout", ".2" if child == hung else "60", "--request-timeout", "360", "--",
                         sys.executable, "serve", "llm", "--model", "fixture.gguf"]
                 with patch.object(sys, "argv", args), patch.object(functional, "TESTS", root), \
                      patch.object(functional, "server", return_value=contextlib.nullcontext()), \
@@ -1658,6 +1760,7 @@ p.with_suffix(".requests.json").write_text(json.dumps({{
                      contextlib.redirect_stdout(io.StringIO()):
                     status = functional.main()
                 report = json.loads((root / "report/report.json").read_text())
+                self.assertEqual(report["request_timeout"], 360)
                 self.assertEqual(report["status"], expected)
                 self.assertEqual(status, 0 if expected == "passed" else 1)
 
