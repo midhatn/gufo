@@ -3129,13 +3129,11 @@ __device__ float ExactSelectScore(const float* q, const __half* blocks,
 // score within the matrix-core scorer's error of that threshold, so the final
 // mask is the one the F32 scorer would have produced.
 template<bool kThresholdOnly, bool kReconcile>
-__global__ void SelectMarkKernel(std::uint32_t* mask, float* scores,
-                                 const std::uint32_t* start_pos,
-                                 std::uint32_t first_token, std::uint32_t ratio,
-                                 std::uint32_t budget, std::uint32_t mask_words,
-                                 std::uint32_t max_blocks, const float* q,
-                                 const __half* keys, float* limits,
-                                 float margin_rel, float margin_abs) {
+__global__ __launch_bounds__(kThreads) void SelectMarkKernel(
+    std::uint32_t* mask, float* scores, const std::uint32_t* start_pos,
+    std::uint32_t first_token, std::uint32_t ratio, std::uint32_t budget,
+    std::uint32_t mask_words, std::uint32_t max_blocks, const float* q,
+    const __half* keys, float* limits, float margin_rel, float margin_abs) {
   __shared__ std::uint32_t candidates[4096];
   __shared__ std::uint32_t hist[256];
   __shared__ std::uint32_t candidate_count;
