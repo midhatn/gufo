@@ -900,13 +900,18 @@ int RunQwen38FlashNextBenchmark(
                 std::max<std::size_t>(max_depth, 16) + max_generation + 1,
                 options.validate_prefill_tokens + 1});
   const bool mtp = options.speculative_backend == "mtp";
-  if (!options.speculative_backend.empty() && !mtp) {
-    std::cerr << "Error: Qwen3.8-Flash-Next supports only --speculative mtp "
-                 "or off\n";
+  const bool dflash = options.speculative_backend == "dflash2";
+  if (!options.speculative_backend.empty() && !mtp && !dflash) {
+    std::cerr << "Error: Qwen3.8-Flash-Next supports --speculative dflash2, "
+                 "mtp, or off\n";
     return 1;
   }
   if (mtp && options.mtp_model_path.empty()) {
     std::cerr << "Error: --speculative mtp requires --mtp-model\n";
+    return 1;
+  }
+  if (dflash && options.dflash_model_path.empty()) {
+    std::cerr << "Error: --speculative dflash2 requires --dflash-model\n";
     return 1;
   }
   if (options.concurrency != std::vector<std::size_t>{1}) {
@@ -914,8 +919,8 @@ int RunQwen38FlashNextBenchmark(
                  "benchmark for concurrent requests\n";
     return 1;
   }
-  if (mtp && options.min_draft_tokens != 1) {
-    std::cerr << "Error: Flash-Next MTP requires --min-draft-tokens 1\n";
+  if ((mtp || dflash) && options.min_draft_tokens != 1) {
+    std::cerr << "Error: Flash-Next drafting requires --min-draft-tokens 1\n";
     return 1;
   }
   if (required_context > std::numeric_limits<std::uint32_t>::max()) {
@@ -929,6 +934,7 @@ int RunQwen38FlashNextBenchmark(
       qfn::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? options.mtp_model_path : "",
+          .dflash_model_path = dflash ? options.dflash_model_path : "",
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
       },
       &error);

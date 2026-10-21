@@ -46,8 +46,11 @@ inline constexpr float kMtpCycleMilliseconds[3][5][8] = {
 // batch policy uses these curves to bootstrap each physical occupancy.
 // Intermediate capacities use the next measured cohort. Context costs
 // interpolate, then extrapolate the measured QSA slope to the native limit.
+// `slot_scale` scales the marginal cost of each draft slot for drafters that
+// propose a whole block in one pass.
 [[nodiscard]] inline std::array<float, 8> MtpCycleCosts(
-    std::uint32_t context, std::uint32_t concurrency) noexcept {
+    std::uint32_t context, std::uint32_t concurrency,
+    float slot_scale = 1.0F) noexcept {
   const auto cohort = concurrency <= 1   ? 0
                       : concurrency <= 2 ? 1
                       : concurrency <= 4 ? 2
@@ -71,6 +74,8 @@ inline constexpr float kMtpCycleMilliseconds[3][5][8] = {
       costs[i] = std::max(costs[i], costs[i - 1] + marginal);
     }
   }
+  for (std::size_t i = 1; i < costs.size(); ++i)
+    costs[i] = costs[0] + (costs[i] - costs[0]) * slot_scale;
   return costs;
 }
 

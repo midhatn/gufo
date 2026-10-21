@@ -14,6 +14,7 @@
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
@@ -80,6 +81,62 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
          std::uint64_t{vocab_size} * sizeof(float);
 }
 
+/// Fits the drafter's top-k distribution into the compact proposal form used
+/// by verification: integer masses sum to 2^24, so the F32 q sums to exactly
+/// one and matches the distribution the block drew from.
+// One block forward serves every slot, so a slot only adds its verification.
+constexpr float kDflashSlotScale = 0.5F;
+
+MtpProposal MakeDflashProposal(std::span<const sampling::TokenId> ids,
+                               std::span<const float> probabilities,
+                               sampling::TokenId token) {
+  constexpr std::uint32_t kUnits = 1U << 24;
+  MtpProposal proposal;
+  if (ids.empty() || ids.size() > kMtpCandidates ||
+      ids.size() != probabilities.size()) {
+    return proposal;
+  }
+  double total = 0.0;
+  std::size_t largest = 0;
+  for (std::size_t i = 0; i < probabilities.size(); ++i) {
+    if (!std::isfinite(probabilities[i]) || probabilities[i] < 0.0F) {
+      return proposal;
+    }
+    total += probabilities[i];
+    if (probabilities[i] > probabilities[largest]) {
+      largest = i;
+    }
+  }
+  if (!(total > 0.0)) {
+    return proposal;
+  }
+  std::array<std::uint32_t, kMtpCandidates> mass{};
+  std::uint32_t sum = 0;
+  for (std::size_t i = 0; i < probabilities.size(); ++i) {
+    mass[i] = static_cast<std::uint32_t>(
+        std::floor(probabilities[i] / total * kUnits));
+    sum += mass[i];
+  }
+  mass[largest] += kUnits - sum;
+  proposal.size = ids.size();
+  double selected = 0.0;
+  bool found = false;
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    proposal.ids[i] = ids[i];
+    proposal.probabilities[i] = static_cast<float>(mass[i]) / kUnits;
+    if (ids[i] == token) {
+      selected += static_cast<double>(proposal.probabilities[i]);
+      found = true;
+    }
+  }
+  if (!found) {
+    return MtpProposal{};
+  }
+  proposal.token = token;
+  proposal.probability = static_cast<float>(selected);
+  return proposal;
+}
+
 }  // namespace
 
 Model::~Model() = default;
@@ -96,10 +153,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "draft token limit must be positive");
     return nullptr;
   }
-  if (!options.mtp_model_path.empty() &&
+  if ((!options.mtp_model_path.empty() || !options.dflash_model_path.empty()) &&
       options.max_draft_tokens > kMaxMtpDraftTokens) {
     AssignError(error_msg,
-                "Flash-Next MTP supports at most seven draft tokens");
+                "Flash-Next drafting supports at most seven draft tokens");
     return nullptr;
   }
   m->options_ = options;
@@ -157,14 +214,44 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  if (!options.dflash_model_path.empty()) {
+    auto dflash_reader =
+        core::GgufReader::OpenFile(options.dflash_model_path, error_msg);
+    if (!dflash_reader) {
+      return nullptr;
+    }
+    const auto tensor_ref = [](const rocm::DeviceTensor& t) {
+      QwenTensorRef ref;
+      ref.data = t.data;
+      ref.type = t.type;
+      ref.num_elements = static_cast<std::size_t>(t.cols) * t.rows;
+      return ref;
+    };
+    m->dflash_model_ = hip::QwenDFlashGpuModel::Create(
+        std::move(dflash_reader), c.hidden_size, c.vocab_size, c.num_layers,
+        tensor_ref(m->device_->token_embd()), tensor_ref(m->device_->output()),
+        error_msg);
+    if (!m->dflash_model_) {
+      return nullptr;
+    }
+  }
   rocm::Executor::Options exec;
   exec.max_batch = m->PrefillThroughCapacity();
+  const bool draft_capable = m->mtp_weights_ != nullptr || m->dflash_model_;
   exec.max_logit_rows =
-      m->mtp_weights_
+      draft_capable
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
+  if (m->dflash_model_) {
+    // The drafter only reads its sliding window, so the tail of the prompt is
+    // all the trunk capture has to keep per forward.
+    const auto& draft = m->dflash_model_->GetDFlashConfig();
+    exec.dflash_rows =
+        std::min<std::uint32_t>(options.max_context, draft.sliding_window);
+    exec.dflash_layers = draft.target_layer_ids;
+  }
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -184,8 +271,13 @@ std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
   if (!native) {
     return nullptr;
   }
-  return std::unique_ptr<Session>(
+  auto session = std::unique_ptr<Session>(
       new Session(shared_from_this(), std::move(native)));
+  if (mode == core::SessionMode::kSpeculative && dflash_model_ != nullptr &&
+      !session->InitDflash(error_msg)) {
+    return nullptr;
+  }
+  return session;
 }
 
 std::vector<std::int32_t> Model::Tokenize(std::string_view text) const {
@@ -269,6 +361,72 @@ bool Session::MtpEnabled() const noexcept {
   return session_->mtp_enabled();
 }
 
+bool Session::MtpLoaded() const noexcept {
+  return model_->HasMtp();
+}
+
+struct Session::DflashState {
+  std::unique_ptr<hip::QwenDFlashGpuExecutor> executor;
+};
+
+bool Session::InitDflash(std::string* error_msg) {
+  if (!model_->dflash_model_) {
+    return true;
+  }
+  auto executor = hip::QwenDFlashGpuExecutor::Create(
+      model_->dflash_model_, session_->max_context(), error_msg);
+  if (!executor) {
+    return false;
+  }
+  dflash_ = std::make_unique<DflashState>();
+  dflash_->executor = std::move(executor);
+  draft_length_.SetSlotScale(kDflashSlotScale);
+  return true;
+}
+
+bool Session::DflashReady() const noexcept {
+  return dflash_ && dflash_->executor &&
+         dflash_->executor->GetInjectedContextLength() ==
+             static_cast<std::uint32_t>(tokens_.size());
+}
+
+bool Session::DflashPrime(std::string* error_msg) {
+  if (!dflash_ || !dflash_->executor) {
+    return true;
+  }
+  const auto rows = session_->dflash_capture_rows();
+  const auto position = session_->dflash_capture_position();
+  const float* features = model_->executor_->dflash_capture();
+  if (rows == 0 || features == nullptr) {
+    return true;
+  }
+  if (!dflash_->executor->InjectTargetContextDevice(features, position, rows)) {
+    AssignError(error_msg, "DFlash target context injection failed");
+    return false;
+  }
+  return true;
+}
+
+bool Session::DflashCommit(std::uint32_t position, std::uint32_t rows,
+                           std::string* error_msg) {
+  if (!dflash_ || !dflash_->executor || rows == 0) {
+    return true;
+  }
+  if (session_->dflash_capture_rows() < rows ||
+      session_->dflash_capture_position() != position) {
+    return true;
+  }
+  const float* features = model_->executor_->dflash_capture();
+  if (features == nullptr) {
+    return true;
+  }
+  if (!dflash_->executor->InjectTargetContextDevice(features, position, rows)) {
+    AssignError(error_msg, "DFlash committed row injection failed");
+    return false;
+  }
+  return true;
+}
+
 Session::Session(std::shared_ptr<Model> model,
                  std::unique_ptr<rocm::Session> session)
     : model_(std::move(model)),
@@ -303,6 +461,9 @@ void Session::Reset() {
   suffix_cooldown_until_ = 0;
   hidden_base_ = 0;
   draft_length_.Reset();
+  if (dflash_ && dflash_->executor) {
+    dflash_->executor->Reset();
+  }
   model_->executor_->MtpRewind(*session_, 0);
   if (continuation_hooks_)
     continuation_hooks_->AfterReset();
@@ -337,7 +498,7 @@ std::span<const std::uint8_t> Session::ImageIdentity(
 }
 
 std::uint32_t Session::KeptHiddenRows() const noexcept {
-  return MtpEnabled()
+  return MtpEnabled() && MtpLoaded()
              ? static_cast<std::uint32_t>(tokens_.size() - hidden_base_)
              : 0;
 }
@@ -516,6 +677,11 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   draft_token_ = 0;
   draft_length_ = restored_policy;
   stats_ = {};
+  if (dflash_ && dflash_->executor) {
+    // The checkpoint does not carry drafter context; drafting resumes only
+    // after a trunk forward primes the restored frontier again.
+    dflash_->executor->Reset();
+  }
   valid_ = true;
   return true;
 }
@@ -623,7 +789,7 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
   std::vector<rocm::Executor::MtpBatchItem> items;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     auto& session = *requests[i].session;
-    if (!session.MtpEnabled())
+    if (!session.MtpEnabled() || !session.MtpLoaded())
       continue;
     std::int32_t hidden_row = 0;
     if (!session.DraftReplay(requests[i].token, &replays[i], &hidden_row,
@@ -661,7 +827,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
       }
     }
     const auto chunk = tokens.subspan(off, n);
-    if (MtpEnabled() && !tokens_.empty() &&
+    if (MtpEnabled() && MtpLoaded() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
       return false;
     }
@@ -718,6 +884,12 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         return false;
     }
     off += n;
+  }
+  // Only the final attention window of the prompt reaches the drafter; the
+  // capture buffer holds it after the last forward. A following chunk will
+  // overwrite it, so only the last chunk primes.
+  if (!(prefill && !after.empty()) && !DflashPrime(error_msg)) {
+    return false;
   }
   return true;
 }
@@ -982,6 +1154,9 @@ struct Session::PendingDecode {
   bool sampled{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
+  /// The cycle was forwarded with other sessions; the shared capture buffer
+  /// does not describe this session alone.
+  bool batch{false};
   std::size_t width{0};
   std::optional<sampling::SamplerState> draft_sampler;
   std::uint64_t draft_rng{0};
@@ -1044,8 +1219,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  const bool draft_enabled = MtpEnabled() && (MtpLoaded() || DflashReady());
   const std::size_t width =
-      MtpEnabled() && cap > 1
+      draft_enabled && cap > 1
           ? 1 + (batch_drafts
                      ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
                      : draft_length_.Choose(
@@ -1074,7 +1250,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // Retrieval drafts: the token history may already contain what follows this
   // phrase. The index includes the anchor, which is committed in every outcome.
   std::vector<std::int32_t> history_draft;
-  if (Suffix().enabled && MtpEnabled() && cap > 1) {
+  if (Suffix().enabled && draft_enabled && cap > 1) {
     SyncLookup();
     lookup_.Append(anchor);
     std::uint32_t matched = 0;
@@ -1092,7 +1268,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   if (!history_draft.empty()) {
     const bool sampled = sampler.config().uses_random_sampling();
     const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
-    if (!defer_head && !DraftCatchUp(anchor, false, error_msg))
+    if (!defer_head && MtpLoaded() && !DraftCatchUp(anchor, false, error_msg))
       return false;
     pending->suffix = true;
     pending->chain = {anchor};
@@ -1111,9 +1287,81 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
     return true;
   }
-  if (!MtpEnabled() || width < 2) {
-    if (MtpEnabled() && !defer_head &&
-        !DraftCatchUp(anchor, false, error_msg)) {
+  if (DflashReady() && cap > 1 && !defer_head) {
+    const bool sampled = sampler.config().uses_random_sampling();
+    const bool can_chain = sampler.config().temperature == 0.0F ||
+                           (sampled && sampler.config().temperature > 0.0F);
+    if (can_chain) {
+      const auto base = static_cast<std::uint32_t>(tokens_.size());
+      const auto want = static_cast<std::uint32_t>(width - 1);
+      const auto selector =
+          model_->dflash_model_->GetDFlashConfig().selector_top_k;
+      std::uint64_t draft_rng = 0;
+      std::vector<float> uniforms;
+      std::vector<sampling::TokenId> candidate_ids;
+      std::vector<float> candidate_probabilities;
+      std::vector<tokenization::TokenId> drafted;
+      if (sampled) {
+        draft_rng = sampling::NextRandom(sampler.mutable_rng_state());
+        uniforms.reserve(want);
+        for (std::uint32_t row = 0; row < want; ++row) {
+          uniforms.push_back(sampling::Uniform(&draft_rng));
+        }
+      }
+      try {
+        drafted = dflash_->executor->ForwardBlock(
+            anchor, base, want, sampled ? sampler.config().temperature : 0.0F,
+            uniforms, nullptr, sampled ? &candidate_ids : nullptr,
+            sampled ? &candidate_probabilities : nullptr);
+      } catch (const std::exception&) {
+        drafted.clear();
+      }
+      std::vector<MtpProposal> proposals;
+      bool complete = !drafted.empty();
+      if (complete && sampled) {
+        complete = selector != 0 &&
+                   drafted.size() * selector == candidate_ids.size() &&
+                   candidate_ids.size() == candidate_probabilities.size();
+        for (std::size_t row = 0; complete && row < drafted.size(); ++row) {
+          auto proposal = MakeDflashProposal(
+              std::span(candidate_ids).subspan(row * selector, selector),
+              std::span(candidate_probabilities)
+                  .subspan(row * selector, selector),
+              static_cast<sampling::TokenId>(drafted[row]));
+          complete =
+              proposal.size != 0 &&
+              proposal.token == static_cast<sampling::TokenId>(drafted[row]);
+          if (complete) {
+            proposals.push_back(proposal);
+          }
+        }
+      }
+      if (complete) {
+        const bool gpu_greedy =
+            !sampled && sampler.config().can_use_unmodified_argmax();
+        pending->suffix = false;
+        pending->chain = {anchor};
+        pending->chain.insert(pending->chain.end(), drafted.begin(),
+                              drafted.end());
+        pending->proposals = std::move(proposals);
+        pending->draft = static_cast<std::int32_t>(drafted.front());
+        pending->base = base;
+        pending->speculative = true;
+        pending->sampled = sampled;
+        pending->gpu_greedy = gpu_greedy;
+        pending->gpu_verification = gpu_greedy;
+        pending->draft_rng = draft_rng;
+        pending->width = pending->chain.size();
+        if (!gpu_greedy && verify_logits_.size() <
+                               exec.max_speculative() * model_->VocabSize()) {
+          verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
+        }
+        return true;
+      }
+    }
+  }
+  if (!draft_enabled || width < 2 || (defer_head && !MtpLoaded())) {
+    if (MtpLoaded() && !defer_head && !DraftCatchUp(anchor, false, error_msg)) {
       return false;
     }
     pending->chain = {anchor};
@@ -1214,6 +1462,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
+    if (!pending.batch && !DflashCommit(pending.base, 1, error_msg)) {
+      return false;
+    }
     return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
@@ -1348,6 +1599,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
     draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
   }
 
+  if (!pending.batch && !DflashCommit(base, keep, error_msg)) {
+    return false;
+  }
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
@@ -1553,7 +1807,7 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
   if (std::ranges::all_of(
-          requests, [](const auto& r) { return r.session->MtpEnabled(); }) &&
+          requests, [](const auto& r) { return r.session->MtpLoaded(); }) &&
       std::ranges::none_of(requests, [](const auto& request) {
         return request.sampler->config().uses_random_sampling();
       })) {
@@ -1577,8 +1831,11 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     const auto& r = requests[i];
     try {
       if (!r.session->PrepareDecode(r, &pending[i], &r.outcome->error, true,
-                                    batch_drafts))
+                                    batch_drafts)) {
         pending[i] = {};
+      } else {
+        pending[i].batch = true;
+      }
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
       pending[i] = {};

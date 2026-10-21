@@ -6213,6 +6213,37 @@ __global__ void ResToFloatKernel(const __half* __restrict__ src,
     StoreResRow(dst + g * 4, LoadResRow(src + g * 4));
   }
 }
+
+template<typename Src>
+__device__ __forceinline__ float MeanStreamValue(Src value);
+template<>
+__device__ __forceinline__ float MeanStreamValue<float>(float value) {
+  return value;
+}
+template<>
+__device__ __forceinline__ float MeanStreamValue<__half>(__half value) {
+  return __half2float(value);
+}
+
+template<typename Src>
+__global__ void MeanStreamsKernel(const Src* __restrict__ src,
+                                  float* __restrict__ dst, std::size_t elements,
+                                  std::uint32_t hidden, std::uint32_t streams,
+                                  std::size_t dst_stride) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= elements) {
+    return;
+  }
+  const std::size_t row = index / hidden;
+  const std::uint32_t column = static_cast<std::uint32_t>(index % hidden);
+  float sum = 0.0F;
+  for (std::uint32_t stream = 0; stream < streams; ++stream) {
+    sum +=
+        MeanStreamValue<Src>(src[(row * streams + stream) * hidden + column]);
+  }
+  dst[row * dst_stride + column] = sum / static_cast<float>(streams);
+}
 }  // namespace
 
 void ResidualToHalf(const float* src, __half* dst, std::size_t count,
@@ -6227,6 +6258,25 @@ void ResidualToFloat(const __half* src, float* dst, std::size_t count,
   const std::size_t groups = count / 4;
   hipLaunchKernelGGL(ResToFloatKernel, dim3((groups + kThreads - 1) / kThreads),
                      dim3(kThreads), 0, stream, src, dst, groups);
+}
+
+void MeanStreams(const void* src, float* dst, std::uint32_t rows,
+                 std::uint32_t hidden, std::uint32_t streams,
+                 std::size_t dst_stride, bool src_half, hipStream_t stream) {
+  const std::size_t elements = static_cast<std::size_t>(rows) * hidden;
+  if (elements == 0) {
+    return;
+  }
+  const auto grid = dim3((elements + kThreads - 1) / kThreads);
+  if (src_half) {
+    hipLaunchKernelGGL(MeanStreamsKernel<__half>, grid, dim3(kThreads), 0,
+                       stream, static_cast<const __half*>(src), dst, elements,
+                       hidden, streams, dst_stride);
+  } else {
+    hipLaunchKernelGGL(MeanStreamsKernel<float>, grid, dim3(kThreads), 0,
+                       stream, static_cast<const float*>(src), dst, elements,
+                       hidden, streams, dst_stride);
+  }
 }
 
 void HcCombineF16(void* res, const float* block_out, const float* inject,

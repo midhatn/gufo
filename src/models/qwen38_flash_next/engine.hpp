@@ -23,6 +23,10 @@ namespace gufo::core {
 class GgufReader;
 }
 
+namespace gufo::hip {
+class QwenDFlashGpuModel;
+}
+
 namespace gufo::models::qwen38_flash_next {
 
 struct ModelWeights;
@@ -41,8 +45,11 @@ class SnapshotState;
 struct ModelOptions {
   std::uint32_t max_context = 4096;
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
-  /// speculative decoding off.
+  /// speculative decoding off unless a DFlash drafter is configured.
   std::string mtp_model_path;
+  /// Optional DFlash-2 draft sidecar bound to this trunk's embedding and
+  /// output head. Takes precedence over MTP when both are loaded.
+  std::string dflash_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
   std::string vision_model_path;
@@ -82,6 +89,9 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  [[nodiscard]] bool HasDflash() const noexcept {
+    return dflash_model_ != nullptr;
+  }
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
   }
@@ -113,6 +123,7 @@ private:
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   MtpBatchController batch_policy_;
 
   friend class Session;
@@ -313,6 +324,17 @@ private:
   bool valid_{true};
   ContinuationHooks* continuation_hooks_{nullptr};
   [[nodiscard]] bool MtpEnabled() const noexcept;
+  [[nodiscard]] bool MtpLoaded() const noexcept;
+  /// True when the DFlash drafter holds the target rows through the frontier.
+  [[nodiscard]] bool DflashReady() const noexcept;
+  bool InitDflash(std::string* error_msg);
+  /// Hands the trunk rows captured by the last forward to the drafter.
+  bool DflashPrime(std::string* error_msg);
+  /// Appends `rows` committed target rows starting at `position`.
+  bool DflashCommit(std::uint32_t position, std::uint32_t rows,
+                    std::string* error_msg);
+  struct DflashState;
+  std::unique_ptr<DflashState> dflash_;
 };
 
 /// Immutable session checkpoint. Committed cache rows may still reside in

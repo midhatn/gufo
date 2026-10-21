@@ -152,6 +152,8 @@ public:
     state_.failed_depths = 0;
   }
 
+  void SetSlotScale(float scale) noexcept { slot_scale_ = scale; }
+
   [[nodiscard]] MtpLengthState State() const noexcept { return state_; }
 
   [[nodiscard]] bool Restore(const MtpLengthState& state) noexcept {
@@ -182,7 +184,7 @@ private:
   [[nodiscard]] std::uint32_t BestLength(
       std::uint32_t cap, std::uint32_t context,
       std::uint32_t concurrency) const noexcept {
-    const auto costs = MtpCycleCosts(context, concurrency);
+    const auto costs = MtpCycleCosts(context, concurrency, slot_scale_);
     float survival = 1.0F;
     float expected_tokens = 1.0F;  // The sampled target anchor.
     float best_score = 1.0F;       // Ordinary target decoding.
@@ -207,6 +209,7 @@ private:
 
   std::uint32_t limit_;
   std::uint32_t concurrency_;
+  float slot_scale_{1.0F};
   MtpLengthState state_{};
 };
 

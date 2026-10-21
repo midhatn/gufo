@@ -530,6 +530,10 @@ bool Executor::AllocateScratch(std::size_t T, Scratch* out, const Scratch* base,
     s.mtp_embd = s.mixed;
     s.mtp_eproj = s.qkvz;
     s.mtp_res = s.res;
+  }
+  // Greedy verification of a block-diffusion chain also needs the argmax
+  // workspace, even when no MTP predictor is loaded.
+  if (model_->has_mtp() || dflash_capture_ != nullptr) {
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
@@ -1080,7 +1084,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   checkpoint->source = &source;
   checkpoint->tokens = prefix;
   checkpoint->hidden_rows =
-      source.mtp_enabled_ ? std::min(prefix, options_.max_speculative) : 0;
+      source.mtp_head_ ? std::min(prefix, options_.max_speculative) : 0;
   checkpoint->logits.resize(c.vocab_size);
   checkpoint->state.reset(new Session);
   auto& view = *checkpoint->state;
@@ -1089,13 +1093,14 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.index_capacity_ = source.index_capacity_;
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
+  view.mtp_head_ = source.mtp_head_;
   view.attention_ = source.attention_;
   view.linear_.resize(source.linear_.size());
   view.blocks_ = c.compress_ratio > 0 && view.position_ > c.indexer_top_k
                      ? view.position_ / c.compress_ratio
                      : source.blocks_;
   view.mtp_ = source.mtp_;
-  if (source.mtp_enabled_) {
+  if (source.mtp_head_) {
     view.mtp_.position = view.position_ - 1;
     view.mtp_.blocks = view.mtp_.position > c.indexer_top_k
                            ? view.mtp_.position / c.compress_ratio
@@ -1143,7 +1148,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
     view.ple_history_ = storage;
     storage += std::size_t{c.PleConvHistory()} * c.HcDim();
   }
-  if (source.mtp_enabled_)
+  if (source.mtp_head_)
     view.mtp_.target_hidden = storage;
   return checkpoint;
 }
@@ -1194,6 +1199,8 @@ void Session::Reset() {
   snapshot_lineage_.reset();
   position_ = 0;
   spec_tokens_ = 0;
+  dflash_capture_pos_ = 0;
+  dflash_capture_rows_ = 0;
   ngram_.Reset();
   mtp_.position = 0;
   mtp_.residual_valid = false;
@@ -1300,6 +1307,31 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   const Config& c = model.config();
   const std::size_t T = e->options_.max_batch;
+  if (!e->options_.dflash_layers.empty()) {
+    if (e->options_.dflash_rows == 0) {
+      AssignError(error_msg, "DFlash capture layers require a row count");
+      return nullptr;
+    }
+    for (const auto il : e->options_.dflash_layers) {
+      if (il >= c.num_layers) {
+        AssignError(error_msg, "DFlash capture layer exceeds the model");
+        return nullptr;
+      }
+    }
+    e->dflash_capture_rows_ = e->options_.dflash_rows;
+    e->dflash_taps_ = e->options_.dflash_layers;
+    e->dflash_captures_last_layer_ =
+        std::find(e->dflash_taps_.begin(), e->dflash_taps_.end(),
+                  c.num_layers - 1) != e->dflash_taps_.end();
+    e->dflash_capture_ =
+        Alloc<float>(e->allocations_,
+                     static_cast<std::size_t>(e->dflash_capture_rows_) *
+                         e->dflash_taps_.size() * c.hidden_size,
+                     error_msg);
+    if (e->dflash_capture_ == nullptr) {
+      return nullptr;
+    }
+  }
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
@@ -1485,7 +1517,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
   s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
-  if (s->mtp_enabled_ && !has_mtp()) {
+  s->mtp_head_ = s->mtp_enabled_ && has_mtp();
+  if (s->mtp_enabled_ && !s->mtp_head_ && options_.dflash_layers.empty()) {
     AssignError(error_msg, "MTP session requires a loaded predictor");
     return nullptr;
   }
@@ -1537,7 +1570,7 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->ple_history_ = Alloc<float>(a, hist, error_msg, &s->allocated_bytes_);
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
-  if (s->mtp_enabled_) {
+  if (s->mtp_head_) {
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
@@ -3639,9 +3672,8 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                                std::string* error_msg) const {
-  if (!session.mtp_enabled_ || session.owner_ != this ||
-      session.position_ == 0 || hidden.empty() ||
-      hidden.size() % config().HcDim() != 0 ||
+  if (!session.mtp_head_ || session.owner_ != this || session.position_ == 0 ||
+      hidden.empty() || hidden.size() % config().HcDim() != 0 ||
       hidden.size() / config().HcDim() >
           std::min(session.position_, options_.max_speculative)) {
     AssignError(error_msg, "invalid trunk hidden diagnostic input");
@@ -3946,7 +3978,8 @@ bool Executor::ForwardBodyRange(
         return false;
       }
     }
-    const bool last_attention = prefill_phase && !session.mtp_enabled_ &&
+    const bool last_attention = prefill_phase && !session.mtp_head_ &&
+                                !dflash_captures_last_layer_ &&
                                 il + 1 == c.num_layers && n >= 1024 &&
                                 n_logits == 1 && checkpoint == nullptr;
     const bool prepared_layer =
@@ -4121,12 +4154,12 @@ bool Executor::ForwardBodyRange(
             : nullptr;
     const auto needed =
         std::max({96U, n_logits, checkpoint ? n - checkpoint->tokens + 1 : 0U});
-    const auto skipped = std::getenv("GUFO_X_NOSKIP") == nullptr &&
-                                 prefill_phase && !session.mtp_enabled_ &&
-                                 !res_half_mode && il + 1 == c.num_layers &&
-                                 n > needed
-                             ? (n - needed) / 128 * 128
-                             : 0U;
+    const auto skipped =
+        std::getenv("GUFO_X_NOSKIP") == nullptr && prefill_phase &&
+                !session.mtp_head_ && !dflash_captures_last_layer_ &&
+                !res_half_mode && il + 1 == c.num_layers && n > needed
+            ? (n - needed) / 128 * 128
+            : 0U;
     const auto finish = [&](std::uint32_t rows) {
       if (res_half_mode && !res_is_half) {
         residual_to_half();
@@ -4157,6 +4190,23 @@ bool Executor::ForwardBodyRange(
         return false;
     } else if (!finish(n)) {
       return false;
+    }
+    if (dflash_capture_ != nullptr) {
+      const auto tap = std::find(dflash_taps_.begin(), dflash_taps_.end(), il);
+      if (tap != dflash_taps_.end()) {
+        const auto rows = std::min(n, dflash_capture_rows_);
+        const auto hc_dim = c.HcDim();
+        const auto offset = static_cast<std::size_t>(n - rows) * hc_dim;
+        const auto* source = res_is_half
+                                 ? static_cast<const void*>(s_.res_h + offset)
+                                 : static_cast<const void*>(s_.res + offset);
+        MeanStreams(source,
+                    dflash_capture_ +
+                        static_cast<std::size_t>(tap - dflash_taps_.begin()) *
+                            c.hidden_size,
+                    rows, c.hidden_size, c.hc_count,
+                    dflash_taps_.size() * c.hidden_size, res_is_half, stream_);
+      }
     }
     normed = next_norm != nullptr;
   }
@@ -4196,7 +4246,7 @@ bool Executor::ForwardBodyRange(
   const auto kept = std::min(
       checkpoint && checkpoint->tokens < n ? n - checkpoint->tokens : n,
       options_.max_speculative);
-  if (session.mtp_enabled_ &&
+  if (session.mtp_head_ &&
       !Check(GuardedMemcpyAsync(
                  GUFO_SITE, session.mtp_.target_hidden,
                  s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
@@ -4294,7 +4344,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t start_pos = session.position_;
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (session.mtp_enabled_ && prefill_phase &&
+  if (session.mtp_head_ && prefill_phase &&
       session.mtp_.position != start_pos) {
     AssignError(error_msg,
                 "MTP must consume the preceding frontier before prefill");
@@ -4411,10 +4461,15 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
 
   session.position_ += n;
+  if (dflash_capture_ != nullptr) {
+    const auto rows = std::min(n, dflash_capture_rows_);
+    session.dflash_capture_pos_ = start_pos + n - rows;
+    session.dflash_capture_rows_ = rows;
+  }
   if (sparse) {
     session.blocks_ = complete;
   }
-  if (session.mtp_enabled_ && prefill_phase && n > 1) {
+  if (session.mtp_head_ && prefill_phase && n > 1) {
     // Every successor except the last one is already known. Consume it while
     // the trunk residual is still in shared scratch. MtpBody reads that
     // residual into xn before reusing res for the predictor output.
@@ -4446,7 +4501,7 @@ bool Executor::CanForwardPair(const Session& session, std::size_t n,
   const auto prefix = session.VisionLayout().PrefixLength();
   if (prefix != 0 && session.position_ < prefix)
     return why(__LINE__);
-  if (session.mtp_enabled_ && session.mtp_.position != session.position_)
+  if (session.mtp_head_ && session.mtp_.position != session.position_)
     return why(__LINE__);
   if (n_logits > n)
     return why(__LINE__);
@@ -4848,7 +4903,7 @@ bool Executor::ForwardPair(Session& session,
                   static_cast<std::size_t>(n_logits) * c.vocab_size, logits);
     }
 
-    if (session.mtp_enabled_) {
+    if (session.mtp_head_) {
       PrefillPhase draft_phase(false);
 
       session.position_ = b_start;
@@ -4877,6 +4932,11 @@ bool Executor::ForwardPair(Session& session,
     session.blocks_ = blocks_after_b;
     session.spec_base_ = b_start;
     session.spec_tokens_ = 0;
+    if (dflash_capture_ != nullptr) {
+      const auto rows = std::min(nB, dflash_capture_rows_);
+      session.dflash_capture_pos_ = end_pos - rows;
+      session.dflash_capture_rows_ = rows;
+    }
     pinned_inputs.completed = true;
     SetScratchHost(saved_scratch, saved_control_host, saved_tokens_host);
     LoadCache(saved_cache);
@@ -5155,8 +5215,7 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_head_, session);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -5186,8 +5245,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+  SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_head_, session);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -5316,12 +5374,12 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
 std::uint64_t Executor::PrefillCheckpointBytes(const Session& session,
                                                std::uint32_t position) const {
   const auto& c = config();
-  auto h = MakeSnapshotHeader(c, session.mtp_enabled_, session);
+  auto h = MakeSnapshotHeader(c, session.mtp_head_, session);
   h.position = position;
   h.blocks = c.compress_ratio > 0 && position > c.indexer_top_k
                  ? position / c.compress_ratio
                  : session.blocks_;
-  if (session.mtp_enabled_) {
+  if (session.mtp_head_) {
     h.mtp_position = position - 1;
     h.mtp_blocks = h.mtp_position > c.indexer_top_k
                        ? h.mtp_position / c.compress_ratio
@@ -5350,7 +5408,7 @@ bool Executor::RestoreSnapshot(Session& session,
   SnapshotHeader h{};
   std::memcpy(&h, payload.data(), sizeof(h));
   const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
+      MakeSnapshotHeader(config(), session.mtp_head_, session);
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;
@@ -5746,7 +5804,7 @@ bool Executor::MtpForward(Session& session,
   }
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (!session.mtp_enabled_) {
+  if (!session.mtp_head_) {
     AssignError(error_msg, "no MTP block loaded");
     return false;
   }
