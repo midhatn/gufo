@@ -207,16 +207,6 @@ void PopulateSnapshotPrefix(std::uint8_t* data, std::uint64_t bytes,
 
 namespace {
 constexpr std::uint64_t kSnapshotReuseBytes = 8ULL << 20;
-// Device memory kept free beyond the executor's own lazy scratch, for the
-// runtime and driver. Snapshot storage never grows into it.
-constexpr std::uint64_t kSnapshotDeviceSlackBytes = 512ULL << 20;
-
-/// Snapshot storage would leave too little device memory. Callers keep the
-/// checkpoint in its host payload instead; the request continues.
-class SnapshotDeviceExhausted : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-};
 }  // namespace
 // Legacy hipFree synchronizes unrelated inference streams. Pool allocations
 // have stream-ordered release, so evicting a checkpoint cannot stall a peer.
@@ -230,8 +220,7 @@ public:
   // HIP calls, so a background refill would land in a peer's decode instead.
   static constexpr std::size_t kSpareBlocks = 2;
 
-  /// `reserve` is the device memory every commit leaves free.
-  explicit SnapshotAllocator(std::uint64_t reserve) : reserve_(reserve) {
+  SnapshotAllocator() {
     hipMemPoolProps properties{};
     properties.allocType = hipMemAllocationTypePinned;
     properties.handleTypes = hipMemHandleTypeNone;
@@ -278,17 +267,6 @@ public:
   [[nodiscard]] static std::uint64_t SpareBytes(std::uint64_t block) {
     return kSpareBlocks * block;
   }
-  /// Whether committing `bytes` keeps the reserve free. The snapshot budget
-  /// counts host payloads, but on an APU the device limit can be lower than
-  /// host RAM. ROCm 7.2's VM pool corrupts its heap when a page commit
-  /// fails, so storage is never requested beyond the device headroom.
-  [[nodiscard]] bool Fits(std::uint64_t bytes) const {
-    std::size_t free = 0;
-    std::size_t total = 0;
-    if (hipMemGetInfo(&free, &total) != hipSuccess)
-      return false;
-    return free >= bytes && free - bytes >= reserve_;
-  }
   /// A transfer on a stream of its own, reused across transfers: creating a
   /// stream can stall for milliseconds, and a shared stream would make a
   /// capture wait for a peer's bulk materialization.
@@ -318,8 +296,6 @@ private:
                                hipGetErrorString(error));
   }
   void* Commit(std::uint64_t bytes) {
-    if (!Fits(bytes))
-      throw SnapshotDeviceExhausted("snapshot storage exceeds device headroom");
     void* data = nullptr;
     CheckStatus(hipMallocFromPoolAsync(&data, bytes, pool_, stream_),
                 "snapshot allocate");
@@ -349,7 +325,6 @@ private:
     // including when their source session has already been destroyed.
     (void)hipStreamSynchronize(stream_);
   }
-  std::uint64_t reserve_;
   std::mutex mutex_;
   std::vector<void*> spares_;
   std::uint64_t spare_bytes_{0};
@@ -587,9 +562,7 @@ bool Executor::AllocateScratch(std::size_t T, Scratch* out, const Scratch* base,
 
 std::shared_ptr<SnapshotAllocator> Executor::GetSnapshotAllocator() const {
   std::call_once(snapshot_allocator_once_, [&] {
-    // Admission reserved the lazy scratch; snapshots must not consume it.
-    snapshot_allocator_ = std::make_shared<SnapshotAllocator>(
-        DeferredScratchBytes() + kSnapshotDeviceSlackBytes);
+    snapshot_allocator_ = std::make_shared<SnapshotAllocator>();
   });
   return snapshot_allocator_;
 }
@@ -685,10 +658,6 @@ void SnapshotState::Materialize() const {
   std::lock_guard lock(registry_->mutex);
   if (registry_->failure)
     std::rethrow_exception(registry_->failure);
-  MaterializeLocked();
-}
-
-void SnapshotState::MaterializeLocked() const {
   const auto transfer = registry_->allocator->Transfer();
   for (const auto& region : regions_) {
     PopulateSnapshotPrefix(region.host, region.bytes);
@@ -824,8 +793,6 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity += block->capacity - block->used;
   // Allocate before enqueuing any copy or changing a checkpoint. Allocation
   // failure then leaves the source and every retained checkpoint intact.
-  std::vector<std::uint64_t> commits;
-  std::uint64_t needed = 0;
   for (std::size_t first = 0; first < copies.size();) {
     auto last = first;
     std::uint64_t bytes = 0;
@@ -838,36 +805,11 @@ void SnapshotRegistry::Preserve(std::uint32_t position,
     capacity -= reused;
     bytes -= reused;
     if (bytes != 0) {
-      commits.push_back(bytes);
-      needed += bytes;
+      auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
+      reserve.push_back(block);
+      available.push_back(std::move(block));
     }
     first = last;
-  }
-  bool device = needed == 0 || allocator->Fits(needed);
-  if (device) {
-    try {
-      for (const auto bytes : commits) {
-        auto block = std::make_shared<SnapshotBlock>(allocator, bytes);
-        reserve.push_back(block);
-        available.push_back(std::move(block));
-      }
-    } catch (const SnapshotDeviceExhausted&) {
-      device = false;
-    }
-  }
-  if (!device) {
-    // No device room for the overwritten rows: move each affected checkpoint
-    // into its host payload, which the snapshot budget already charges. This
-    // also releases the device copies it held from earlier rewinds.
-    std::vector<bool> affected(snapshots.size());
-    for (const auto& copy : copies)
-      for (const auto owner : copy.owners)
-        affected[owner] = true;
-    for (std::size_t index = 0; index < snapshots.size(); ++index)
-      if (affected[index])
-        snapshots[index]->MaterializeLocked();
-    copies.clear();
-    available.clear();
   }
   std::size_t block_index = 0;
   std::unique_ptr<gufo::hip::SnapshotTransfer> transfer;
@@ -5361,23 +5303,18 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
                        });
     pending->mutable_offset_ = sizeof(SnapshotHeader);
     pending->mutable_bytes_ = mutable_prefix - sizeof(SnapshotHeader);
-    try {
-      pending->mutable_storage_ =
-          session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
-      pending->mutable_device_ =
-          static_cast<std::uint8_t*>(pending->mutable_storage_.get());
-      if (extra_bytes != 0) {
-        pending->extra_storage_ =
-            session.snapshots_->allocator->Allocate(extra_bytes);
-        pending->extra_bytes_ = extra_bytes;
-      }
-    } catch (const SnapshotDeviceExhausted&) {
-      // No device room to freeze this capture: copy it to its host payload.
-      pending.reset();
+    pending->mutable_storage_ =
+        session.snapshots_->allocator->AllocateSpare(pending->mutable_bytes_);
+    pending->mutable_device_ =
+        static_cast<std::uint8_t*>(pending->mutable_storage_.get());
+    if (extra_bytes != 0) {
+      pending->extra_storage_ =
+          session.snapshots_->allocator->Allocate(extra_bytes);
+      pending->extra_bytes_ = extra_bytes;
     }
-  }
-  if (!pending)
+  } else {
     PopulateSnapshotPrefix(payload.data(), payload.size());
+  }
   std::memcpy(payload.data(), &h, sizeof(h));
   const auto grid_bytes =
       std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
