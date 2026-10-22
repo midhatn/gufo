@@ -107,7 +107,8 @@ streaming forward (`Open`/`CreateSession`/`Evaluate` -> logits);
 `glm53_reference_check` (ctest `glm53.reference_full`, slow, guarded by
 GUFO_GLM53_ALLOW_FULL=1) verifies its top-5 logits against the 45-layer
 goldens in `$GUFO_GLM53_GOLDENS` and must only run with no other model
-resident. Sampler, CLI wiring, tokenizer (pre=glm4: CHATGLM4 regex +
+resident. VERIFIED: all 5 teacher-forcing steps OK on the full trunk
+(top-5 logits vs harness goldens, exact ids). Sampler, CLI wiring, tokenizer (pre=glm4: CHATGLM4 regex +
 ignore_merges), GPU kernels, NPU offload, drafter: pending. The full trunk runs
 only while the GGUF page cache is warm and no other model is resident;
 teacher-forcing top-1 accuracy cannot be validated while flash-next holds
