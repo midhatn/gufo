@@ -11,6 +11,7 @@ namespace gufo::models::glm53_flash {
 namespace {
 
 constexpr std::string_view kArchitecture = "glm5-next";
+constexpr std::string_view kLegacyArchitecture = "glm5next";
 
 struct Reader {
   const core::GgufReader& gguf;
@@ -125,14 +126,21 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
                                   std::string* error_msg) {
   Reader r{reader, error_msg};
   const auto architecture = reader.GetMetadataString("general.architecture");
-  if (!architecture.has_value() || *architecture != kArchitecture) {
+  std::string_view prefix{kArchitecture};
+  if (!architecture.has_value()) {
+    r.Fail("missing general.architecture");
+    return std::nullopt;
+  }
+  if (*architecture == kLegacyArchitecture) {
+    prefix = kLegacyArchitecture;
+  } else if (*architecture != kArchitecture) {
     r.Fail("artifact is not " + std::string(kArchitecture));
     return std::nullopt;
   }
 
   Config c;
-  const auto key = [](std::string_view name) {
-    return "glm5-next." + std::string(name);
+  const auto key = [prefix](std::string_view name) {
+    return std::string(prefix) + "." + std::string(name);
   };
   c.num_layers = r.U32(key("block_count"));
   c.hidden_size = r.U32(key("embedding_length"));
@@ -147,7 +155,9 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   c.indexer_key_dim = r.U32(key("attention.indexer.key_length"));
   c.indexer_top_k = r.U32(key("attention.indexer.top_k"));
   c.indexer_kpool = r.U32(key("attention.indexer.kpool"));
-  c.index_share_mtp = r.Bool(key("attention.indexer.index_share_mtp"), false);
+  const auto share =
+      reader.GetMetadataBool(key("attention.indexer.index_share_mtp"));
+  c.index_share_mtp = share.value_or(false);
   c.expert_count = r.U32(key("expert_count"));
   c.expert_used = r.U32(key("expert_used_count"));
   c.expert_shared = r.U32(key("expert_shared_count"));

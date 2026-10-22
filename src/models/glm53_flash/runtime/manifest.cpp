@@ -64,19 +64,12 @@ struct Builder {
       }
       ++index;
     }
-    const bool is_float = IsFloatSlot(slot);
-    if (is_float != !IsQuantized(tensor->type)) {
-      Fail(std::string(name) + " has type " +
-           std::string(core::ToString(tensor->type)) +
-           (is_float ? ", expected F32" : ", expected a block-quantized type"));
-      return;
-    }
     manifest.entries.push_back(ManifestEntry{slot, layer, tensor});
     manifest.total_bytes += tensor->size_bytes;
-    if (is_float) {
-      manifest.float_bytes += tensor->size_bytes;
-    } else {
+    if (IsQuantized(tensor->type)) {
       manifest.quantized_bytes += tensor->size_bytes;
+    } else {
+      manifest.float_bytes += tensor->size_bytes;
     }
     if (slot == Slot::kExpertGate || slot == Slot::kExpertUp ||
         slot == Slot::kExpertDown) {
