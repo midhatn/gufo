@@ -3,6 +3,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
+#include "src/models/glm53_flash/runtime/manifest.hpp"
 
 int main(int argc, char** argv) {
   if (argc != 2) {
@@ -41,6 +42,19 @@ int main(int argc, char** argv) {
       c.rms_eps, c.layer_norm_eps, c.hc_eps, c.kda_gate_lower_bound,
       c.expert_weights_scale, c.expert_weights_norm ? 1 : 0,
       reader->GetTensors().size());
+  auto manifest = gufo::models::glm53_flash::BuildManifest(c, *reader, &error);
+  if (!manifest) {
+    std::fprintf(stderr, "manifest rejected: %s\n", error.c_str());
+    return 1;
+  }
+  std::printf("manifest tensors=%zu total=%.1f GiB float=%.1f MiB "
+              "quant=%.1f GiB experts=%.1f GiB mtp=%.1f MiB\n",
+              manifest->entries.size(),
+              static_cast<double>(manifest->total_bytes) / (1 << 30),
+              static_cast<double>(manifest->float_bytes) / (1 << 20),
+              static_cast<double>(manifest->quantized_bytes) / (1 << 30),
+              static_cast<double>(manifest->expert_bytes) / (1 << 30),
+              static_cast<double>(manifest->mtp_bytes) / (1 << 20));
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
     std::printf("blk.%02u %s%s%s\n", layer,
                 c.IsMla(layer) ? "mla" : "kda",
