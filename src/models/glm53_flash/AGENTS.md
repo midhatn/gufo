@@ -69,3 +69,20 @@ MMQ tier (`src/models/deepseek_v4_flash/kernels/rocm/mmq/`, vendored
 llama.cpp) covers every GLM type incl. IQ2_XXS/IQ2_XS/IQ3_XXS/Q2_K/Q3_K.
 CPU dequant in `src/core/quant/ggml_dequant.cpp` (no IQ2_XXS yet — needed
 for the CPU reference only).
+
+## Pitfalls (verified by cross-validation)
+
+- Sinkhorn order is exactly: softmax(cols) -> norm_src -> 19x(norm_dst,
+  norm_src). Swapping the inner pair yields a different matrix (~2e-2 here).
+- `hc_*_fn` comb slice `mixes[8:24]` is stored dst-fastest: element (d, s) is
+  `mixes[8 + d + 4s]` (Fortran order for a [dst, src] view).
+- Stage comparison needs a scale-aware metric; per-coordinate relative metrics
+  explode near zero coordinates.
+
+## Status
+
+Reference (tests, CPU): config, manifest, layout, hc_pre/post, KDA, dense
+FFN, head -- cross-validated against an independent numpy reimplementation
+on the real AJ-IQ2_XXS artifact: 6 tokens x 3 KDA layers, every stage and
+h_final agree within 3.3e-7 relative.
+DSA/MLA layers, MoE expert path, sampler, drafter: pending.
