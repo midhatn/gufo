@@ -74,6 +74,7 @@ endif()
 add_subdirectory(src/models/qwen38_flash_next)
 
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
+add_subdirectory(src/models/glm53_flash)
 add_subdirectory(src/models/qwen3_tts)
 
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
