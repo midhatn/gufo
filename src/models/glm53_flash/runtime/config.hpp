@@ -56,11 +56,12 @@ struct Config {
   std::vector<float> swiglu_clamp_exp;
   std::vector<float> swiglu_clamp_shexp;
 
+  [[nodiscard]] bool HasMtp() const noexcept { return nextn_layers != 0; }
   [[nodiscard]] std::uint32_t MtpLayer() const noexcept {
-    return nextn_layers == 0 ? num_layers : num_layers - nextn_layers;
+    return HasMtp() ? num_layers - nextn_layers : 0;
   }
   [[nodiscard]] std::uint32_t TrunkLayers() const noexcept {
-    return MtpLayer();
+    return num_layers - nextn_layers;
   }
   [[nodiscard]] bool IsMla(std::uint32_t layer) const noexcept {
     return layer < kv_layer.size() && kv_layer[layer] != 0;

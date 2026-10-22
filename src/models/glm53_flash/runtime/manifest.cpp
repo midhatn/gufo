@@ -82,7 +82,7 @@ struct Builder {
         slot == Slot::kExpertDown) {
       manifest.expert_bytes += tensor->size_bytes;
     }
-    if (layer == config.MtpLayer()) {
+    if (config.HasMtp() && layer == config.MtpLayer()) {
       manifest.mtp_bytes += tensor->size_bytes;
     }
   }
@@ -144,7 +144,7 @@ std::optional<Manifest> BuildManifest(const Config& config,
     };
     b.Add(Slot::kAttnNorm, l, p("attn_norm.weight"), {h});
     b.Add(Slot::kFfnNorm, l, p("ffn_norm.weight"), {h});
-    if (l != config.MtpLayer()) {
+    if (!config.HasMtp() || l != config.MtpLayer()) {
       b.Add(Slot::kHcAttnBase, l, p("hc_attn_base.weight"), {config.HcRank()});
       b.Add(Slot::kHcAttnFn, l, p("hc_attn_fn.weight"),
             {config.HcDim(), config.HcRank()});
@@ -234,16 +234,17 @@ std::optional<Manifest> BuildManifest(const Config& config,
     }
   }
 
-  const auto mtp = config.MtpLayer();
-  const auto p = [mtp](std::string_view suffix) {
-    return "blk." + std::to_string(mtp) + "." + std::string(suffix);
-  };
-  b.Add(Slot::kNextnEhProj, mtp, p("nextn.eh_proj.weight"),
-        {2 * h, h});
-  b.Add(Slot::kNextnEnorm, mtp, p("nextn.enorm.weight"), {h});
-  b.Add(Slot::kNextnHnorm, mtp, p("nextn.hnorm.weight"), {h});
-  b.Add(Slot::kNextnSharedHeadNorm, mtp, p("nextn.shared_head_norm.weight"),
-        {h});
+  if (config.HasMtp()) {
+    const auto mtp = config.MtpLayer();
+    const auto p = [mtp](std::string_view suffix) {
+      return "blk." + std::to_string(mtp) + "." + std::string(suffix);
+    };
+    b.Add(Slot::kNextnEhProj, mtp, p("nextn.eh_proj.weight"), {2 * h, h});
+    b.Add(Slot::kNextnEnorm, mtp, p("nextn.enorm.weight"), {h});
+    b.Add(Slot::kNextnHnorm, mtp, p("nextn.hnorm.weight"), {h});
+    b.Add(Slot::kNextnSharedHeadNorm, mtp, p("nextn.shared_head_norm.weight"),
+          {h});
+  }
 
   if (!b.ok) {
     return std::nullopt;

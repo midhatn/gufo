@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     std::printf("blk.%02u %s%s%s\n", layer,
                 c.IsMla(layer) ? "mla" : "kda",
                 layer >= c.leading_dense ? "+moe" : "+dense",
-                layer == c.MtpLayer() ? " mtp" : "");
+                c.HasMtp() && layer == c.MtpLayer() ? " mtp" : "");
   }
   return 0;
 }

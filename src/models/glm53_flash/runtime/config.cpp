@@ -182,7 +182,10 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
 
   // Pinned GLM-5.3-Flash shape. A different revision has to bring its own
   // kernels and layouts rather than run on these.
-  Expect(r, "block_count", c.num_layers, 46);
+  if (c.num_layers != 45 && c.num_layers != 46) {
+    r.Fail("GLM-5.3-Flash: block_count is " + std::to_string(c.num_layers) +
+           ", this build supports 45 (pruned MTP) or 46");
+  }
   Expect(r, "embedding_length", c.hidden_size, 4096);
   Expect(r, "attention.head_count", c.num_heads, 64);
   Expect(r, "attention.key_length", c.key_length, 512);
@@ -207,10 +210,15 @@ std::optional<Config> ParseConfig(const core::GgufReader& reader,
   Expect(r, "kda.head_dim", c.kda_head_dim, 128);
   Expect(r, "ssm.conv_kernel", c.ssm_conv_kernel, 4);
   Expect(r, "vocab_size", c.vocab_size, 154880);
-  Expect(r, "nextn_predict_layers", c.nextn_layers, 1);
-  Expect(r, "kv_layer entries", c.kv_layer.size(), 46);
-  Expect(r, "swiglu_clamp_exp entries", c.swiglu_clamp_exp.size(), 46);
-  Expect(r, "swiglu_clamp_shexp entries", c.swiglu_clamp_shexp.size(), 46);
+  Expect(r, "block_count minus nextn", c.num_layers - c.nextn_layers, 45);
+  if (c.nextn_layers > 1) {
+    r.Fail("GLM-5.3-Flash: more than one nextn layer");
+  }
+  Expect(r, "kv_layer entries", c.kv_layer.size(), c.num_layers);
+  Expect(r, "swiglu_clamp_exp entries", c.swiglu_clamp_exp.size(),
+         c.num_layers);
+  Expect(r, "swiglu_clamp_shexp entries", c.swiglu_clamp_shexp.size(),
+         c.num_layers);
   Expect(r, "trunk MLA layers", c.NumMlaLayers(), 11);
   Expect(r, "trunk KDA layers", c.NumKdaLayers(), 34);
   if (!r.ok) {
