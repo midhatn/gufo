@@ -17,6 +17,8 @@ H, HC, HD, HEADS, D_INNER = 4096, 4, 128, 64, 8192
 HC_EPS = 1e-6
 RMS_EPS = 1e-5
 TOK = [9703, 11, 1879, 0, 101726, 98384]
+if os.environ.get('GUFO_GLM53_TOKENS'):
+    TOK = [int(v) for v in os.environ['GUFO_GLM53_TOKENS'].split(',')]
 LAYERS = int(os.environ.get('GUFO_GLM53_LAYERS', '3'))
 KV, QK, IH, ID, KPOOL = 512, 256, 32, 128, 4
 

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <numeric>
 #include <span>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -564,7 +565,15 @@ int main(int argc, char** argv) {
 
   const std::uint32_t h = 4096, hc = 4, hd = 128, heads = 64, d_inner = 8192;
   const float hc_eps = config->hc_eps;
-  const std::vector<std::int32_t> tokens = {9703, 11, 1879, 0, 101726, 98384};
+  std::vector<std::int32_t> tokens = {9703, 11, 1879, 0, 101726, 98384};
+  if (const char* tv = std::getenv("GUFO_GLM53_TOKENS"); tv != nullptr) {
+    tokens.clear();
+    std::stringstream ss(tv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      tokens.push_back(static_cast<std::int32_t>(std::stoi(item)));
+    }
+  }
   const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());
 
   std::vector<float> x(static_cast<std::size_t>(T) * hc * h, 0.0F);
