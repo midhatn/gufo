@@ -278,10 +278,12 @@ HcMix HcPre(std::span<const float> x, const char* prefix, float eps, int token,
     norm(false);
     norm(true);
   }
-  Dump(dump_dir, prefix, token, mixes);
-  Dump((std::string(dump_dir) + "/pre").c_str(), prefix, token, m.pre);
-  Dump((std::string(dump_dir) + "/comb").c_str(), prefix, token, m.comb);
-  Dump((std::string(dump_dir) + "/post").c_str(), prefix, token, m.post);
+  if (dump_dir != nullptr) {
+    Dump(dump_dir, prefix, token, mixes);
+    Dump((std::string(dump_dir) + "/pre").c_str(), prefix, token, m.pre);
+    Dump((std::string(dump_dir) + "/comb").c_str(), prefix, token, m.comb);
+    Dump((std::string(dump_dir) + "/post").c_str(), prefix, token, m.post);
+  }
   return m;
 }
 
@@ -581,6 +583,7 @@ int main(int argc, char** argv) {
       return "blk." + std::to_string(layer) + "." + s;
     };
     const bool dsa = (layer % 4) == 3;
+    const bool moe = layer >= 3;
     for (std::uint32_t t = 0; t < T; ++t) {
       auto& cur = tok_x[t];
       // attention block
@@ -722,7 +725,7 @@ int main(int argc, char** argv) {
       Rms(ffn_in, ffn_norm, 1e-5F);
       Dump(dump_dir, "ffn_in", t, ffn_in);
       std::vector<float> ffn_out(h, 0.0F);
-      if (!dsa) {
+      if (!moe) {
         std::vector<float> gate(12288), up(12288), act(12288);
         Load(p("ffn_gate.weight").c_str()).MatVec(ffn_in, gate);
         Load(p("ffn_up.weight").c_str()).MatVec(ffn_in, up);
@@ -769,6 +772,42 @@ int main(int argc, char** argv) {
                 finite ? 1 : 0, max_abs, sum / h);
     if (!finite || max_abs == 0.0) {
       return 1;
+    }
+    if (std::getenv("GUFO_GLM53_LOGITS") != nullptr && t + 1 < T) {
+      const F32& head_w = Load("output.weight");
+      std::vector<float> lg(head_w.rows());
+      head_w.MatVec(xn, lg);
+      int best = 0;
+      std::uint32_t top5[5] = {0, 0, 0, 0, 0};
+      float topv[5] = {-1e30F, -1e30F, -1e30F, -1e30F, -1e30F};
+      for (std::uint64_t i = 0; i < head_w.rows(); ++i) {
+        if (lg[i] > topv[4]) {
+          int k = 4;
+          while (k > 0 && topv[k - 1] < lg[i]) {
+            topv[k] = topv[k - 1];
+            top5[k] = top5[k - 1];
+            --k;
+          }
+          topv[k] = lg[i];
+          top5[k] = static_cast<std::uint32_t>(i);
+        }
+        if (lg[i] > lg[best]) {
+          best = static_cast<int>(i);
+        }
+      }
+      const int want = tokens[t + 1];
+      std::printf("logits t=%u argmax=%d want=%d %s top5=[%u %u %u %u %u]\n", t,
+                  best, want, best == want ? "HIT" : "MISS", top5[0], top5[1],
+                  top5[2], top5[3], top5[4]);
+      if (dump_dir != nullptr) {
+        std::ofstream out(std::string(dump_dir) + "/logits_top5." +
+                              std::to_string(t) + ".f32",
+                          std::ios::binary);
+        for (int k = 0; k < 5; ++k) {
+          out.write(reinterpret_cast<const char*>(&topv[k]), 4);
+          out.write(reinterpret_cast<const char*>(&top5[k]), 4);
+        }
+      }
     }
   }
   return 0;

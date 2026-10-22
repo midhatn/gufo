@@ -81,8 +81,17 @@ for the CPU reference only).
 
 ## Status
 
-Reference (tests, CPU): config, manifest, layout, hc_pre/post, KDA, dense
-FFN, head -- cross-validated against an independent numpy reimplementation
-on the real AJ-IQ2_XXS artifact: 6 tokens x 3 KDA layers, every stage and
-h_final agree within 3.3e-7 relative.
-DSA/MLA layers, MoE expert path, sampler, drafter: pending.
+Reference (tests, CPU): config, manifest, layout, hc_pre/post, KDA, DSA
+(absorbed MLA + kpool indexer), dense FFN, MoE (top-8 of 288 + shared,
+IQ2_XXS/IQ2_S expert dequant bit-exact vs python-gguf), head and logits --
+cross-validated against an independent numpy reimplementation on the real
+AJ-IQ2_XXS artifact: 6 tokens x 4 stages + 8-layer teacher-forcing logits,
+every stage, h_final and top-5 logits agree within 3.3e-7 relative
+(`glm53.layer0_numpy`, `glm53.logits8_numpy`). The full 45-layer trunk runs
+end-to-end on the reference harness (finite h_final and logits; teacher
+forcing 2/5 top-1 at 2.3 bpw is quant-limited, not validated as a bug
+until an unquantized or llama.cpp reference exists).
+Sampler, GPU kernels, NPU offload, drafter: pending. The full trunk runs
+only while the GGUF page cache is warm and no other model is resident;
+teacher-forcing top-1 accuracy cannot be validated while flash-next holds
+model memory, so logit-level goldens are deferred.

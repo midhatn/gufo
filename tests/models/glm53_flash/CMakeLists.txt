@@ -29,8 +29,33 @@ set_tests_properties(glm53.forward0 PROPERTIES
   FIXTURES_SETUP glm53-dump
   COST 300)
 
-# Independent numpy reimplementation cross-checks every dumped stage.
 find_program(PYTHON3_EXECUTABLE python3)
+
+# Teacher-forcing logits cross-check through 8 layers (slow; -LE slow to skip).
+add_test(NAME glm53.logits8
+  COMMAND glm53_forward_layer0_test "${GUFO_GLM53_FLASH_MODEL}")
+set_tests_properties(glm53.logits8 PROPERTIES
+  LABELS "cpu;glm53;reference;external-model;slow"
+  SKIP_REGULAR_EXPRESSION "model artifact unavailable"
+  ENVIRONMENT "GUFO_GLM53_DUMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/glm53-dump8;GUFO_GLM53_LAYERS=8;GUFO_GLM53_LOGITS=1"
+  FIXTURES_SETUP glm53-dump8
+  COST 900)
+
+if(PYTHON3_EXECUTABLE)
+  add_test(NAME glm53.logits8_numpy
+    COMMAND ${PYTHON3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/layer0_numpy.py
+      "${GUFO_GLM53_FLASH_MODEL}"
+      ${CMAKE_CURRENT_BINARY_DIR}/glm53-dump8)
+  set_tests_properties(glm53.logits8_numpy PROPERTIES
+    LABELS "cpu;glm53;reference;external-model;slow"
+    SKIP_RETURN_CODE 77
+    FIXTURES_REQUIRED glm53-dump8
+    ENVIRONMENT "GUFO_GLM53_LAYERS=8;GUFO_GLM53_LOGITS=1"
+    COST 3600)
+endif()
+
+# Independent numpy reimplementation cross-checks every dumped stage.
 if(PYTHON3_EXECUTABLE)
   add_test(NAME glm53.layer0_numpy
     COMMAND ${PYTHON3_EXECUTABLE}

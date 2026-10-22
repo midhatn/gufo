@@ -210,6 +210,7 @@ def main():
                   hc_scale=model.get(p + 'hc_ffn_scale.weight'),
                   hc_base=model.get(p + 'hc_ffn_base.weight'))
         dsa = (layer % 4) == 3
+        moe = layer >= 3
         attn_norm = model.get(p + 'attn_norm.weight')
         ffn_norm = model.get(p + 'ffn_norm.weight')
         if not dsa:
@@ -268,7 +269,7 @@ def main():
             _, pre, post, comb = hc_mixes(x[t].astype(np.float32), wf)
             fin = (x[t].astype(np.float32) * pre[:, None]).sum(axis=0)
             fin = rms(fin, ffn_norm)
-            if dsa:
+            if moe:
                 sel = np.argsort(-(sigmoid(
                     (model.get(p + 'ffn_gate_inp.weight') @
                      fin.astype(np.float64)).astype(np.float32)
@@ -292,6 +293,22 @@ def main():
     h = np.stack([rms(h[t], model.get('output_norm.weight')) for t in range(T)])
     for t in range(T):
         check(dump, 'h_final', t, h[t])
+    if os.environ.get('GUFO_GLM53_LOGITS'):
+        w = model.get('output.weight')
+        for t in range(T - 1):
+            lg = (w @ h[t].astype(np.float64)).astype(np.float32)
+            top = np.argsort(-lg)[:5]
+            ref = np.fromfile(os.path.join(dump, f'logits_top5.{t}.f32'),
+                              dtype=np.float32)
+            cpp_ids = ref[1::2].view(np.int32)
+            cpp_log = ref[0::2]
+            agree = int(top[0]) == int(cpp_ids[0])
+            vrel = np.abs(lg[top] - cpp_log).max() / max(
+                np.abs(cpp_log).max(), 1.0)
+            print(f'logits t={t} top1 {"HIT" if agree else "MISS"} '
+                  f'top5_logit_max_rel={vrel:.3e}')
+            if not agree or vrel >= 5e-3:
+                sys.exit(1)
     print('numpy forward complete')
 
 
