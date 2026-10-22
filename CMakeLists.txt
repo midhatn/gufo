@@ -477,6 +477,7 @@ if (BUILD_TESTING)
   endif()
 
   add_subdirectory(tests/models/deepseek_v4_flash)
+  add_subdirectory(tests/models/glm53_flash)
   add_subdirectory(tests/models/qwen38_flash_next)
 
   if(ENGINE_ENABLE_HIP)
