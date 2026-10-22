@@ -187,6 +187,9 @@ void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ3_S to float
 void DequantizeIQ3_S(const void* src, float* dst, std::size_t k);
+// IQ2_XXS / IQ2_S (GLM-5.3-Flash AJ MoE experts).
+void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k);
+void DequantizeIQ2_S(const void* src, float* dst, std::size_t k);
 
 // Compute dot product of IQ4_NL quantized row with FP32 vector
 float DotProductIQ4_NL(const void* row_data, std::span<const float> vec,

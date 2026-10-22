@@ -7,14 +7,18 @@ import os
 import sys
 
 import numpy as np
-from gguf import GGUFReader
-from gguf.quants import dequantize
+try:
+    from gguf import GGUFReader
+    from gguf.quants import dequantize
+except ImportError:
+    sys.exit(77)
 
 H, HC, HD, HEADS, D_INNER = 4096, 4, 128, 64, 8192
 HC_EPS = 1e-6
 RMS_EPS = 1e-5
 TOK = [9703, 11, 1879, 0, 101726, 98384]
-LAYERS = 3
+LAYERS = int(os.environ.get('GUFO_GLM53_LAYERS', '3'))
+KV, QK, IH, ID, KPOOL = 512, 256, 32, 128, 4
 
 
 def sigmoid(x):
@@ -25,6 +29,13 @@ def rms(x, w=None, eps=RMS_EPS):
     inv = 1.0 / np.sqrt(np.mean(x * x, dtype=np.float64) + eps)
     y = x * inv
     return (y * w) if w is not None else y
+
+
+def lnorm(x, w, b, eps=1e-6):
+    mu = x.mean()
+    var = np.mean((x - mu) ** 2, dtype=np.float64)
+    y = (x - mu) / np.sqrt(var + eps)
+    return (y * w + b).astype(np.float32)
 
 
 def l2(x, eps=1e-6):
@@ -46,6 +57,15 @@ class Model:
                 self.cache[name] = np.array(dequantize(t.data, t.tensor_type),
                                            dtype=np.float32)
         return self.cache[name]
+
+    def expert(self, name, e):
+        """Dequantize one expert slab of a 3-D tensor without loading all."""
+        key = f'{name}#{e}'
+        if key not in self.cache:
+            t = self.tensors[name]
+            self.cache[key] = np.array(dequantize(t.data[e], t.tensor_type),
+                                      dtype=np.float32)
+        return self.cache[key]
 
     def w(self, name):  # matrix [out, in] for GGUF dims (in, out)
         return self.get(name)
@@ -79,6 +99,94 @@ def hc_post(x_stream, block, post, comb):
     return out
 
 
+
+
+def dsa_dump(dump, layer, t, st, model, p):
+    check(dump, f'L{layer}_dsa_lat', t, np.asarray(st['lat'][t]))
+
+
+def dsa_block(model, p, xin, st, t):
+    """Sparse MLA (nope-only) with the kpool-select indexer."""
+    qr = rms((model.get(p + 'attn_q_a.weight') @ xin).astype(np.float32),
+             model.get(p + 'attn_q_a_norm.weight'))
+    q = (model.get(p + 'attn_q_b.weight') @
+         qr.astype(np.float64)).astype(np.float32).reshape(HEADS, QK)
+    lat = rms((model.get(p + 'attn_kv_a_mqa.weight') @ xin).astype(np.float32),
+              model.get(p + 'attn_kv_a_norm.weight'))
+
+    iq = (model.get(p + 'indexer.attn_q_b.weight') @ qr).reshape(IH, ID)
+    ik = model.get(p + 'indexer.attn_k.weight') @ xin
+    ik = lnorm(ik.astype(np.float64), model.get(p + 'indexer.k_norm.weight'),
+               model.get(p + 'indexer.k_norm.bias'))
+    gate = model.get(p + 'indexer_compressor_gate.weight') @ xin
+
+    n = len(st['lat'])
+    st['lat'].append(lat)
+    st['ik'].append(ik)
+    st['gate'].append(gate)
+    if (n + 1) % KPOOL == 0:
+        ape = model.get(p + 'indexer_compressor_ape.weight')  # [slot, dim]
+        b = n + 1 - KPOOL
+        ks = np.stack(st['ik'][b:n + 1])          # [slot, dim]
+        gs = np.stack(st['gate'][b:n + 1]) + ape  # [slot, dim]
+        gs = gs - gs.max(axis=0, keepdims=True)
+        ps = np.exp(gs)
+        ps /= ps.sum(axis=0, keepdims=True)
+        st['pooled'].append((ps * ks).sum(axis=0).astype(np.float32))
+
+    w = (model.get(p + 'indexer.proj.weight') @ xin) / math.sqrt(IH * ID)
+    npool = len(st['pooled'])
+    n_top = min(npool, 2048 // KPOOL)
+    vis = []
+    if npool:
+        pooled = np.stack(st['pooled'])  # [pool, dim]
+        score = (np.maximum(pooled @ iq.T, 0) *
+                 w[None, :]).sum(axis=1)
+        order = np.argsort(-score)[:n_top]
+        vis = [int(order[i]) * KPOOL + k for i in order for k in range(KPOOL)]
+    for k in range((n + 1) % KPOOL):
+        vis.append(n - k)
+
+    wk = model.get(p + 'attn_k_b.weight')   # [head, kv, qk]
+    wv = model.get(p + 'attn_v_b.weight')   # [head, qk, kv]
+    latm = np.stack(st['lat'])              # [tok, kv]
+    qabs = (q[:, None, :].astype(np.float64) *
+            wk.astype(np.float64)).sum(axis=2)  # [head, kv]
+    sel = latm[vis].astype(np.float64)         # [vis, kv]
+    s = (qabs @ sel.T) / math.sqrt(QK)
+    s -= s.max(axis=1, keepdims=True)
+    a = np.exp(s)
+    a /= a.sum(axis=1, keepdims=True)
+    ctx = (a @ sel).astype(np.float32)         # [head, kv]
+    out = np.einsum('hc,hjc->hj', ctx.astype(np.float64),
+                    wv.astype(np.float64)).astype(np.float32)
+    return (model.get(p + 'attn_output.weight') @
+            out.reshape(-1).astype(np.float64)).astype(np.float32)
+
+
+def moe_ffn(model, p, fin):
+    logits = model.get(p + 'ffn_gate_inp.weight') @ fin.astype(np.float64)
+    eb = model.get(p + 'exp_probs_b.bias')
+    probs = sigmoid(logits.astype(np.float32))
+    sel = probs + eb
+    idx = np.argsort(-sel)[:8]
+    wsum = max(float(probs[idx].sum()), 6.103515625e-5)
+    out = np.zeros(4096, dtype=np.float32)
+    for e in idx:
+        g = model.expert(p + 'ffn_gate_exps.weight', e) @ fin
+        u = model.expert(p + 'ffn_up_exps.weight', e) @ fin
+        g = np.minimum(g, 10.0)
+        u = np.clip(u, -10.0, 10.0)
+        act = g * sigmoid(g) * u
+        out += probs[e] / wsum * 2.5 * (
+            model.expert(p + 'ffn_down_exps.weight', e) @ act).astype(np.float32)
+    g = np.minimum(model.get(p + 'ffn_gate_shexp.weight') @ fin, 10.0)
+    u = np.clip(model.get(p + 'ffn_up_shexp.weight') @ fin, -10.0, 10.0)
+    act = g * sigmoid(g) * u
+    return (out + (model.get(p + 'ffn_down_shexp.weight') @
+                   act).astype(np.float32))
+
+
 def main():
     if not len(sys.argv) > 2 or not sys.argv[1]:
         sys.exit(77)
@@ -91,6 +199,7 @@ def main():
 
     conv_state = np.zeros((LAYERS, 3, 3, D_INNER), dtype=np.float32)
     ssm_state = np.zeros((LAYERS, HEADS, HD, HD), dtype=np.float32)
+    dsa_state = [dict(lat=[], ik=[], gate=[], pooled=[]) for _ in range(45)]
 
     for layer in range(LAYERS):
         p = f'blk.{layer}.'
@@ -100,13 +209,15 @@ def main():
         wf = dict(hc_fn=model.get(p + 'hc_ffn_fn.weight'),
                   hc_scale=model.get(p + 'hc_ffn_scale.weight'),
                   hc_base=model.get(p + 'hc_ffn_base.weight'))
+        dsa = (layer % 4) == 3
         attn_norm = model.get(p + 'attn_norm.weight')
         ffn_norm = model.get(p + 'ffn_norm.weight')
-        cq = model.get(p + 'ssm_conv1d_q.weight').reshape(D_INNER, 4)
-        ck = model.get(p + 'ssm_conv1d_k.weight').reshape(D_INNER, 4)
-        cv = model.get(p + 'ssm_conv1d_v.weight').reshape(D_INNER, 4)
-        a_log = model.get(p + 'ssm_a')
-        dt = model.get(p + 'ssm_dt.bias')
+        if not dsa:
+            cq = model.get(p + 'ssm_conv1d_q.weight').reshape(D_INNER, 4)
+            ck = model.get(p + 'ssm_conv1d_k.weight').reshape(D_INNER, 4)
+            cv = model.get(p + 'ssm_conv1d_v.weight').reshape(D_INNER, 4)
+            a_log = model.get(p + 'ssm_a')
+            dt = model.get(p + 'ssm_dt.bias')
 
         for t in range(T):
             cur = x[t].astype(np.float32)
@@ -115,50 +226,63 @@ def main():
             xin = rms(xin, attn_norm)
             check(dump, f'L{layer}_attn_in', t, xin)
 
-            q = proj(model, p + 'attn_q.weight', xin)
-            k = proj(model, p + 'attn_k.weight', xin)
-            v = proj(model, p + 'attn_v.weight', xin)
-            q = conv_silu(conv_state[layer, 0], cq, q)
-            k = conv_silu(conv_state[layer, 1], ck, k)
-            v = conv_silu(conv_state[layer, 2], cv, v)
+            if dsa:
+                block = dsa_block(model, p, xin, dsa_state[layer], t)
+                dsa_dump(dump, layer, t, dsa_state[layer], model, p)
+            else:
+                q = proj(model, p + 'attn_q.weight', xin)
+                k = proj(model, p + 'attn_k.weight', xin)
+                v = proj(model, p + 'attn_v.weight', xin)
+                q = conv_silu(conv_state[layer, 0], cq, q)
+                k = conv_silu(conv_state[layer, 1], ck, k)
+                v = conv_silu(conv_state[layer, 2], cv, v)
 
-            g = proj(model, p + 'ssm_f_b.weight',
-                     proj(model, p + 'ssm_f_a.weight', xin)) + dt
-            beta = sigmoid(proj(model, p + 'ssm_beta.weight', xin))
-            g2 = proj(model, p + 'ssm_g_b.weight',
-                      proj(model, p + 'ssm_g_a.weight', xin))
+                g = proj(model, p + 'ssm_f_b.weight',
+                         proj(model, p + 'ssm_f_a.weight', xin)) + dt
+                beta = sigmoid(proj(model, p + 'ssm_beta.weight', xin))
+                g2 = proj(model, p + 'ssm_g_b.weight',
+                          proj(model, p + 'ssm_g_a.weight', xin))
 
-            o = np.zeros(D_INNER, dtype=np.float32)
-            for h in range(HEADS):
-                s = ssm_state[layer, h]
-                qh = l2(q[h * HD:(h + 1) * HD].astype(np.float64)).astype(
-                    np.float32)
-                kh = l2(k[h * HD:(h + 1) * HD].astype(np.float64)).astype(
-                    np.float32)
-                decay = np.exp(-5.0 * sigmoid(-(g[h * HD:(h + 1) * HD] *
-                                              a_log[h]))).astype(np.float32)
-                s *= decay[None, :]
-                u = s @ kh
-                delta = (v[h * HD:(h + 1) * HD] - u) * beta[h]
-                s += delta[:, None] * kh[None, :]
-                oh = (s @ qh).astype(np.float32) / math.sqrt(HD)
-                oh = rms(oh, model.get(p + 'ssm_norm.weight'))
-                o[h * HD:(h + 1) * HD] = oh * sigmoid(
-                    g2[h * HD:(h + 1) * HD])
-            block = proj(model, p + 'attn_output.weight', o)
+                o = np.zeros(D_INNER, dtype=np.float32)
+                for h in range(HEADS):
+                    s = ssm_state[layer, h]
+                    qh = l2(q[h * HD:(h + 1) * HD].astype(np.float64)).astype(
+                        np.float32)
+                    kh = l2(k[h * HD:(h + 1) * HD].astype(np.float64)).astype(
+                        np.float32)
+                    decay = np.exp(-5.0 * sigmoid(-(g[h * HD:(h + 1) * HD] *
+                                                  a_log[h]))).astype(np.float32)
+                    s *= decay[None, :]
+                    u = s @ kh
+                    delta = (v[h * HD:(h + 1) * HD] - u) * beta[h]
+                    s += delta[:, None] * kh[None, :]
+                    oh = (s @ qh).astype(np.float32) / math.sqrt(HD)
+                    oh = rms(oh, model.get(p + 'ssm_norm.weight'))
+                    o[h * HD:(h + 1) * HD] = oh * sigmoid(
+                        g2[h * HD:(h + 1) * HD])
+                block = proj(model, p + 'attn_output.weight', o)
+
             check(dump, f'L{layer}_attn_block', t, block)
             x[t] = hc_post(cur, block, post, comb)
 
             _, pre, post, comb = hc_mixes(x[t].astype(np.float32), wf)
             fin = (x[t].astype(np.float32) * pre[:, None]).sum(axis=0)
             fin = rms(fin, ffn_norm)
-            gate = proj(model, p + 'ffn_gate.weight', fin)
-            up = proj(model, p + 'ffn_up.weight', fin)
-            gate = np.minimum(gate, 10.0)
-            up = np.clip(up, -10.0, 10.0)
-            ffn_out = proj(
-                model, p + 'ffn_down.weight',
-                (gate * sigmoid(gate) * up).astype(np.float32))
+            if dsa:
+                sel = np.argsort(-(sigmoid(
+                    (model.get(p + 'ffn_gate_inp.weight') @
+                     fin.astype(np.float64)).astype(np.float32)
+                    ) + model.get(p + 'exp_probs_b.bias')))[:8]
+                check(dump, f'L{layer}_moe_sel', t, sel.astype(np.float32))
+                ffn_out = moe_ffn(model, p, fin)
+            else:
+                gate = proj(model, p + 'ffn_gate.weight', fin)
+                up = proj(model, p + 'ffn_up.weight', fin)
+                gate = np.minimum(gate, 10.0)
+                up = np.clip(up, -10.0, 10.0)
+                ffn_out = proj(
+                    model, p + 'ffn_down.weight',
+                    (gate * sigmoid(gate) * up).astype(np.float32))
             check(dump, f'L{layer}_ffn_block', t, ffn_out)
             x[t] = hc_post(x[t].astype(np.float32), ffn_out, post, comb)
             x[t].astype(np.float32).tofile(

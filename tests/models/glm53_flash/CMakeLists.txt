@@ -25,7 +25,7 @@ add_test(NAME glm53.forward0
 set_tests_properties(glm53.forward0 PROPERTIES
   LABELS "cpu;glm53;reference;external-model"
   SKIP_RETURN_CODE 77
-  ENVIRONMENT "GUFO_GLM53_DUMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/glm53-dump"
+  ENVIRONMENT "GUFO_GLM53_DUMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/glm53-dump;GUFO_GLM53_LAYERS=4"
   FIXTURES_SETUP glm53-dump
   COST 300)
 
@@ -41,5 +41,6 @@ if(PYTHON3_EXECUTABLE)
     LABELS "cpu;glm53;reference;external-model"
     SKIP_RETURN_CODE 77
     FIXTURES_REQUIRED glm53-dump
+    ENVIRONMENT "GUFO_GLM53_LAYERS=4"
     COST 300)
 endif()
