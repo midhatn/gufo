@@ -67,8 +67,8 @@ the MLA attention over selected positions. (Detail from
 
 MMQ tier (`src/models/deepseek_v4_flash/kernels/rocm/mmq/`, vendored
 llama.cpp) covers every GLM type incl. IQ2_XXS/IQ2_XS/IQ3_XXS/Q2_K/Q3_K.
-CPU dequant in `src/core/quant/ggml_dequant.cpp` (no IQ2_XXS yet — needed
-for the CPU reference only).
+CPU dequant in `src/core/quant/ggml_dequant.cpp` includes IQ2_XXS/IQ2_S
+(bit-exact vs python-gguf, used by `reference.cpp`).
 
 ## Pitfalls (verified by cross-validation)
 
@@ -101,7 +101,14 @@ every stage, h_final and top-5 logits agree within 3.3e-7 relative
 end-to-end on the reference harness (finite h_final and logits; teacher
 forcing 2/5 top-1 at 2.3 bpw is quant-limited, not validated as a bug
 until an unquantized or llama.cpp reference exists).
-Sampler, GPU kernels, NPU offload, drafter: pending. The full trunk runs
+Production CPU reference (`reference.cpp`): `ReferenceModel` is the
+cross-validated harness math lifted into the library as a token-major
+streaming forward (`Open`/`CreateSession`/`Evaluate` -> logits);
+`glm53_reference_check` (ctest `glm53.reference_full`, slow, guarded by
+GUFO_GLM53_ALLOW_FULL=1) verifies its top-5 logits against the 45-layer
+goldens in `$GUFO_GLM53_GOLDENS` and must only run with no other model
+resident. Sampler, CLI wiring, tokenizer (pre=glm4: CHATGLM4 regex +
+ignore_merges), GPU kernels, NPU offload, drafter: pending. The full trunk runs
 only while the GGUF page cache is warm and no other model is resident;
 teacher-forcing top-1 accuracy cannot be validated while flash-next holds
 model memory, so logit-level goldens are deferred.

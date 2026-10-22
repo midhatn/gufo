@@ -1,3 +1,4 @@
+
 # GLM-5.3-Flash CTest checks. Artifact-backed tests skip (77) without
 # GUFO_GLM53_FLASH_MODEL so hosted CI stays green.
 set(GUFO_GLM53_FLASH_MODEL "$ENV{GUFO_GLM53_FLASH_MODEL}" CACHE FILEPATH
@@ -94,3 +95,13 @@ if(PYTHON3_EXECUTABLE)
     ENVIRONMENT "GUFO_GLM53_LAYERS=4"
     COST 300)
 endif()
+
+add_executable(glm53_reference_check reference_check.cpp)
+target_link_libraries(glm53_reference_check PRIVATE gufo_glm53_flash)
+add_test(NAME glm53.reference_full
+  COMMAND glm53_reference_check "${GUFO_GLM53_FLASH_MODEL}")
+set_tests_properties(glm53.reference_full PROPERTIES
+  LABELS "cpu;glm53;reference;external-model;slow"
+  SKIP_RETURN_CODE 77
+  ENVIRONMENT "GUFO_GLM53_GOLDENS=$ENV{GUFO_GLM53_GOLDENS}"
+  COST 3600)
