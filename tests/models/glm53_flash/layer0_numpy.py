@@ -80,6 +80,8 @@ def hc_post(x_stream, block, post, comb):
 
 
 def main():
+    if not len(sys.argv) > 2 or not sys.argv[1]:
+        sys.exit(77)
     model = Model(sys.argv[1])
     dump = sys.argv[2]
     T = len(TOK)

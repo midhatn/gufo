@@ -50,16 +50,16 @@ struct Builder {
     const auto* tensor = it->second;
     if (tensor->dimensions.size() != dims.size()) {
       Fail(std::string(name) + " has " +
-           std::to_string(tensor->dimensions.size()) + " dimensions, expected " +
-           std::to_string(dims.size()));
+           std::to_string(tensor->dimensions.size()) +
+           " dimensions, expected " + std::to_string(dims.size()));
       return;
     }
     std::size_t index = 0;
     for (const auto expected : dims) {
       if (tensor->dimensions[index] != expected) {
-        Fail(std::string(name) + " dimension " + std::to_string(index) + " is " +
-             std::to_string(tensor->dimensions[index]) + ", expected " +
-             std::to_string(expected));
+        Fail(std::string(name) + " dimension " + std::to_string(index) +
+             " is " + std::to_string(tensor->dimensions[index]) +
+             ", expected " + std::to_string(expected));
         return;
       }
       ++index;
@@ -176,8 +176,7 @@ std::optional<Manifest> BuildManifest(const Config& config,
       b.Add(Slot::kMlaQa, l, p("attn_q_a.weight"), {h, config.q_lora_rank});
       b.Add(Slot::kMlaQaNorm, l, p("attn_q_a_norm.weight"),
             {config.q_lora_rank});
-      b.Add(Slot::kMlaQb, l, p("attn_q_b.weight"),
-            {config.q_lora_rank, qdim});
+      b.Add(Slot::kMlaQb, l, p("attn_q_b.weight"), {config.q_lora_rank, qdim});
       b.Add(Slot::kMlaKvA, l, p("attn_kv_a_mqa.weight"), {h, kv});
       b.Add(Slot::kMlaKvANorm, l, p("attn_kv_a_norm.weight"), {kv});
       b.Add(Slot::kMlaKb, l, p("attn_k_b.weight"),
@@ -202,16 +201,13 @@ std::optional<Manifest> BuildManifest(const Config& config,
     }
 
     if (config.IsDense(l)) {
-      b.Add(Slot::kDenseGate, l, p("ffn_gate.weight"),
-            {h, config.dense_ff});
+      b.Add(Slot::kDenseGate, l, p("ffn_gate.weight"), {h, config.dense_ff});
       b.Add(Slot::kDenseUp, l, p("ffn_up.weight"), {h, config.dense_ff});
-      b.Add(Slot::kDenseDown, l, p("ffn_down.weight"),
-            {config.dense_ff, h});
+      b.Add(Slot::kDenseDown, l, p("ffn_down.weight"), {config.dense_ff, h});
     } else {
       b.Add(Slot::kRouter, l, p("ffn_gate_inp.weight"),
             {h, config.expert_count});
-      b.Add(Slot::kRouterBias, l, p("exp_probs_b.bias"),
-            {config.expert_count});
+      b.Add(Slot::kRouterBias, l, p("exp_probs_b.bias"), {config.expert_count});
       b.Add(Slot::kExpertGate, l, p("ffn_gate_exps.weight"),
             {h, config.expert_ff, config.expert_count});
       b.Add(Slot::kExpertUp, l, p("ffn_up_exps.weight"),

@@ -1,3 +1,5 @@
+#include "src/models/glm53_flash/runtime/layout.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -6,7 +8,6 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
-#include "src/models/glm53_flash/runtime/layout.hpp"
 #include "src/models/glm53_flash/runtime/manifest.hpp"
 
 namespace {
@@ -97,8 +98,8 @@ int main() {
   if (tensors != (c.HasMtp() ? 1412u : 1383u)) {
     return Fail("unexpected tensor count " + std::to_string(tensors));
   }
-  const std::string probe = c.HasMtp() ? "blk.45.attn_output.weight"
-                                       : "blk.44.attn_output.weight";
+  const std::string probe =
+      c.HasMtp() ? "blk.45.attn_output.weight" : "blk.44.attn_output.weight";
   if (!by_name.contains(std::string_view(probe))) {
     return Fail("missing " + probe);
   }

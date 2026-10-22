@@ -97,7 +97,8 @@ struct Manifest {
 
 /// Builds and verifies the manifest for the pinned GLM-5.3-Flash layout.
 [[nodiscard]] std::optional<Manifest> BuildManifest(
-    const Config& config, const core::GgufReader& reader, std::string* error_msg);
+    const Config& config, const core::GgufReader& reader,
+    std::string* error_msg);
 
 }  // namespace gufo::models::glm53_flash
 

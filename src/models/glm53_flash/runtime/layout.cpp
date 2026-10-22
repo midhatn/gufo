@@ -40,8 +40,8 @@ std::optional<Layout> BuildLayout(const Manifest& manifest,
   for (const auto& entry : manifest.entries) {
     const auto* tensor = entry.tensor;
     const auto elements = tensor->ElementCount();
-    const auto encoded =
-        quant::EncodedSizeBytes(tensor->type, static_cast<std::size_t>(elements));
+    const auto encoded = quant::EncodedSizeBytes(
+        tensor->type, static_cast<std::size_t>(elements));
     if (encoded == 0) {
       return fail("cannot size " + std::string(tensor->name) + " as " +
                   std::string(core::ToString(tensor->type)));
@@ -52,14 +52,14 @@ std::optional<Layout> BuildLayout(const Manifest& manifest,
                   std::to_string(encoded) + " are implied by its shape");
     }
     const Arena arena = ArenaOf(entry.slot);
-    auto& cursor = arena == Arena::kExperts ? layout.expert_bytes
-                                            : layout.dense_bytes;
+    auto& cursor =
+        arena == Arena::kExperts ? layout.expert_bytes : layout.dense_bytes;
     cursor = Align(cursor);
     if (cursor > std::numeric_limits<std::uint64_t>::max() - encoded) {
       return fail("arena size overflow at " + std::string(tensor->name));
     }
-    layout.placements.push_back(WeightPlacement{
-        entry.slot, entry.layer, arena, cursor, encoded, tensor->type});
+    layout.placements.push_back(WeightPlacement{entry.slot, entry.layer, arena,
+                                                cursor, encoded, tensor->type});
     cursor += encoded;
   }
   layout.dense_bytes = Align(layout.dense_bytes);

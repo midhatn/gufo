@@ -18,11 +18,11 @@ namespace gufo::models::glm53_flash {
 /// `ssm_*` recurrence) and MLA layers with a DSA indexer. `head_count_kv` is a
 /// per-layer flag array in the GGUF: a non-zero entry marks an MLA layer.
 struct Config {
-  std::uint32_t num_layers{0};  ///< 46, the last one is the MTP block.
-  std::uint32_t hidden_size{0};  ///< 4096.
-  std::uint32_t num_heads{0};    ///< 64.
-  std::uint32_t key_length{0};   ///< 512 (KDA head width).
-  std::uint32_t value_length{0};  ///< 512 (KDA head width).
+  std::uint32_t num_layers{0};        ///< 46, the last one is the MTP block.
+  std::uint32_t hidden_size{0};       ///< 4096.
+  std::uint32_t num_heads{0};         ///< 64.
+  std::uint32_t key_length{0};        ///< 512 (KDA head width).
+  std::uint32_t value_length{0};      ///< 512 (KDA head width).
   std::uint32_t key_length_mla{0};    ///< 256.
   std::uint32_t value_length_mla{0};  ///< 256.
   std::uint32_t kv_lora_rank{0};      ///< 512.
@@ -72,14 +72,27 @@ struct Config {
   [[nodiscard]] bool IsDense(std::uint32_t layer) const noexcept {
     return layer < leading_dense;
   }
-  /// Hyper-connection mixer rank: `hc_attn_fn` is [hidden * hc_count, 6 * hc_count].
+  /// Hyper-connection mixer rank: `hc_attn_fn` is [hidden * hc_count, 6 *
+  /// hc_count].
   [[nodiscard]] std::uint32_t HcRank() const noexcept { return 6 * hc_count; }
-  [[nodiscard]] std::uint32_t HcDim() const noexcept { return hc_count * hidden_size; }
-  [[nodiscard]] std::uint32_t KdaDim() const noexcept { return num_heads * kda_head_dim; }
-  [[nodiscard]] std::uint32_t SsmChannels() const noexcept { return 3 * KdaDim(); }
-  [[nodiscard]] std::uint32_t MlaQDim() const noexcept { return num_heads * key_length_mla; }
-  [[nodiscard]] std::uint32_t MlaVDim() const noexcept { return num_heads * value_length_mla; }
-  [[nodiscard]] std::uint32_t IndexerDim() const noexcept { return indexer_heads * indexer_key_dim; }
+  [[nodiscard]] std::uint32_t HcDim() const noexcept {
+    return hc_count * hidden_size;
+  }
+  [[nodiscard]] std::uint32_t KdaDim() const noexcept {
+    return num_heads * kda_head_dim;
+  }
+  [[nodiscard]] std::uint32_t SsmChannels() const noexcept {
+    return 3 * KdaDim();
+  }
+  [[nodiscard]] std::uint32_t MlaQDim() const noexcept {
+    return num_heads * key_length_mla;
+  }
+  [[nodiscard]] std::uint32_t MlaVDim() const noexcept {
+    return num_heads * value_length_mla;
+  }
+  [[nodiscard]] std::uint32_t IndexerDim() const noexcept {
+    return indexer_heads * indexer_key_dim;
+  }
   [[nodiscard]] std::uint32_t NumMlaLayers() const noexcept;
   [[nodiscard]] std::uint32_t NumKdaLayers() const noexcept;
 };

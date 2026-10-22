@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <span>
 #include <string>
@@ -27,13 +28,16 @@ namespace {
 std::unordered_map<std::string, const GgufTensorInfo*> g_tensors;
 std::string g_stage_prefix;
 
-float Sigmoid(float x) { return 1.0F / (1.0F + std::exp(-x)); }
+float Sigmoid(float x) {
+  return 1.0F / (1.0F + std::exp(-x));
+}
 
 void Rms(std::span<float> x, const float* w, float eps) {
   double sum = 0.0;
-  for (const auto v : x) sum += static_cast<double>(v) * v;
-  const float inv =
-      static_cast<float>(1.0 / std::sqrt(sum / static_cast<double>(x.size()) + eps));
+  for (const auto v : x)
+    sum += static_cast<double>(v) * v;
+  const float inv = static_cast<float>(
+      1.0 / std::sqrt(sum / static_cast<double>(x.size()) + eps));
   for (std::size_t i = 0; i < x.size(); ++i) {
     x[i] = x[i] * inv * (w != nullptr ? w[i] : 1.0F);
   }
@@ -41,14 +45,16 @@ void Rms(std::span<float> x, const float* w, float eps) {
 
 void L2(std::span<float> x, float eps) {
   double sum = 0.0;
-  for (const auto v : x) sum += static_cast<double>(v) * v;
+  for (const auto v : x)
+    sum += static_cast<double>(v) * v;
   const float inv = static_cast<float>(1.0 / std::sqrt(sum + eps));
-  for (auto& v : x) v *= inv;
+  for (auto& v : x)
+    v *= inv;
 }
 
 // Full dequantization of a tensor to F32, row-major over the last dimension.
 class F32 {
- public:
+public:
   F32() = default;
   explicit F32(const GgufTensorInfo* t) {
     Setup(t);
@@ -112,7 +118,7 @@ class F32 {
   std::uint64_t cols() const { return cols_; }
   const std::vector<float>& data() const { return data_; }
 
- private:
+private:
   const GgufTensorInfo* t_{nullptr};
   std::uint64_t rows_{0}, cols_{0};
   std::vector<float> data_;
@@ -153,8 +159,8 @@ struct HcMix {
   std::vector<float> pre, post, comb;
 };
 
-HcMix HcPre(std::span<const float> x, const char* prefix, float eps,
-            int token, const char* dump_dir) {
+HcMix HcPre(std::span<const float> x, const char* prefix, float eps, int token,
+            const char* dump_dir) {
   const std::uint32_t hc = 4, h = 4096;
   std::vector<float> xn(x.begin(), x.end());
   Rms(xn, nullptr, 1e-5F);
@@ -237,13 +243,21 @@ void HcPost(std::span<const float> block_out, std::span<const float> res,
 
 int main(int argc, char** argv) {
   const char* model_path = std::getenv("GUFO_GLM53_FLASH_MODEL");
-  if (argc > 1) {
+  if (argc > 1 && argv[1][0] != '\0') {
     model_path = argv[1];
   }
   if (model_path == nullptr) {
     return 77;
   }
   const char* dump_dir = std::getenv("GUFO_GLM53_DUMP_DIR");
+  if (dump_dir != nullptr) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dump_dir, ec);
+    fs::create_directories(std::string(dump_dir) + "/pre", ec);
+    fs::create_directories(std::string(dump_dir) + "/comb", ec);
+    fs::create_directories(std::string(dump_dir) + "/post", ec);
+  }
   std::string error;
   auto reader = GgufReader::OpenFile(model_path, &error);
   if (!reader) {
@@ -284,10 +298,10 @@ int main(int argc, char** argv) {
 
   // Recurrent state per KDA layer (conv history + delta state), sequence-wide.
   struct KdaState {
-    std::vector<float> conv;  // 3 * 3 * 8192 (qkv, history)
+    std::vector<float> conv;   // 3 * 3 * 8192 (qkv, history)
     std::vector<float> state;  // heads*hd*hd
-    KdaState() : conv(3 * (4 - 1) * d_inner, 0.0F),
-                 state(heads * hd * hd, 0.0F) {}
+    KdaState()
+        : conv(3 * (4 - 1) * d_inner, 0.0F), state(heads * hd * hd, 0.0F) {}
   };
   std::vector<KdaState> kda_state(3);
 
@@ -309,7 +323,8 @@ int main(int argc, char** argv) {
         }
       }
       std::copy_n(attn_in.data(), h, attn_in_n.data());
-      const float* attn_norm = Load(p("attn_norm.weight").c_str()).data().data();
+      const float* attn_norm =
+          Load(p("attn_norm.weight").c_str()).data().data();
       Rms(attn_in_n, attn_norm, 1e-5F);
       Dump(dump_dir, "attn_in", t, attn_in_n);
 
@@ -342,9 +357,10 @@ int main(int argc, char** argv) {
           }
           (*qkv[w])[ch] = acc / (1.0F + std::exp(-acc));
         }
-        std::copy(ks.conv.begin() + static_cast<std::ptrdiff_t>(base) + d_inner,
-                  ks.conv.begin() + static_cast<std::ptrdiff_t>(base) + 3 * d_inner,
-                  ks.conv.begin() + static_cast<std::ptrdiff_t>(base));
+        std::copy(
+            ks.conv.begin() + static_cast<std::ptrdiff_t>(base) + d_inner,
+            ks.conv.begin() + static_cast<std::ptrdiff_t>(base) + 3 * d_inner,
+            ks.conv.begin() + static_cast<std::ptrdiff_t>(base));
         std::memcpy(ks.conv.data() + base + 2 * d_inner, raw.data(),
                     d_inner * sizeof(float));
       }
@@ -393,8 +409,7 @@ int main(int argc, char** argv) {
         }
         float* o = attn_out.data() + hh * hd;
         for (std::uint32_t jv = 0; jv < hd; ++jv) {
-          const float delta =
-              (v[hh * hd + jv] - u[jv]) * betah[hh];
+          const float delta = (v[hh * hd + jv] - u[jv]) * betah[hh];
           float* row = S + static_cast<std::size_t>(jv) * hd;
           double acc = 0.0;
           for (std::uint32_t i = 0; i < hd; ++i) {
@@ -417,7 +432,8 @@ int main(int argc, char** argv) {
       tok_x[t].swap(next);
 
       // ffn block (dense)
-      const HcMix m_ffn = HcPre(tok_x[t], p("hc_ffn").c_str(), hc_eps, t, dump_dir);
+      const HcMix m_ffn =
+          HcPre(tok_x[t], p("hc_ffn").c_str(), hc_eps, t, dump_dir);
       std::vector<float> ffn_in(h);
       for (std::uint32_t i = 0; i < h; ++i) {
         ffn_in[i] = 0.0F;
@@ -463,12 +479,13 @@ int main(int argc, char** argv) {
     double max_abs = 0.0, sum = 0.0;
     bool finite = true;
     for (const auto v : xn) {
-      if (!std::isfinite(v)) finite = false;
+      if (!std::isfinite(v))
+        finite = false;
       max_abs = std::max(max_abs, static_cast<double>(std::abs(v)));
       sum += v;
     }
-    std::printf("h_final t=%u finite=%d max=%.6f mean=%.6f\n", t, finite ? 1 : 0,
-                max_abs, sum / h);
+    std::printf("h_final t=%u finite=%d max=%.6f mean=%.6f\n", t,
+                finite ? 1 : 0, max_abs, sum / h);
     if (!finite || max_abs == 0.0) {
       return 1;
     }

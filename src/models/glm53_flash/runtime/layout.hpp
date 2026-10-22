@@ -37,8 +37,8 @@ struct Layout {
   }
 };
 
-/// Assigns every tensor a 256-byte aligned slot in the dense or expert arena and
-/// verifies that the on-disk size matches the declared type and shape.
+/// Assigns every tensor a 256-byte aligned slot in the dense or expert arena
+/// and verifies that the on-disk size matches the declared type and shape.
 [[nodiscard]] std::optional<Layout> BuildLayout(const Manifest& manifest,
                                                 std::string* error_msg);
 
