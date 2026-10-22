@@ -3,10 +3,11 @@
 # are added once the layer-0 reference matches.
 add_library(gufo_glm53_flash STATIC
   runtime/config.cpp
-  runtime/manifest.cpp)
+  runtime/manifest.cpp
+  runtime/layout.cpp)
 
 target_include_directories(gufo_glm53_flash PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(gufo_glm53_flash PUBLIC gufo_core)
+target_link_libraries(gufo_glm53_flash PUBLIC gufo_core gufo_quant)
 
 # Host-only artifact check: parses the pinned `glm5-next` metadata and rejects
 # anything this build cannot run. Not part of the production package.

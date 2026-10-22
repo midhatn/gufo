@@ -3,6 +3,7 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
+#include "src/models/glm53_flash/runtime/layout.hpp"
 #include "src/models/glm53_flash/runtime/manifest.hpp"
 
 int main(int argc, char** argv) {
@@ -55,6 +56,29 @@ int main(int argc, char** argv) {
               static_cast<double>(manifest->quantized_bytes) / (1 << 30),
               static_cast<double>(manifest->expert_bytes) / (1 << 30),
               static_cast<double>(manifest->mtp_bytes) / (1 << 20));
+  auto layout = gufo::models::glm53_flash::BuildLayout(*manifest, &error);
+  if (!layout) {
+    std::fprintf(stderr, "layout rejected: %s\n", error.c_str());
+    return 1;
+  }
+  const auto gib = [](std::uint64_t bytes) {
+    return static_cast<double>(bytes) / (1 << 30);
+  };
+  std::printf("layout dense=%.2f GiB experts=%.2f GiB total=%.2f GiB "
+              "placements=%zu\n",
+              gib(layout->dense_bytes), gib(layout->expert_bytes),
+              gib(layout->TotalBytes()), layout->placements.size());
+  std::uint64_t layer_dense = 0;
+  std::uint64_t layer_experts = 0;
+  for (const auto& placement : layout->placements) {
+    if (placement.arena == gufo::models::glm53_flash::Arena::kDense) {
+      layer_dense += placement.bytes;
+    } else {
+      layer_experts += placement.bytes;
+    }
+  }
+  std::printf("verify dense=%.2f GiB experts=%.2f GiB\n", gib(layer_dense),
+              gib(layer_experts));
   for (std::uint32_t layer = 0; layer < c.num_layers; ++layer) {
     std::printf("blk.%02u %s%s%s\n", layer,
                 c.IsMla(layer) ? "mla" : "kda",
