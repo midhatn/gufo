@@ -79,6 +79,16 @@ for the CPU reference only).
 - Stage comparison needs a scale-aware metric; per-coordinate relative metrics
   explode near zero coordinates.
 
+## Indexer selection contract
+
+`indexer.k_norm` is mean-centering LayerNorm (llama.cpp `LLM_NORM` ->
+`ggml_norm`), not RMSNorm. Pool scores accumulate in double; ranks at the
+top-k boundary are ambiguous at float32 input precision, so cross-
+implementation equality of *selected pool sets* is only contractual given
+identical scores (stable by pool index on ties). The sparsity unit test
+(`glm53.dsasp`, top-8 of 12 pools) validates score equality independently
+and runs attention on identical selection.
+
 ## Status
 
 Reference (tests, CPU): config, manifest, layout, hc_pre/post, KDA, DSA
