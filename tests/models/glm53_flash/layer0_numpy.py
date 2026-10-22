@@ -105,7 +105,7 @@ def dsa_dump(dump, layer, t, st, model, p):
     check(dump, f'L{layer}_dsa_lat', t, np.asarray(st['lat'][t]))
 
 
-def dsa_block(model, p, xin, st, t):
+def dsa_block(model, p, xin, st, t, sp_dump=None):
     """Sparse MLA (nope-only) with the kpool-select indexer."""
     qr = rms((model.get(p + 'attn_q_a.weight') @ xin).astype(np.float32),
              model.get(p + 'attn_q_a_norm.weight'))
@@ -136,14 +136,28 @@ def dsa_block(model, p, xin, st, t):
 
     w = (model.get(p + 'indexer.proj.weight') @ xin) / math.sqrt(IH * ID)
     npool = len(st['pooled'])
-    n_top = min(npool, 2048 // KPOOL)
+    n_top = min(npool, int(os.environ.get('GUFO_GLM53_TOPPOOL',
+                        2048 // KPOOL)))
     vis = []
     if npool:
         pooled = np.stack(st['pooled'])  # [pool, dim]
-        score = (np.maximum(pooled @ iq.T, 0) *
-                 w[None, :]).sum(axis=1)
-        order = np.argsort(-score)[:n_top]
-        vis = [int(order[i]) * KPOOL + k for i in order for k in range(KPOOL)]
+        score = (np.maximum(pooled.astype(np.float64) @ iq.T.astype(
+            np.float64), 0) * w[None, :].astype(np.float64)).sum(axis=1)
+        if sp_dump is None:
+            order = np.argsort(-score, kind='stable')[:n_top]
+        else:
+            check(sp_dump, 'DSASP_w0', t, w.astype(np.float32))
+            check(sp_dump, 'DSASP_ikrow', t, ik.astype(np.float32))
+            check(sp_dump, 'DSASP_grow', t, gate.astype(np.float32))
+            check(sp_dump, 'DSASP_iq0', t, iq.reshape(-1).astype(np.float32))
+            check(sp_dump, 'DSASP_pool0', t, pooled[0].astype(np.float32))
+            check(sp_dump, 'DSASP_pool_score', t, score.astype(np.float32))
+            cs = np.fromfile(
+                os.path.join(sp_dump, f'DSASP_pool_score.{t}.f32'),
+                dtype=np.float32)
+            order = np.argsort(-cs, kind='stable')[:n_top]
+        vis = [int(o) * KPOOL + k for o in order[:n_top]
+               for k in range(KPOOL)]
     for k in range((n + 1) % KPOOL):
         vis.append(n - k)
 
@@ -192,6 +206,19 @@ def main():
         sys.exit(77)
     model = Model(sys.argv[1])
     dump = sys.argv[2]
+
+    if len(sys.argv) > 3 and sys.argv[3] == '--dsasp':
+        st = dict(lat=[], ik=[], gate=[], pooled=[])
+        idx = np.arange(4096, dtype=np.float32)
+        for t in range(48):
+            xn = (np.float32(0.1) * np.sin(
+                np.float32(0.37) * idx +
+                np.float32(0.11) * np.float32(t))).astype(np.float32)
+            blk = dsa_block(model, 'blk.3.', xn, st, t, dump)
+            check(dump, 'DSASP_dsa_lat', t, np.asarray(st['lat'][t]))
+            check(dump, 'DSASP_attn_block', t, blk)
+        print('numpy dsasp complete')
+        return
     T = len(TOK)
 
     embd = model.get('token_embd.weight')  # [vocab, H]

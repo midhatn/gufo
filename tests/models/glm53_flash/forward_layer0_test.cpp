@@ -57,12 +57,19 @@ void L2(std::span<float> x, float eps) {
 void Lnorm(std::span<float> x, const float* w, const float* b, float eps) {
   double sum = 0.0;
   for (const auto v : x)
-    sum += static_cast<double>(v) * v;
+    sum += static_cast<double>(v);
+  const double mu = sum / static_cast<double>(x.size());
+  double s2 = 0.0;
+  for (const auto v : x) {
+    const double d = static_cast<double>(v) - mu;
+    s2 += d * d;
+  }
   const float inv = static_cast<float>(
-      1.0 / std::sqrt(sum / static_cast<double>(x.size()) + eps));
+      1.0 / std::sqrt(s2 / static_cast<double>(x.size()) + eps));
   for (std::size_t i = 0; i < x.size(); ++i) {
-    x[i] = x[i] * inv * (w != nullptr ? w[i] : 1.0F) +
-           (b != nullptr ? b[i] : 0.0F);
+    x[i] =
+        (static_cast<double>(x[i]) - mu) * inv * (w != nullptr ? w[i] : 1.0F) +
+        (b != nullptr ? b[i] : 0.0F);
   }
 }
 
@@ -304,7 +311,8 @@ void HcPost(std::span<const float> block_out, std::span<const float> res,
 
 // ---- DSA / MLA (nope-only, kpool-select indexer) ----
 constexpr std::uint32_t kKv = 512, kQk = 256, kNh = 64, kId = 128, kIh = 32;
-constexpr std::uint32_t kKpool = 4, kTopPool = 2048 / kKpool;
+constexpr std::uint32_t kKpool = 4;
+static std::uint32_t g_topPool = 2048 / kKpool;
 
 struct DsaState {
   std::vector<float> lat;     // n * kKv
@@ -334,6 +342,10 @@ void DsaFwd(std::uint32_t layer, std::uint32_t t, std::span<const float> xn,
   std::vector<float> g(kId);
   Load(p("indexer_compressor_gate.weight").c_str()).MatVec(xn, g);
 
+  if (g_stage_prefix == "DSASP_") {
+    Dump(dump_dir, "ikrow", t, ik);
+    Dump(dump_dir, "grow", t, g);
+  }
   const std::uint32_t n = static_cast<std::uint32_t>(st.lat.size()) / kKv;
   st.lat.insert(st.lat.end(), lat.begin(), lat.end());
   st.ik.insert(st.ik.end(), ik.begin(), ik.end());
@@ -373,16 +385,27 @@ void DsaFwd(std::uint32_t layer, std::uint32_t t, std::span<const float> xn,
   std::vector<float> score(npool, 0.0F);
   for (std::uint32_t pp = 0; pp < npool; ++pp) {
     const float* kp = st.pooled.data() + static_cast<std::size_t>(pp) * kId;
+    double acc = 0.0;
     for (std::uint32_t h = 0; h < kIh; ++h) {
       const float* qh = iq.data() + static_cast<std::size_t>(h) * kId;
       double dot = 0.0;
       for (std::uint32_t d = 0; d < kId; ++d) {
         dot += static_cast<double>(qh[d]) * kp[d];
       }
-      score[pp] += std::max(0.0F, static_cast<float>(dot)) * w[h];
+      acc +=
+          std::max(0.0F, static_cast<float>(dot)) * static_cast<double>(w[h]);
     }
+    score[pp] = static_cast<float>(acc);
   }
-  const std::uint32_t n_top = std::min(npool, kTopPool);
+  if (g_stage_prefix == "DSASP_") {
+    Dump(dump_dir, "pool_score", t, score);
+    if (npool > 0) {
+      Dump(dump_dir, "pool0", t, {st.pooled.data(), kId});
+    }
+    Dump(dump_dir, "iq0", t, iq);
+    Dump(dump_dir, "w0", t, w);
+  }
+  const std::uint32_t n_top = std::min(npool, g_topPool);
   std::vector<std::uint32_t> order(npool);
   std::iota(order.begin(), order.end(), 0U);
   std::stable_sort(
@@ -576,6 +599,24 @@ int main(int argc, char** argv) {
                                      ? static_cast<std::uint32_t>(std::atoi(
                                            std::getenv("GUFO_GLM53_LAYERS")))
                                      : 3;
+
+  if (const char* sp = std::getenv("GUFO_GLM53_DSASP"); sp != nullptr) {
+    g_topPool = static_cast<std::uint32_t>(std::atoi(sp));
+    g_stage_prefix = "DSASP_";
+    DsaState st;
+    for (std::uint32_t t = 0; t < 48; ++t) {
+      std::vector<float> xn(h);
+      for (std::uint32_t i = 0; i < h; ++i) {
+        xn[i] = 0.1F * std::sin(0.37F * static_cast<float>(i) +
+                                0.11F * static_cast<float>(t));
+      }
+      std::vector<float> blk(h);
+      DsaFwd(3, t, xn, blk, st, dump_dir);
+      Dump(dump_dir, "attn_block", t, blk);
+    }
+    std::printf("dsa sparsity unit complete\n");
+    return 0;
+  }
 
   for (std::uint32_t layer = 0; layer < n_layers; ++layer) {
     g_stage_prefix = "L" + std::to_string(layer) + "_";
