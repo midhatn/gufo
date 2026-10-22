@@ -7,7 +7,7 @@ add_library(gufo_glm53_flash STATIC
   runtime/layout.cpp)
 
 target_include_directories(gufo_glm53_flash PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(gufo_glm53_flash PUBLIC gufo_core gufo_quant)
+target_link_libraries(gufo_glm53_flash PUBLIC gufo_core)
 
 # Host-only artifact check: parses the pinned `glm5-next` metadata and rejects
 # anything this build cannot run. Not part of the production package.
