@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 
@@ -218,7 +219,11 @@ const ReferenceModel::Loaded& ReferenceModel::LoadRow(
 }
 
 std::uint32_t ReferenceModel::n_layers() const {
-  return config_.num_layers - config_.nextn_layers;
+  const std::uint32_t full = config_.num_layers - config_.nextn_layers;
+  if (const char* cap = std::getenv("GUFO_GLM53_REF_LAYERS"); cap != nullptr) {
+    return static_cast<std::uint32_t>(std::atoi(cap));
+  }
+  return full;
 }
 
 std::unique_ptr<ReferenceModel::Session> ReferenceModel::CreateSession() const {
@@ -324,7 +329,8 @@ void ReferenceModel::AttnBlock(std::uint32_t layer, Session& session, bool dsa,
       std::memcpy(st.conv.data() + base + 2 * kInner, raw.data(),
                   kInner * sizeof(float));
     }
-    std::vector<float> fa(kHeads);
+    // ssm_f_a: [4096, 128] -> one scalar per head dim; f_b: [128, 8192].
+    std::vector<float> fa(kHd);
     Load(P(layer, "ssm_f_a.weight")).MatVec(xn, fa);
     std::vector<float> gproj(kInner);
     Load(P(layer, "ssm_f_b.weight")).MatVec(fa, gproj);
@@ -339,7 +345,7 @@ void ReferenceModel::AttnBlock(std::uint32_t layer, Session& session, bool dsa,
       }
     }
     const float* norm_w = Load(P(layer, "ssm_norm.weight")).w();
-    std::vector<float> ga(kHeads);
+    std::vector<float> ga(kHd);
     Load(P(layer, "ssm_g_a.weight")).MatVec(xn, ga);
     std::vector<float> g2(kInner);
     Load(P(layer, "ssm_g_b.weight")).MatVec(ga, g2);
