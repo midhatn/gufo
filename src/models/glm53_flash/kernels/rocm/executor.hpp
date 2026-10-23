@@ -30,6 +30,10 @@ struct ExecutorOptions {
 
 struct DeviceTensor {
   void* data{nullptr};
+  // Q8_0 rows of the same weights for the W8A8 prefill GEMMs: `data` itself
+  // for Q8_0 tensors, a re-encoded copy for Q6_K, null otherwise.
+  void* q8{nullptr};
+  bool q8_owned{false};
   int type{-1};
   std::uint32_t k{0};
   std::uint32_t rows{0};
@@ -93,10 +97,17 @@ private:
 
   bool Forward(Session& session, const std::int32_t* tokens, int count,
                bool want_logits, std::string* error);
-  void Proj(const DeviceTensor& w, const float* x, float* out,
-            int tokens) const;
+  // A projection input: F32 rows and, for wide batches, the same rows
+  // quantized once into the tiled Q8 layout the W8A8 GEMM reads.
+  struct Act {
+    const float* f{nullptr};
+    const void* q{nullptr};
+  };
+  Act Prep(const float* x, int tokens, int k) const;
+  void Proj(const DeviceTensor& w, const Act& x, float* out, int tokens) const;
   void KdaBlock(std::uint32_t layer, Session& s, int tokens) const;
   void DsaBlock(std::uint32_t layer, Session& s, int tokens) const;
+  void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
 
   std::unique_ptr<core::GgufReader> reader_;
@@ -110,6 +121,7 @@ private:
   void* staging_{nullptr};
   float* last_residual_{nullptr};
   bool profile_{false};
+  mutable std::size_t arena_used_{0};
   double profile_seconds_[5]{};
   std::chrono::steady_clock::time_point profile_mark_{};
 };

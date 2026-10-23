@@ -24,6 +24,13 @@ int MoeRoute(const float* logits, const float* bias, float scale, int* ids,
 int MoeCombine(const float* parts, const float* weights, const float* shared,
                float* out, hipStream_t stream, int tokens = 1);
 
+// dst[i] = half(src[i]).
+int ToHalf(const float* src, void* dst, long long n, hipStream_t stream);
+
+// MoeCombine over F16 expert rows: parts is [tokens][8][4096] half.
+int MoeCombineF16(const void* parts, const float* weights, const float* shared,
+                  float* out, hipStream_t stream, int tokens);
+
 }  // namespace gufo::models::glm53_flash::rocm
 
 #endif  // GUFO_MODELS_GLM53_FLASH_KERNELS_ROCM_MOE_HPP_

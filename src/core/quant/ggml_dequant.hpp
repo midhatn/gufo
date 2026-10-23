@@ -204,6 +204,10 @@ float DotProductIQ3_S(const void* row_data, std::span<const float> vec,
 /// Returns the 512-entry IQ3_S grid table (each entry packs four uint8
 /// magnitudes).
 [[nodiscard]] const std::uint32_t* Iq3sGrid() noexcept;
+// IQ2_XXS (256 entries) and IQ2_S (1024 entries) codebooks as two little-endian
+// words per entry: the low word holds elements 0-3, the high word 4-7.
+[[nodiscard]] const std::uint32_t* Iq2xxsGridWords() noexcept;
+[[nodiscard]] const std::uint32_t* Iq2sGridWords() noexcept;
 
 // Compute dot product of Q8_0 quantized row with FP32 vector
 float DotProductQ8_0(const void* row_data, std::span<const float> vec,

@@ -936,7 +936,15 @@ int ds4_mmq_moe_impl(
         }
     }
 
-    const mmq_args args = {
+    /* GLM-5.3-Flash: when the caller states the largest expert bucket (see
+     * ds4_mmq_set_routed_max_expert_rows), the column tile and grid follow it
+     * instead of the gathered-row count. It must be exact: rows past it in
+     * any bucket are not computed. */
+    const int64_t bucket_cols =
+        g_routed_max_expert_rows > 0 && (int64_t)g_routed_max_expert_rows < ne_get_rows
+            ? (int64_t)g_routed_max_expert_rows
+            : ne_get_rows;
+    mmq_args args = {
         /*x=*/(const char *)W,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
@@ -960,11 +968,12 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /*ncols_max=*/bucket_cols,
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
 
+    args.mmq_x_request = g_routed_tile_cols;
     mul_mat_q_case<type>(*ctx, args, stream);
 
     err = hipGetLastError();

@@ -14,6 +14,7 @@
 #include "src/models/glm53_flash/kernels/rocm/matvec.hpp"
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 extern "C" int ds4_mmq_init(int device);
 
@@ -31,6 +32,11 @@ constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
 constexpr int kQLora = 1536;
+constexpr std::uint32_t kPairTileRows = 128;
+constexpr std::uint32_t kDownTileRows = 64;
+constexpr std::uint32_t kPadRows = 16;
+// Batches at least this wide use the W8A8 GEMMs.
+constexpr int kWideBatch = 32;
 constexpr int kFfnScratch = std::max(kDenseFf, kMoeUsed* kExpertFf);
 constexpr int kMlaQ = kDsaHeads * 256;
 constexpr float kRmsEps = 1e-5F;
@@ -114,6 +120,16 @@ struct Executor::Scratch {
   int* ids{};
   // Head
   float *head_in{}, *logits{};
+  char* q8_arena{};
+  std::size_t q8_arena_bytes{0};
+  // Routed-expert F16 route (prefill).
+  void *x_half{}, *act_half{}, *parts_half{};
+  std::uint32_t* counts{};
+  std::int32_t *bounds{}, *cursors{}, *rows_token{}, *rows_slot{},
+      *tiles_pair{}, *tiles_down{};
+  std::uint32_t* host_counts{};
+  std::int32_t* host_tiles{};
+  std::uint32_t tile_capacity{0};
   std::vector<void*> all;
 };
 
@@ -142,6 +158,10 @@ Executor::~Executor() {
     for (void* p : scratch_->all) {
       hipFree(p);
     }
+    if (scratch_->host_counts != nullptr)
+      hipHostFree(scratch_->host_counts);
+    if (scratch_->host_tiles != nullptr)
+      hipHostFree(scratch_->host_tiles);
   }
 }
 
@@ -234,6 +254,23 @@ bool Executor::Upload(const std::string& name, std::string* error) {
   if (!CopyToDevice(d.data, *t, error)) {
     hipFree(d.data);
     return false;
+  }
+  if (d.experts == 1 && name.rfind("blk.", 0) == 0 && d.k % 32 == 0) {
+    if (d.type == kTypeQ8_0) {
+      d.q8 = d.data;
+    } else if (d.type == kTypeQ6_K) {
+      const std::size_t bytes =
+          static_cast<std::size_t>(d.rows) * (d.k / 32) * 34;
+      if (hipMalloc(&d.q8, bytes + kTailMargin) == hipSuccess) {
+        d.q8_owned = true;
+        gufo::models::qwen38_flash_next::rocm::RequantToQ8_0(
+            d.data, static_cast<std::uint32_t>(GgmlType::kQ6_K), d.k, d.rows,
+            d.q8, stream_);
+        hipStreamSynchronize(stream_);
+      } else {
+        d.q8 = nullptr;
+      }
+    }
   }
   tensors_.emplace(name, d);
   return true;
@@ -436,6 +473,34 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.su, c * kExpertFf);
   take(&s.sact, c * kExpertFf);
   take(&s.shared, c * kHidden);
+  const std::size_t slots = c * kMoeUsed;
+  const std::size_t compact_rows =
+      gufo::models::qwen38_flash_next::rocm::RoutedCompactRows(slots,
+                                                               kMoeExperts);
+  s.tile_capacity = static_cast<std::uint32_t>(
+      (slots + std::size_t{kMoeExperts} * (kPadRows - 1)) / kPadRows +
+      kMoeExperts + 1);
+  take(reinterpret_cast<std::uint16_t**>(&s.x_half), c * kHidden);
+  take(reinterpret_cast<std::uint16_t**>(&s.act_half), slots * kExpertFf);
+  take(reinterpret_cast<std::uint16_t**>(&s.parts_half), slots * kHidden);
+  take(&s.counts, kMoeExperts);
+  take(&s.bounds, kMoeExperts + 1);
+  take(&s.cursors, kMoeExperts);
+  take(&s.rows_token, compact_rows);
+  take(&s.rows_slot, compact_rows);
+  take(&s.tiles_pair, s.tile_capacity);
+  take(&s.tiles_down, s.tile_capacity);
+  if (ok && (hipHostMalloc(reinterpret_cast<void**>(&s.host_counts),
+                           kMoeExperts * sizeof(std::uint32_t)) != hipSuccess ||
+             hipHostMalloc(reinterpret_cast<void**>(&s.host_tiles),
+                           2 * s.tile_capacity * sizeof(std::int32_t)) !=
+                 hipSuccess)) {
+    ok = false;
+    if (error != nullptr)
+      *error = "pinned routing buffers failed";
+  }
+  s.q8_arena_bytes = c * std::size_t{160} * 1024;
+  take(&s.q8_arena, s.q8_arena_bytes);
   take(&s.head_in, kHidden);
   take(&s.logits, config_.vocab_size);
   return ok;
@@ -464,9 +529,29 @@ std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
   return ok ? std::move(s) : nullptr;
 }
 
-void Executor::Proj(const DeviceTensor& w, const float* x, float* out,
+Executor::Act Executor::Prep(const float* x, int tokens, int k) const {
+  if (tokens < kWideBatch) {
+    return {x, nullptr};
+  }
+  namespace qfn = gufo::models::qwen38_flash_next::rocm;
+  const std::size_t bytes = (qfn::Q8TiledBytes(tokens, k) + 255) / 256 * 256;
+  if (arena_used_ + bytes > scratch_->q8_arena_bytes) {
+    return {x, nullptr};
+  }
+  char* at = scratch_->q8_arena + arena_used_;
+  arena_used_ += bytes;
+  qfn::QuantizeQ8Tiled(x, at, tokens, k, stream_);
+  return {x, at};
+}
+
+void Executor::Proj(const DeviceTensor& w, const Act& x, float* out,
                     int tokens) const {
-  Gemm(w.type, w.data, x, out, static_cast<int>(w.rows), tokens,
+  namespace qfn = gufo::models::qwen38_flash_next::rocm;
+  if (x.q != nullptr && w.q8 != nullptr &&
+      qfn::W8A8Gemm(w.q8, x.q, out, tokens, w.rows, w.k, stream_)) {
+    return;
+  }
+  Gemm(w.type, w.data, x.f, out, static_cast<int>(w.rows), tokens,
        static_cast<int>(w.k), scratch_->matvec, stream_);
 }
 
@@ -474,38 +559,43 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
   LayerState& st = s.layers[layer];
-  Proj(*w.attn_q, b.y, b.kq, T);
-  Proj(*w.attn_k, b.y, b.kk, T);
-  Proj(*w.attn_v, b.y, b.kv, T);
+  arena_used_ = 0;
+  const Act y = Prep(b.y, T, kHidden);
+  Proj(*w.attn_q, y, b.kq, T);
+  Proj(*w.attn_k, y, b.kk, T);
+  Proj(*w.attn_v, y, b.kv, T);
   KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
           w.conv_v->f32(), stream_, T);
-  Proj(*w.ssm_f_a, b.y, b.fa, T);
-  Proj(*w.ssm_f_b, b.fa, b.fproj, T);
-  Proj(*w.ssm_beta, b.y, b.braw, T);
+  Proj(*w.ssm_f_a, y, b.fa, T);
+  Proj(*w.ssm_f_b, Prep(b.fa, T, kKdaHeadDim), b.fproj, T);
+  Proj(*w.ssm_beta, y, b.braw, T);
   KdaGates(b.fproj, w.ssm_dt->f32(), w.ssm_a->f32(), b.braw, b.decay, b.beta,
            stream_, T);
   KdaRecur(b.kq, b.kk, b.kv, b.decay, b.beta, st.state, b.o, stream_, T);
-  Proj(*w.ssm_g_a, b.y, b.ga, T);
-  Proj(*w.ssm_g_b, b.ga, b.g2, T);
+  Proj(*w.ssm_g_a, y, b.ga, T);
+  Proj(*w.ssm_g_b, Prep(b.ga, T, kKdaHeadDim), b.g2, T);
   KdaOut(b.o, w.ssm_norm->f32(), b.g2, stream_, T);
-  Proj(*w.attn_output, b.o, b.block, T);
+  Proj(*w.attn_output, Prep(b.o, T, kKdaInner), b.block, T);
 }
 
 void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
   LayerState& st = s.layers[layer];
-  Proj(*w.q_a, b.y, b.qr, T);
+  arena_used_ = 0;
+  const Act y = Prep(b.y, T, kHidden);
+  Proj(*w.q_a, y, b.qr, T);
   RmsNorm(b.qr, w.q_a_norm->f32(), kQLora, kRmsEps, stream_, T);
-  Proj(*w.q_b, b.qr, b.q, T);
-  Proj(*w.kv_a, b.y, b.lat, T);
+  const Act qr = Prep(b.qr, T, kQLora);
+  Proj(*w.q_b, qr, b.q, T);
+  Proj(*w.kv_a, y, b.lat, T);
   RmsNorm(b.lat, w.kv_a_norm->f32(), kDsaLatent, kRmsEps, stream_, T);
-  Proj(*w.idx_q_b, b.qr, b.iq, T);
-  Proj(*w.idx_k, b.y, b.ik, T);
+  Proj(*w.idx_q_b, qr, b.iq, T);
+  Proj(*w.idx_k, y, b.ik, T);
   LayerNorm(b.ik, w.idx_k_norm_w->f32(), w.idx_k_norm_b->f32(), kDsaIndexDim,
             kKNormEps, stream_, T);
-  Proj(*w.idx_gate, b.y, b.gt, T);
-  Proj(*w.idx_proj, b.y, b.wp, T);
+  Proj(*w.idx_gate, y, b.gt, T);
+  Proj(*w.idx_proj, y, b.wp, T);
   for (int t = 0; t < T; ++t) {
     const int pos = static_cast<int>(s.position) + t;
     DsaAppend(st.cache, b.lat + static_cast<std::size_t>(t) * kDsaLatent,
@@ -529,20 +619,73 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
                   b.vout + static_cast<std::size_t>(t) * kMlaQ, 256, kDsaLatent,
                   kDsaHeads, b.matvec, stream_);
   }
-  Proj(*w.attn_output, b.vout, b.block, T);
+  Proj(*w.attn_output, Prep(b.vout, T, kMlaQ), b.block, T);
+}
+
+// Prefill experts on the Flash-Next route: expert-sorted row compaction, the
+// paired gate/up F16 GEMM with clamped SwiGLU, then the down GEMM, whose F16
+// rows MoeCombineF16 sums with the shared expert.
+void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
+  namespace qfn = gufo::models::qwen38_flash_next::rocm;
+  const Scratch& b = *scratch_;
+  const std::uint32_t slots = static_cast<std::uint32_t>(T) * kMoeUsed;
+  ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
+  qfn::ExpertCounts(b.ids, b.counts, T, kMoeExperts, kMoeUsed, stream_);
+  hipMemcpyAsync(b.host_counts, b.counts, kMoeExperts * sizeof(std::uint32_t),
+                 hipMemcpyDeviceToHost, stream_);
+  hipStreamSynchronize(stream_);
+  const std::uint32_t pair_rows = kPairTileRows;
+  const std::uint32_t down_rows = kDownTileRows;
+  std::int32_t* host_pair = b.host_tiles;
+  std::int32_t* host_down = b.host_tiles + b.tile_capacity;
+  std::uint32_t pair_tiles = 0;
+  std::uint32_t down_tiles = 0;
+  for (int e = 0; e < kMoeExperts; ++e) {
+    const std::uint32_t padded =
+        (b.host_counts[e] + kPadRows - 1) / kPadRows * kPadRows;
+    for (std::uint32_t j = 0; j < (padded + pair_rows - 1) / pair_rows; ++j) {
+      host_pair[pair_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+    }
+    for (std::uint32_t j = 0; j < (padded + down_rows - 1) / down_rows; ++j) {
+      host_down[down_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+    }
+  }
+  hipMemcpyAsync(b.tiles_pair, host_pair, pair_tiles * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, stream_);
+  hipMemcpyAsync(b.tiles_down, host_down, down_tiles * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, stream_);
+  qfn::RoutedCompact(b.ids, b.counts, b.bounds, b.cursors, b.rows_token,
+                     b.rows_slot, T, kMoeUsed, kMoeExperts, stream_);
+  const auto weight_type = [](int code) {
+    return code == kTypeIQ2_S ? qfn::WeightType::kIQ2_S
+                              : qfn::WeightType::kIQ2_XXS;
+  };
+  qfn::RoutedGatedF16Gemm(
+      w.exp_gate->data, w.exp_up->data, weight_type(w.exp_gate->type),
+      static_cast<const __half*>(b.x_half), b.tiles_pair, pair_tiles, pair_rows,
+      b.bounds, b.rows_token, b.rows_slot, static_cast<__half*>(b.act_half),
+      kExpertFf, kHidden, stream_);
+  qfn::RoutedF16Gemm(w.exp_down->data, weight_type(w.exp_down->type),
+                     static_cast<const __half*>(b.act_half), b.tiles_down,
+                     down_tiles, down_rows, b.bounds, b.rows_slot, b.rows_slot,
+                     nullptr, nullptr, static_cast<__half*>(b.parts_half),
+                     kHidden, kExpertFf, stream_);
+  (void)slots;
 }
 
 void Executor::FfnBlock(std::uint32_t layer, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
+  arena_used_ = 0;
+  const Act y = Prep(b.y, T, kHidden);
   if (w.dense) {
-    Proj(*w.ffn_gate, b.y, b.gate, T);
-    Proj(*w.ffn_up, b.y, b.up, T);
+    Proj(*w.ffn_gate, y, b.gate, T);
+    Proj(*w.ffn_up, y, b.up, T);
     SwigluClamp(b.gate, b.up, b.act, T * kDenseFf, stream_);
-    Proj(*w.ffn_down, b.act, b.ffn_out, T);
+    Proj(*w.ffn_down, Prep(b.act, T, kDenseFf), b.ffn_out, T);
     return;
   }
-  Proj(*w.router, b.y, b.rlogits, T);
+  Proj(*w.router, Act{b.y, nullptr}, b.rlogits, T);
   MoeRoute(b.rlogits, w.router_bias->f32(), config_.expert_weights_scale, b.ids,
            b.wts, stream_, T);
   if (T == 1) {
@@ -556,19 +699,17 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                   kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
                   stream_);
   } else {
-    ExpertsGemm(w.exp_gate->type, w.exp_gate->data, b.y, b.gate, kExpertFf,
-                kHidden, T, kMoeExperts, kMoeUsed, b.ids, stream_);
-    ExpertsGemm(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf, kHidden,
-                T, kMoeExperts, kMoeUsed, b.ids, stream_);
-    SwigluClamp(b.gate, b.up, b.act, T * kMoeUsed * kExpertFf, stream_);
-    ExpertsGemm(w.exp_down->type, w.exp_down->data, b.act, b.parts, kHidden,
-                kExpertFf, T * kMoeUsed, kMoeExperts, 1, b.ids, stream_);
+    RoutedExpertsF16(w, T);
   }
-  Proj(*w.sh_gate, b.y, b.sg, T);
-  Proj(*w.sh_up, b.y, b.su, T);
+  Proj(*w.sh_gate, y, b.sg, T);
+  Proj(*w.sh_up, y, b.su, T);
   SwigluClamp(b.sg, b.su, b.sact, T * kExpertFf, stream_);
-  Proj(*w.sh_down, b.sact, b.shared, T);
-  MoeCombine(b.parts, b.wts, b.shared, b.ffn_out, stream_, T);
+  Proj(*w.sh_down, Prep(b.sact, T, kExpertFf), b.shared, T);
+  if (T == 1) {
+    MoeCombine(b.parts, b.wts, b.shared, b.ffn_out, stream_, T);
+  } else {
+    MoeCombineF16(b.parts_half, b.wts, b.shared, b.ffn_out, stream_, T);
+  }
 }
 
 bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
@@ -664,7 +805,7 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     const DeviceTensor& norm = *Find("output_norm.weight");
     const DeviceTensor& out = *Find("output.weight");
     HeadNorm(last_residual_, norm.f32(), b.head_in, stream_);
-    Proj(out, b.head_in, b.logits, 1);
+    Proj(out, Act{b.head_in, nullptr}, b.logits, 1);
   }
   session.position += static_cast<std::uint32_t>(T);
   if (hipStreamSynchronize(stream_) != hipSuccess ||

@@ -1142,6 +1142,14 @@ constexpr std::uint8_t kMaskIq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
 }  // namespace
 
+const std::uint32_t* Iq2xxsGridWords() noexcept {
+  return reinterpret_cast<const std::uint32_t*>(kIq2xxsGrid);
+}
+
+const std::uint32_t* Iq2sGridWords() noexcept {
+  return reinterpret_cast<const std::uint32_t*>(kIq2sGrid);
+}
+
 void DequantizeIQ2_XXS(const void* src, float* dst, std::size_t k) {
   struct Blk {
     std::uint16_t d;

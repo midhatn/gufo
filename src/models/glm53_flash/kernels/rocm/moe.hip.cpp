@@ -1,5 +1,7 @@
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
 
+#include <hip/hip_fp16.h>
+
 namespace gufo::models::glm53_flash::rocm {
 
 namespace {
@@ -104,6 +106,35 @@ __global__ void MoeCombineKernel(const float* __restrict__ parts,
   out[c] = acc + shared[c];
 }
 
+__global__ void ToHalfKernel(const float* __restrict__ src,
+                             __half* __restrict__ dst, long long n) {
+  const long long i =
+      static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    dst[i] = __float2half(src[i]);
+  }
+}
+
+__global__ void MoeCombineF16Kernel(const __half* __restrict__ parts,
+                                    const float* __restrict__ weights,
+                                    const float* __restrict__ shared,
+                                    float* __restrict__ out) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= kMoeHidden) {
+    return;
+  }
+  const int token = blockIdx.y;
+  parts += static_cast<std::size_t>(token) * kMoeUsed * kMoeHidden;
+  weights += token * kMoeUsed;
+  shared += static_cast<std::size_t>(token) * kMoeHidden;
+  out += static_cast<std::size_t>(token) * kMoeHidden;
+  float acc = 0.0F;
+  for (int i = 0; i < kMoeUsed; ++i) {
+    acc += weights[i] * __half2float(parts[i * kMoeHidden + c]);
+  }
+  out[c] = acc + shared[c];
+}
+
 }  // namespace
 
 int SwigluClamp(const float* gate, const float* up, float* act, int n,
@@ -125,6 +156,21 @@ int MoeCombine(const float* parts, const float* weights, const float* shared,
   MoeCombineKernel<<<dim3((kMoeHidden + kElemThreads - 1) / kElemThreads,
                           tokens),
                      kElemThreads, 0, stream>>>(parts, weights, shared, out);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int ToHalf(const float* src, void* dst, long long n, hipStream_t stream) {
+  ToHalfKernel<<<static_cast<unsigned>((n + kElemThreads - 1) / kElemThreads),
+                 kElemThreads, 0, stream>>>(src, static_cast<__half*>(dst), n);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int MoeCombineF16(const void* parts, const float* weights, const float* shared,
+                  float* out, hipStream_t stream, int tokens) {
+  MoeCombineF16Kernel<<<dim3((kMoeHidden + kElemThreads - 1) / kElemThreads,
+                             tokens),
+                        kElemThreads, 0, stream>>>(
+      static_cast<const __half*>(parts), weights, shared, out);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
