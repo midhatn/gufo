@@ -114,4 +114,12 @@ if(ENGINE_ENABLE_HIP)
   set_tests_properties(glm53.matvec PROPERTIES
     LABELS "gpu;glm53;kernel;external-model"
     SKIP_RETURN_CODE 77)
+
+  add_executable(glm53_mhc_test mhc_test.cpp)
+  target_link_libraries(glm53_mhc_test PRIVATE gufo_glm53_flash_rocm)
+  add_test(NAME glm53.mhc
+    COMMAND glm53_mhc_test "${GUFO_GLM53_FLASH_MODEL}")
+  set_tests_properties(glm53.mhc PROPERTIES
+    LABELS "gpu;glm53;kernel;external-model"
+    SKIP_RETURN_CODE 77)
 endif()

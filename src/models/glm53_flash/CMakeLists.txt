@@ -19,8 +19,10 @@ target_link_libraries(gufo_glm53_probe PRIVATE gufo_glm53_flash)
 if(ENGINE_ENABLE_HIP)
   # Decode matvec over the vendored DS4 mmvq tier (covers Q6_K, Q8_0, IQ2_XXS
   # and IQ2_S). Same dialect and feature macros as the tier it links.
-  add_library(gufo_glm53_flash_rocm STATIC kernels/rocm/matvec.hip.cpp)
+  add_library(gufo_glm53_flash_rocm STATIC kernels/rocm/matvec.hip.cpp
+    kernels/rocm/mhc.hip.cpp)
   set_source_files_properties(kernels/rocm/matvec.hip.cpp
+    kernels/rocm/mhc.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_glm53_flash_rocm PROPERTIES
     HIP_STANDARD 17
