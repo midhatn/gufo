@@ -180,7 +180,9 @@ private:
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
   void RunLayer(std::uint32_t layer, Session& session, int tokens, int& cur,
-                bool attn_prepared);
+                bool attn_prepared, int ffn_rows);
+  // Rows of the last layer's FFN that reach the head; every row elsewhere.
+  int FfnRows(std::uint32_t layer, int tokens, int logit_rows) const;
   void FinishHead(float* residual, int tokens, int logit_rows);
   bool EmbedRows(const std::int32_t* tokens, int count, float* dst,
                  std::string* error);

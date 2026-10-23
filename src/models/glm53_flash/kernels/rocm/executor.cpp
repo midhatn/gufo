@@ -1060,8 +1060,17 @@ bool Executor::EmbedRows(const std::int32_t* tokens, int T, float* dst,
   return true;
 }
 
+int Executor::FfnRows(std::uint32_t layer, int T, int logit_rows) const {
+  if (layer + 1 != layers_ || !options_.head || options_.layers != 0)
+    return T;
+  if (std::find(dflash_taps_.begin(), dflash_taps_.end(), layer) !=
+      dflash_taps_.end())
+    return T;
+  return logit_rows;
+}
+
 void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
-                        bool attn_prepared) {
+                        bool attn_prepared, int ffn_rows) {
   Scratch& b = *scratch_;
   const LayerWeights& w = weights_[layer];
   if (!attn_prepared) {
@@ -1079,13 +1088,18 @@ void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
   HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
   cur = 1 - cur;
 
-  HcPreStep(b.x[cur], *w.hc_ffn_fn, w.hc_ffn_scale->f32(), w.hc_ffn_base->f32(),
-            w.ffn_norm->f32(), T);
-  Mark(0);
-  FfnBlock(layer, T);
-  Mark(w.dense ? 3 : 4);
-  HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
-  cur = 1 - cur;
+  if (ffn_rows > 0) {
+    const std::size_t off =
+        static_cast<std::size_t>(T - ffn_rows) * kStreams * kHidden;
+    HcPreStep(b.x[cur] + off, *w.hc_ffn_fn, w.hc_ffn_scale->f32(),
+              w.hc_ffn_base->f32(), w.ffn_norm->f32(), ffn_rows);
+    Mark(0);
+    FfnBlock(layer, ffn_rows);
+    Mark(w.dense ? 3 : 4);
+    HcPost(b.x[cur] + off, b.ffn_out, b.post, b.comb, b.x[1 - cur] + off,
+           stream_, ffn_rows);
+    cur = 1 - cur;
+  }
   if (!dflash_taps_.empty()) {
     const auto tap = std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
     if (tap != dflash_taps_.end()) {
@@ -1141,7 +1155,7 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
   const auto run = [&]() {
     profile_mark_ = std::chrono::steady_clock::now();
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      RunLayer(layer, session, T, cur, false);
+      RunLayer(layer, session, T, cur, false, FfnRows(layer, T, logit_rows));
     }
     FinishHead(b.x[cur], T, logit_rows);
   };
@@ -1324,7 +1338,8 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
         SwapBank();
       session.position = pos0 + static_cast<std::uint32_t>(bank * T);
       qkv_bank_ = prepared[bank] ? bank : -1;
-      RunLayer(layer, session, T, cur[bank], prepared[bank]);
+      RunLayer(layer, session, T, cur[bank], prepared[bank],
+               FfnRows(layer, T, bank == 1 ? logit_rows : 0));
       qkv_bank_ = -1;
       prefetch(bank, layer + 1);
       if (bank == 1)
