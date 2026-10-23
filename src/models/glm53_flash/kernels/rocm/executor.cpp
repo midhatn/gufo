@@ -841,6 +841,7 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
                    stream_);
     DsaScoresBatch(b.iq, b.wp, st.cache.pooled, pos0, T, b.score_stride,
                    b.scores, stream_);
+    Mark(9);
     DsaSelectBatch(b.scores, b.score_stride, pos0, T, top, b.sel, stream_);
     Mark(6);
     // attn_k_b / attn_v_b are 64 stacked per-head slabs: one GEMM per head
@@ -1230,7 +1231,7 @@ void Executor::PrintProfile() {
     return;
   static const char* kNames[] = {
       "hc",       "kda",        "dsa",          "ffn-dense",  "ffn-moe",
-      "dsa:proj", "dsa:select", "dsa:headgemm", "dsa:attend", "dsa:out"};
+      "dsa:proj", "dsa:select", "dsa:headgemm", "dsa:attend", "dsa:scores"};
   double total = 0.0;
   for (const double v : profile_seconds_)
     total += v;

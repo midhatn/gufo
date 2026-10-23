@@ -264,6 +264,107 @@ __global__ __launch_bounds__(kScoreWaves* kWaveLanes) void DsaScoresKernel(
   }
 }
 
+constexpr int kScoreTokens = 16;
+constexpr int kScoreWmmaWaves = 8;
+constexpr int kScoreHeadGroup = 4;
+constexpr int kScoreQPad = kDsaIndexDim + 8;
+
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+__global__
+__launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
+    const float* __restrict__ iq, const float* __restrict__ proj,
+    const float* __restrict__ pooled, int pos0, int tokens, int max_pools,
+    long long score_stride, float* __restrict__ scores) {
+  const int tok0 = blockIdx.y * kScoreTokens;
+  const int last_pos = pos0 + min(tok0 + kScoreTokens, tokens) - 1;
+  if (blockIdx.x * kScoreWmmaWaves * 16 >= (last_pos + 1) / kDsaPool) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int wave = tid / kWaveLanes;
+  const int lane = tid % kWaveLanes;
+  const int col = lane & 15;
+  const int row_hi = lane >> 4;
+  const int pool = (blockIdx.x * kScoreWmmaWaves + wave) * 16 + col;
+
+  __shared__ _Float16 qh[kScoreTokens][kScoreHeadGroup][kScoreQPad];
+  __shared__ _Float16 ql[kScoreTokens][kScoreHeadGroup][kScoreQPad];
+  __shared__ float wt[kScoreTokens][kDsaIndexHeads];
+  for (int idx = tid; idx < kScoreTokens * kDsaIndexHeads;
+       idx += kScoreWmmaWaves * kWaveLanes) {
+    const int t = idx / kDsaIndexHeads;
+    const int h = idx % kDsaIndexHeads;
+    const int tok = tok0 + t;
+    wt[t][h] =
+        tok < tokens
+            ? proj[static_cast<std::size_t>(tok) * kDsaIndexHeads + h] *
+                  rsqrtf(static_cast<float>(kDsaIndexDim * kDsaIndexHeads))
+            : 0.0F;
+  }
+
+  v16h bh[kDsaIndexDim / 16];
+  v16h bl[kDsaIndexDim / 16];
+#pragma unroll
+  for (int step = 0; step < kDsaIndexDim / 16; ++step) {
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      const float f =
+          pool < max_pools
+              ? pooled[static_cast<std::size_t>(pool) * kDsaIndexDim +
+                       step * 16 + e]
+              : 0.0F;
+      const _Float16 hi = static_cast<_Float16>(f);
+      bh[step][e] = hi;
+      bl[step][e] = static_cast<_Float16>(f - static_cast<float>(hi));
+    }
+  }
+  v8f total = v8f{};
+  for (int group = 0; group < kDsaIndexHeads / kScoreHeadGroup; ++group) {
+    __syncthreads();
+    for (int idx = tid; idx < kScoreTokens * kScoreHeadGroup * kDsaIndexDim;
+         idx += kScoreWmmaWaves * kWaveLanes) {
+      const int d = idx % kDsaIndexDim;
+      const int hh = (idx / kDsaIndexDim) % kScoreHeadGroup;
+      const int t = idx / (kDsaIndexDim * kScoreHeadGroup);
+      const int tok = tok0 + t;
+      const float f = tok < tokens
+                          ? iq[(static_cast<std::size_t>(tok) * kDsaIndexHeads +
+                                group * kScoreHeadGroup + hh) *
+                                   kDsaIndexDim +
+                               d]
+                          : 0.0F;
+      const _Float16 hi = static_cast<_Float16>(f);
+      qh[t][hh][d] = hi;
+      ql[t][hh][d] = static_cast<_Float16>(f - static_cast<float>(hi));
+    }
+    __syncthreads();
+    for (int hh = 0; hh < kScoreHeadGroup; ++hh) {
+      v8f acc = v8f{};
+#pragma unroll
+      for (int step = 0; step < kDsaIndexDim / 16; ++step) {
+        const v16h a = *reinterpret_cast<const v16h*>(&qh[col][hh][step * 16]);
+        const v16h a_lo =
+            *reinterpret_cast<const v16h*>(&ql[col][hh][step * 16]);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bh[step], acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bl[step], acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, bh[step], acc);
+      }
+      for (int i = 0; i < 8; ++i) {
+        total[i] += fmaxf(acc[i], 0.0F) *
+                    wt[2 * i + row_hi][group * kScoreHeadGroup + hh];
+      }
+    }
+  }
+  for (int i = 0; i < 8; ++i) {
+    const int tok = tok0 + 2 * i + row_hi;
+    if (tok < tokens && pool < (pos0 + tok + 1) / kDsaPool) {
+      scores[tok * score_stride + pool] = total[i];
+    }
+  }
+}
+
 __device__ std::uint32_t OrderedKey(float v) {
   const std::uint32_t u = __float_as_uint(v);
   return (u & 0x80000000U) ? ~u : (u | 0x80000000U);
@@ -450,9 +551,6 @@ __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
     ctx[slab + c] = acc;
   }
 }
-
-using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
-using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 constexpr int kAttnKeys = 32;
 constexpr int kAttnWaves = 8;
@@ -717,9 +815,11 @@ int DsaScoresBatch(const float* iq, const float* proj, const float* pooled,
   if (max_pools <= 0) {
     return 0;
   }
-  DsaScoresKernel<<<dim3((max_pools + kScoreWaves - 1) / kScoreWaves, tokens),
-                    kScoreWaves * kWaveLanes, 0, stream>>>(
-      iq, proj, pooled, 0, scores, pos0, score_stride, nullptr);
+  DsaScoresWmmaKernel<<<dim3((max_pools + kScoreWmmaWaves * 16 - 1) /
+                                 (kScoreWmmaWaves * 16),
+                             (tokens + kScoreTokens - 1) / kScoreTokens),
+                        kScoreWmmaWaves * kWaveLanes, 0, stream>>>(
+      iq, proj, pooled, pos0, tokens, max_pools, score_stride, scores);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
