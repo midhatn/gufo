@@ -16,6 +16,7 @@
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 extern "C" int ds4_mmq_init(int device);
 
@@ -24,6 +25,7 @@ namespace gufo::models::glm53_flash::rocm {
 namespace {
 
 using core::GgmlType;
+namespace qfn = gufo::models::qwen38_flash_next::rocm;
 
 constexpr std::size_t kTailMargin = 4096;
 constexpr std::size_t kUploadChunk = std::size_t{128} << 20;
@@ -32,6 +34,7 @@ constexpr int kHidden = kHcHidden;
 constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
+constexpr int kNpuShexpSlices = 8;
 constexpr int kQLora = 1536;
 constexpr std::uint32_t kPairTileRows = 128;
 constexpr std::uint32_t kDownTileRows = 64;
@@ -345,6 +348,21 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     return nullptr;
   ex->config_ = *config;
   ex->options_ = options;
+#ifdef GUFO_NPU
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
+      dir != nullptr && dir[0] != '\0') {
+    qfn::NpuGemm::Config cfg;
+    cfg.xclbin =
+        std::string(dir) + "/runtime_k/final_4096xKx1024_128x64x128.xclbin";
+    cfg.insts =
+        std::string(dir) + "/runtime_k/insts_4096x4096x1024_128x64x128.txt";
+    cfg.k = kHidden;
+    std::string npu_error;
+    ex->npu_ = qfn::NpuGemm::Create(cfg, &npu_error);
+    if (ex->npu_ == nullptr)
+      std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+  }
+#endif
   ex->profile_ = std::getenv("GUFO_GLM53_PROFILE") != nullptr;
   ex->layers_ = options.layers == 0
                     ? ex->config_.TrunkLayers()
@@ -416,9 +434,60 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       }
     }
   }
-  if (!ex->Resolve(error) || !ex->AllocScratch(error))
+  if (!ex->Resolve(error) || !ex->AllocScratch(error) || !ex->SetupNpu(error))
     return nullptr;
   return ex;
+}
+
+bool Executor::SetupNpu(std::string*) {
+  if (npu_ == nullptr)
+    return true;
+  std::string npu_error;
+  npu_a_ = npu_->NewBuffer(npu_->ABytes(), &npu_error);
+  npu_a_lo_ = npu_->NewBuffer(npu_->ABytes(), &npu_error);
+  bool ok = npu_a_ >= 0 && npu_a_lo_ >= 0;
+  for (int i = 0; i < kNpuShexpSlices && ok; ++i) {
+    const int id = npu_->NewBuffer(npu_->CBytes(), &npu_error);
+    ok = id >= 0;
+    npu_c_.push_back(id);
+  }
+  npu_shexp_.assign(layers_, {});
+  std::uint32_t staged_layers = 0;
+  for (std::uint32_t layer = 0; layer < layers_ && ok; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    if (w.dense || w.sh_gate == nullptr || w.sh_up == nullptr)
+      continue;
+    std::vector<int> ids;
+    for (const DeviceTensor* t : {w.sh_gate, w.sh_up}) {
+      for (std::uint32_t slice = 0; slice < kExpertFf / npu_->n(); ++slice) {
+        const int id = npu_->NewBuffer(npu_->BBytes(), &npu_error);
+        if (id < 0) {
+          ok = false;
+          break;
+        }
+        qfn::NpuEncodeWeightsQuant(t->data, static_cast<std::uint32_t>(t->type),
+                                   kHidden, slice * npu_->n(), npu_->n(),
+                                   kHidden, 0, kHidden, npu_->Device(id),
+                                   nullptr);
+        ids.push_back(id);
+      }
+    }
+    if (ok)
+      npu_shexp_[layer] = std::move(ids);
+    ++staged_layers;
+  }
+  ok = ok && hipDeviceSynchronize() == hipSuccess;
+  if (!ok) {
+    std::fprintf(stderr, "NPU buffers unavailable: %s\n", npu_error.c_str());
+    npu_.reset();
+    npu_shexp_.clear();
+    return true;
+  }
+  for (const auto& ids : npu_shexp_)
+    for (const int id : ids)
+      npu_->FinalizeWeights(id);
+  std::fprintf(stderr, "NPU: shared expert of %u layers\n", staged_layers);
+  return true;
 }
 
 bool Executor::Resolve(std::string* error) {
@@ -797,7 +866,6 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
   namespace qfn = gufo::models::qwen38_flash_next::rocm;
   const Scratch& b = *scratch_;
   const std::uint32_t slots = static_cast<std::uint32_t>(T) * kMoeUsed;
-  ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
   qfn::ExpertCounts(b.ids, b.counts, T, kMoeExperts, kMoeUsed, stream_);
   hipMemcpyAsync(b.host_counts, b.counts, kMoeExperts * sizeof(std::uint32_t),
                  hipMemcpyDeviceToHost, stream_);
@@ -841,6 +909,46 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
   (void)slots;
 }
 
+void Executor::ShexpGateUp(const LayerWeights& w, const Act& y, int T) const {
+  const Scratch& b = *scratch_;
+  Proj(*w.sh_gate, y, b.sg, T);
+  Proj(*w.sh_up, y, b.su, T);
+}
+
+bool Executor::NpuShexp(std::uint32_t layer, int T) const {
+  if (npu_ == nullptr || !npu_->Healthy() || layer >= npu_shexp_.size() ||
+      npu_shexp_[layer].empty() || T != static_cast<int>(npu_->tokens()))
+    return false;
+  const Scratch& b = *scratch_;
+  const std::vector<int>& ids = npu_shexp_[layer];
+  const std::uint32_t slices = kExpertFf / npu_->n();
+  for (int pass = 0; pass < 2; ++pass) {
+    qfn::NpuEncodeActivations(
+        static_cast<const __half*>(b.x_half), kHidden,
+        static_cast<std::uint32_t>(T), kHidden, 0, kHidden,
+        npu_->Device(pass == 0 ? npu_a_ : npu_a_lo_), stream_, pass == 1);
+    npu_->Submit(stream_, pass == 0 ? npu_a_ : npu_a_lo_, ids.data(),
+                 npu_c_.data() + pass * 2 * slices, 2 * slices);
+  }
+  return true;
+}
+
+void Executor::NpuShexpFinish(std::uint32_t layer, int T) const {
+  const Scratch& b = *scratch_;
+  const std::uint32_t slices = kExpertFf / npu_->n();
+  npu_->Wait(stream_);
+  for (int pass = 0; pass < 2; ++pass) {
+    for (std::uint32_t i = 0; i < 2 * slices; ++i) {
+      float* out = i < slices ? b.sg : b.su;
+      qfn::NpuDecodeOutput(npu_->Staged(stream_, npu_c_[pass * 2 * slices + i]),
+                           out, static_cast<std::uint32_t>(T), npu_->n(),
+                           kExpertFf, (i % slices) * npu_->n(), pass == 1,
+                           stream_);
+    }
+  }
+  (void)layer;
+}
+
 void Executor::FfnBlock(std::uint32_t layer, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
@@ -877,10 +985,16 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                   kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
                   stream_);
   } else {
+    ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
+    const bool on_npu = NpuShexp(layer, T);
     RoutedExpertsF16(w, T);
+    if (on_npu)
+      NpuShexpFinish(layer, T);
+    else
+      ShexpGateUp(w, y, T);
   }
-  Proj(*w.sh_gate, y, b.sg, T);
-  Proj(*w.sh_up, y, b.su, T);
+  if (T == 1)
+    ShexpGateUp(w, y, T);
   SwigluClamp(b.sg, b.su, b.sact, T * kExpertFf, stream_);
   Proj(*w.sh_down, Prep(b.sact, T, kExpertFf), b.shared, T);
   if (T == 1) {
