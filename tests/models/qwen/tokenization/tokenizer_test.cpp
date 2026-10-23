@@ -361,6 +361,80 @@ void TestCorpusConformance() {
   }
 }
 
+void TestGlm4PreTokenizer() {
+  GgufTokenizerBuilder builder;
+  builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "glm4");
+
+  std::vector<std::string> vocab;
+  vocab.reserve(256 + 4);
+  for (int i = 0; i < 256; ++i) {
+    vocab.emplace_back(1, static_cast<char>(i));
+  }
+  const auto kWorlds = static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("worlds");
+  const auto kAposS = static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("'s");
+  const auto kHello = static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("Hello");
+  builder.AddMetadataStringArray("tokenizer.ggml.tokens", vocab);
+  builder.AddMetadataStringArray("tokenizer.ggml.merges", {});
+
+  auto binary = builder.Build();
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "GLM reader open succeeds: " + err);
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+  Expect(tok != nullptr, "GLM tokenizer loads: " + err);
+
+  gufo::tokenization::TokenizerOptions opts;
+  opts.parse_special_tokens = false;
+  const auto encode = [&](std::string_view text) {
+    return tok->Encode(text, opts);
+  };
+
+  // ignore_merges: a whole split piece that is a vocabulary token encodes as
+  // that single token even with no merge ranks that could build it.
+  Expect(encode("worlds") == std::vector<gufo::tokenization::TokenId>{kWorlds},
+         "GLM whole-piece token");
+  Expect(encode("Hello") == std::vector<gufo::tokenization::TokenId>{kHello},
+         "GLM whole-piece token without merges");
+
+  // The split regex keeps a contraction suffix apart from the word.
+  Expect(encode("it's") ==
+             std::vector<gufo::tokenization::TokenId>{105, 116, kAposS},
+         "GLM contraction split");
+
+  // Digits split in runs of at most three.
+  Expect(encode("12345") ==
+             std::vector<gufo::tokenization::TokenId>{49, 50, 51, 52, 53},
+         "GLM digit grouping");
+
+  // One leading space belongs to the following word run, so a two-space gap
+  // yields a whitespace piece plus a space-prefixed word.
+  Expect(encode("a  b") ==
+             std::vector<gufo::tokenization::TokenId>{97, 32, 32, 98},
+         "GLM multi-space split");
+
+  // CJK letters form a single letter run.
+  Expect(
+      encode("你好") == std::vector<gufo::tokenization::TokenId>{228, 189, 160,
+                                                                 229, 165, 189},
+      "GLM CJK letter run");
+
+  // Round-trip conformance over mixed scripts and whitespace.
+  const std::vector<std::string> corpus = {
+      "Hello, world! 你好",
+      "  leading\ttabbed\n\nnewlines\r\nCRLF",
+      "It's 100% co-op, e.g. U.S.A. 🙂",
+      "Mixed 中文 123 abc!@#  spaced  ",
+  };
+  for (const auto& text : corpus) {
+    Expect(tok->Decode(encode(text)) == text, "GLM roundtrip matches: " + text);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -371,6 +445,7 @@ int main() {
   TestUnicodeContractionBoundary();
   TestEmptyAndSpecialEdgeCases();
   TestCorpusConformance();
+  TestGlm4PreTokenizer();
   std::cout << "All QwenTokenizer tests passed successfully!\n";
   return 0;
 }
