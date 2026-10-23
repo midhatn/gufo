@@ -112,6 +112,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::ifstream in(argv[4], std::ios::binary);
+  std::ofstream gpu_dump;
+  if (const char* path = std::getenv("GUFO_GLM53_DUMP_GPU")) {
+    gpu_dump.open(path, std::ios::binary);
+  }
   int top1_match = 0;
   int bad_cosine = 0;
   double kl_sum = 0.0;
@@ -122,6 +126,10 @@ int main(int argc, char** argv) {
       return 1;
     }
     const auto gpu = executor->Logits(*session);
+    if (gpu_dump.is_open()) {
+      gpu_dump.write(reinterpret_cast<const char*>(gpu.data()),
+                     static_cast<std::streamsize>(gpu.size() * sizeof(float)));
+    }
     std::vector<float> ref(gpu.size());
     if (!in.read(reinterpret_cast<char*>(ref.data()),
                  static_cast<std::streamsize>(ref.size() * sizeof(float)))) {
