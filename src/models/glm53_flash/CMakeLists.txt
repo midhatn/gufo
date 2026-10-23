@@ -15,3 +15,24 @@ target_link_libraries(gufo_glm53_flash PUBLIC gufo_core)
 # anything this build cannot run. Not part of the production package.
 add_executable(gufo_glm53_probe EXCLUDE_FROM_ALL probe_main.cpp)
 target_link_libraries(gufo_glm53_probe PRIVATE gufo_glm53_flash)
+
+if(ENGINE_ENABLE_HIP)
+  # Decode matvec over the vendored DS4 mmvq tier (covers Q6_K, Q8_0, IQ2_XXS
+  # and IQ2_S). Same dialect and feature macros as the tier it links.
+  add_library(gufo_glm53_flash_rocm STATIC kernels/rocm/matvec.hip.cpp)
+  set_source_files_properties(kernels/rocm/matvec.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  set_target_properties(gufo_glm53_flash_rocm PROPERTIES
+    HIP_STANDARD 17
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+  target_compile_definitions(gufo_glm53_flash_rocm PRIVATE
+    GGML_USE_HIP
+    GGML_HIP_NO_VMM
+    DS4_ROCM_WMMA_MMQ_Y=64)
+  target_compile_options(gufo_glm53_flash_rocm PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+  target_include_directories(gufo_glm53_flash_rocm PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(gufo_glm53_flash_rocm PUBLIC
+    gufo_glm53_flash gufo_deepseek_v4_flash_mmq)
+endif()

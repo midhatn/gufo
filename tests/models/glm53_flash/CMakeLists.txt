@@ -105,3 +105,13 @@ set_tests_properties(glm53.reference_full PROPERTIES
   SKIP_RETURN_CODE 77
   ENVIRONMENT "GUFO_GLM53_GOLDENS=$ENV{GUFO_GLM53_GOLDENS}"
   COST 3600)
+
+if(ENGINE_ENABLE_HIP)
+  add_executable(glm53_matvec_test matvec_test.cpp)
+  target_link_libraries(glm53_matvec_test PRIVATE gufo_glm53_flash_rocm)
+  add_test(NAME glm53.matvec
+    COMMAND glm53_matvec_test "${GUFO_GLM53_FLASH_MODEL}")
+  set_tests_properties(glm53.matvec PROPERTIES
+    LABELS "gpu;glm53;kernel;external-model"
+    SKIP_RETURN_CODE 77)
+endif()
