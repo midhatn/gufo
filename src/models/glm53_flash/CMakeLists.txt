@@ -5,6 +5,7 @@ add_library(gufo_glm53_flash STATIC
   runtime/config.cpp
   runtime/manifest.cpp
   runtime/layout.cpp
+  chat_template.cpp
   reference.cpp)
 
 target_include_directories(gufo_glm53_flash PUBLIC ${CMAKE_SOURCE_DIR})

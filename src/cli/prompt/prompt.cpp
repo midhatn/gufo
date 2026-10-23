@@ -1,5 +1,6 @@
 #include "src/cli/prompt/prompt.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -20,6 +21,8 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/glm53_flash/chat_template.hpp"
+#include "src/models/glm53_flash/reference.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -248,6 +251,88 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
 
 bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
+}
+
+bool IsGlm53Flash(const core::GgufReader& reader) {
+  const auto architecture = reader.GetMetadataString("general.architecture");
+  return architecture == "glm5-next" || architecture == "glm5next";
+}
+
+int RunGlm53Prompt(const PromptOptions& opt, const core::GgufReader& reader,
+                   std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "GLM-5.3 tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::glm53_flash::ReferenceModel::Open(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "GLM-5.3 load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::glm53_flash::RenderPrompt(
+                opt.system_prompt, opt.prompt_text, opt.reasoning_effort)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "GLM-5.3 prompt produced no tokens\n";
+    return 1;
+  }
+
+  std::vector<tokenization::TokenId> stop_tokens;
+  for (const char* key :
+       {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
+        "tokenizer.ggml.eom_token_id"}) {
+    if (const auto id = reader.GetMetadataUint32(key)) {
+      stop_tokens.push_back(*id);
+    }
+  }
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  auto session = model->CreateSession();
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<float>* logits = nullptr;
+  for (const auto token : prompt) {
+    logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const auto token = sampler.Sample(*logits);
+    if (is_stop(token)) {
+      break;
+    }
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens) {
+      logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[GLM-5.3 CPU reference] prompt=" << prompt.size()
+              << " tok in " << seconds(start, prefill_end)
+              << " s, generated=" << generated << " tok in "
+              << seconds(prefill_end, end) << " s\n";
+  }
+  return 0;
 }
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
@@ -1016,6 +1101,10 @@ int RunPrompt(std::span<const char* const> args) {
     return 1;
   }
 #endif
+
+  if (IsGlm53Flash(*reader)) {
+    return RunGlm53Prompt(opt, *reader, model_load_start);
+  }
 
   std::string rendered_prompt = opt.prompt_text;
   std::vector<tokenization::ContentSpan> content_spans;
