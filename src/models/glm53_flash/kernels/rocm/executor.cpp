@@ -1,6 +1,7 @@
 #include "src/models/glm53_flash/kernels/rocm/executor.hpp"
 
 #include <fcntl.h>
+#include <hipblas/hipblas.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -112,7 +113,8 @@ struct Executor::Scratch {
       *g2{}, *o{};
   // DSA
   float *qr{}, *q{}, *lat{}, *iq{}, *ik{}, *gt{}, *wp{}, *scores{}, *qabs{},
-      *ctx{}, *vout{};
+      *ctx{}, *vout{}, *q_heads{}, *v_heads{};
+  void* head_half{};
   int* sel{};
   // FFN
   float *gate{}, *up{}, *act{};
@@ -130,6 +132,7 @@ struct Executor::Scratch {
   std::uint32_t* host_counts{};
   std::int32_t* host_tiles{};
   std::uint32_t tile_capacity{0};
+  long long score_stride{0};
   std::vector<void*> all;
 };
 
@@ -150,7 +153,13 @@ Executor::~Executor() {
   hipDeviceSynchronize();
   if (staging_ != nullptr)
     hipHostFree(staging_);
+  if (blas_ != nullptr)
+    hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
   for (auto& [name, t] : tensors_) {
+    if (t.q8_owned && t.q8 != nullptr)
+      hipFree(t.q8);
+    if (t.f16 != nullptr)
+      hipFree(t.f16);
     if (t.data != nullptr)
       hipFree(t.data);
   }
@@ -246,6 +255,7 @@ bool Executor::Upload(const std::string& name, std::string* error) {
   d.experts = t->dimensions.size() > 2
                   ? static_cast<std::uint32_t>(t->dimensions[2])
                   : 1;
+  d.slab_bytes = t->size_bytes / d.experts;
   if (hipMalloc(&d.data, t->size_bytes + kTailMargin) != hipSuccess) {
     if (error != nullptr)
       *error = "hipMalloc failed for " + name;
@@ -270,6 +280,25 @@ bool Executor::Upload(const std::string& name, std::string* error) {
       } else {
         d.q8 = nullptr;
       }
+    }
+  }
+  if (d.experts > 1 && d.type == kTypeQ6_K &&
+      (name.find("attn_k_b") != std::string::npos ||
+       name.find("attn_v_b") != std::string::npos)) {
+    const std::size_t rows_total = static_cast<std::size_t>(d.rows) * d.experts;
+    std::vector<__half> half(rows_total * d.k);
+    std::vector<float> row(d.k);
+    const std::size_t row_bytes = t->size_bytes / rows_total;
+    for (std::size_t r = 0; r < rows_total; ++r) {
+      quant::DequantizeQ6_K(static_cast<const char*>(t->data) + r * row_bytes,
+                            row.data(), d.k);
+      for (std::uint32_t i = 0; i < d.k; ++i) {
+        half[r * d.k + i] = __float2half(row[i]);
+      }
+    }
+    if (hipMalloc(&d.f16, half.size() * sizeof(__half)) == hipSuccess) {
+      hipMemcpy(d.f16, half.data(), half.size() * sizeof(__half),
+                hipMemcpyHostToDevice);
     }
   }
   tensors_.emplace(name, d);
@@ -306,6 +335,15 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     if (error != nullptr)
       *error = "no HIP device";
     return nullptr;
+  }
+  {
+    hipblasHandle_t handle = nullptr;
+    if (hipblasCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+      if (error != nullptr)
+        *error = "hipblas init failed";
+      return nullptr;
+    }
+    ex->blas_ = handle;
   }
   if (ds4_mmq_init(0) != 0) {
     if (error != nullptr)
@@ -457,11 +495,16 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.ik, c * kDsaIndexDim);
   take(&s.gt, c * kDsaIndexDim);
   take(&s.wp, c * kDsaIndexHeads);
-  take(&s.scores, pools);
-  take(&s.qabs, kDsaHeads * kDsaLatent);
-  take(&s.ctx, kDsaHeads * kDsaLatent);
+  s.score_stride = static_cast<long long>(pools);
+  take(&s.scores, c * pools);
+  take(&s.qabs, c * kDsaHeads * kDsaLatent);
+  take(&s.ctx, c * kDsaHeads * kDsaLatent);
+  take(reinterpret_cast<std::uint16_t**>(&s.head_half),
+       c * kDsaHeads * kDsaLatent);
+  take(&s.q_heads, c * kMlaQ);
+  take(&s.v_heads, c * kMlaQ);
   take(&s.vout, c * kMlaQ);
-  take(&s.sel, kDsaTopPools);
+  take(&s.sel, c * kDsaTopPools);
   take(&s.gate, c * kFfnScratch);
   take(&s.up, c * kFfnScratch);
   take(&s.act, c * kFfnScratch);
@@ -555,6 +598,25 @@ void Executor::Proj(const DeviceTensor& w, const Act& x, float* out,
        static_cast<int>(w.k), scratch_->matvec, stream_);
 }
 
+// out[h][t][r] = sum_k W_h[r][k] * in[h][t][k] for the 64 head slabs of a
+// stacked [64][rows][k] tensor: one strided-batched GEMM over F16 copies of
+// the slabs and the F16 activations.
+void Executor::HeadGemm(const DeviceTensor& w, const float* in, float* out,
+                        int T, int k, int rows) const {
+  const Scratch& b = *scratch_;
+  ToHalf(in, b.head_half, static_cast<long long>(kDsaHeads) * T * k, stream_);
+  const auto handle = static_cast<hipblasHandle_t>(blas_);
+  hipblasSetStream(handle, stream_);
+  const float alpha = 1.0F;
+  const float beta = 0.0F;
+  hipblasGemmStridedBatchedEx(
+      handle, HIPBLAS_OP_T, HIPBLAS_OP_N, rows, T, k, &alpha, w.f16,
+      HIPBLAS_R_16F, k, static_cast<long long>(rows) * k, b.head_half,
+      HIPBLAS_R_16F, k, static_cast<long long>(T) * k, &beta, out,
+      HIPBLAS_R_32F, rows, static_cast<long long>(T) * rows, kDsaHeads,
+      HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+}
+
 void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
@@ -596,28 +658,51 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
             kKNormEps, stream_, T);
   Proj(*w.idx_gate, y, b.gt, T);
   Proj(*w.idx_proj, y, b.wp, T);
-  for (int t = 0; t < T; ++t) {
-    const int pos = static_cast<int>(s.position) + t;
-    DsaAppend(st.cache, b.lat + static_cast<std::size_t>(t) * kDsaLatent,
-              b.ik + static_cast<std::size_t>(t) * kDsaIndexDim,
-              b.gt + static_cast<std::size_t>(t) * kDsaIndexDim,
-              w.idx_ape->f32(), pos, stream_);
-    const int npool = (pos + 1) / kDsaPool;
-    const int nsel = std::min<int>(npool, options_.top_pools);
-    DsaScores(
-        b.iq + static_cast<std::size_t>(t) * kDsaIndexHeads * kDsaIndexDim,
-        b.wp + static_cast<std::size_t>(t) * kDsaIndexHeads, st.cache.pooled,
-        npool, b.scores, stream_);
-    DsaSelect(b.scores, npool, static_cast<int>(options_.top_pools), b.sel,
-              stream_);
-    MatvecBatched(w.k_b->type, w.k_b->data,
-                  b.q + static_cast<std::size_t>(t) * kMlaQ, b.qabs, kDsaLatent,
-                  256, kDsaHeads, b.matvec, stream_);
-    DsaAttend(b.qabs, st.cache.lat, b.sel, nsel, pos, 1.0F / 16.0F, b.ctx,
-              stream_);
-    MatvecBatched(w.v_b->type, w.v_b->data, b.ctx,
-                  b.vout + static_cast<std::size_t>(t) * kMlaQ, 256, kDsaLatent,
-                  kDsaHeads, b.matvec, stream_);
+  Mark(5);
+  if (T >= kWideBatch) {
+    const int pos0 = static_cast<int>(s.position);
+    const int top = static_cast<int>(options_.top_pools);
+    DsaAppendBatch(st.cache, b.lat, b.ik, b.gt, w.idx_ape->f32(), pos0, T,
+                   stream_);
+    DsaScoresBatch(b.iq, b.wp, st.cache.pooled, pos0, T, b.score_stride,
+                   b.scores, stream_);
+    DsaSelectBatch(b.scores, b.score_stride, pos0, T, top, b.sel, stream_);
+    Mark(6);
+    // attn_k_b / attn_v_b are 64 stacked per-head slabs: one GEMM per head
+    // over all tokens, in the head-major layout the attention kernel reads.
+    HeadMajor(b.q, b.q_heads, T, kDsaHeads, 256, stream_);
+    HeadGemm(*w.k_b, b.q_heads, b.qabs, T, 256, kDsaLatent);
+    Mark(7);
+    DsaAttendBatch(b.qabs, st.cache.lat, b.sel, pos0, T, top, 1.0F / 16.0F,
+                   b.ctx, stream_);
+    Mark(8);
+    HeadGemm(*w.v_b, b.ctx, b.v_heads, T, kDsaLatent, 256);
+    TokenMajor(b.v_heads, b.vout, T, kDsaHeads, 256, stream_);
+    Mark(7);
+  } else {
+    for (int t = 0; t < T; ++t) {
+      const int pos = static_cast<int>(s.position) + t;
+      DsaAppend(st.cache, b.lat + static_cast<std::size_t>(t) * kDsaLatent,
+                b.ik + static_cast<std::size_t>(t) * kDsaIndexDim,
+                b.gt + static_cast<std::size_t>(t) * kDsaIndexDim,
+                w.idx_ape->f32(), pos, stream_);
+      const int npool = (pos + 1) / kDsaPool;
+      const int nsel = std::min<int>(npool, options_.top_pools);
+      DsaScores(
+          b.iq + static_cast<std::size_t>(t) * kDsaIndexHeads * kDsaIndexDim,
+          b.wp + static_cast<std::size_t>(t) * kDsaIndexHeads, st.cache.pooled,
+          npool, b.scores, stream_);
+      DsaSelect(b.scores, npool, static_cast<int>(options_.top_pools), b.sel,
+                stream_);
+      MatvecBatched(w.k_b->type, w.k_b->data,
+                    b.q + static_cast<std::size_t>(t) * kMlaQ, b.qabs,
+                    kDsaLatent, 256, kDsaHeads, b.matvec, stream_);
+      DsaAttend(b.qabs, st.cache.lat, b.sel, nsel, pos, 1.0F / 16.0F, b.ctx,
+                stream_);
+      MatvecBatched(w.v_b->type, w.v_b->data, b.ctx,
+                    b.vout + static_cast<std::size_t>(t) * kMlaQ, 256,
+                    kDsaLatent, kDsaHeads, b.matvec, stream_);
+    }
   }
   Proj(*w.attn_output, Prep(b.vout, T, kMlaQ), b.block, T);
 }
@@ -762,16 +847,7 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
                  hipMemcpyHostToDevice, stream_);
   hipStreamSynchronize(stream_);
 
-  const bool profile = profile_;
-  auto mark = [&](int bucket) {
-    if (!profile)
-      return;
-    hipStreamSynchronize(stream_);
-    const auto now = std::chrono::steady_clock::now();
-    profile_seconds_[bucket] +=
-        std::chrono::duration<double>(now - profile_mark_).count();
-    profile_mark_ = now;
-  };
+  auto mark = [&](int bucket) { Mark(bucket); };
   profile_mark_ = std::chrono::steady_clock::now();
   for (std::uint32_t layer = 0; layer < layers_; ++layer) {
     const LayerWeights& w = weights_[layer];
@@ -817,14 +893,28 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
   return true;
 }
 
+void Executor::Mark(int bucket) const {
+  if (!profile_)
+    return;
+  hipStreamSynchronize(stream_);
+  const auto now = std::chrono::steady_clock::now();
+  profile_seconds_[bucket] +=
+      std::chrono::duration<double>(now - profile_mark_).count();
+  profile_mark_ = now;
+}
+
 void Executor::PrintProfile() {
   if (!profile_)
     return;
-  static const char* kNames[] = {"hc", "kda", "dsa", "ffn-dense", "ffn-moe"};
+  static const char* kNames[] = {
+      "hc",       "kda",        "dsa",          "ffn-dense",  "ffn-moe",
+      "dsa:proj", "dsa:select", "dsa:headgemm", "dsa:attend", "dsa:out"};
   double total = 0.0;
   for (const double v : profile_seconds_)
     total += v;
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < 10; ++i) {
+    if (profile_seconds_[i] == 0.0)
+      continue;
     std::printf("  %-10s %7.3f s %5.1f%%\n", kNames[i], profile_seconds_[i],
                 100.0 * profile_seconds_[i] / std::max(total, 1e-9));
   }

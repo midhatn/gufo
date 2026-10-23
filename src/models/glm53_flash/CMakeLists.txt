@@ -50,5 +50,6 @@ if(ENGINE_ENABLE_HIP)
   target_include_directories(gufo_glm53_flash_engine PUBLIC
     ${CMAKE_SOURCE_DIR})
   target_link_libraries(gufo_glm53_flash_engine PUBLIC
-    gufo_glm53_flash_rocm gufo_qwen38_flash_next gufo_core hip::host)
+    gufo_glm53_flash_rocm gufo_qwen38_flash_next gufo_core hip::host
+    roc::hipblas)
 endif()

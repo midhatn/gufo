@@ -34,10 +34,14 @@ struct DeviceTensor {
   // for Q8_0 tensors, a re-encoded copy for Q6_K, null otherwise.
   void* q8{nullptr};
   bool q8_owned{false};
+  // attn_k_b / attn_v_b only: all head slabs dequantized to F16 for the
+  // strided-batched prefill GEMMs.
+  void* f16{nullptr};
   int type{-1};
   std::uint32_t k{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  std::size_t slab_bytes{0};  // bytes of one expert / head slab
   [[nodiscard]] const float* f32() const {
     return static_cast<const float*>(data);
   }
@@ -61,6 +65,8 @@ public:
                                           const ExecutorOptions& options,
                                           std::string* error);
   ~Executor();
+  Executor(const Executor&) = delete;
+  Executor& operator=(const Executor&) = delete;
 
   std::unique_ptr<Session> CreateSession(std::string* error);
 
@@ -107,6 +113,8 @@ private:
   void Proj(const DeviceTensor& w, const Act& x, float* out, int tokens) const;
   void KdaBlock(std::uint32_t layer, Session& s, int tokens) const;
   void DsaBlock(std::uint32_t layer, Session& s, int tokens) const;
+  void HeadGemm(const DeviceTensor& w, const float* in, float* out, int tokens,
+                int k, int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
 
@@ -119,11 +127,13 @@ private:
   std::unique_ptr<Scratch> scratch_;
   hipStream_t stream_{nullptr};
   void* staging_{nullptr};
+  void* blas_{nullptr};  // hipblasHandle_t
   float* last_residual_{nullptr};
   bool profile_{false};
   mutable std::size_t arena_used_{0};
-  double profile_seconds_[5]{};
-  std::chrono::steady_clock::time_point profile_mark_{};
+  mutable double profile_seconds_[10]{};
+  mutable std::chrono::steady_clock::time_point profile_mark_{};
+  void Mark(int bucket) const;
 };
 
 }  // namespace gufo::models::glm53_flash::rocm
