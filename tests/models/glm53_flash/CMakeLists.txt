@@ -182,4 +182,8 @@ if(ENGINE_ENABLE_HIP)
     LABELS "gpu;glm53;kernel;external-model"
     SKIP_RETURN_CODE 77
     COST 120)
+
+  add_executable(glm53_executor_prefill_test executor_prefill_test.cpp)
+  target_link_libraries(glm53_executor_prefill_test PRIVATE
+    gufo_glm53_flash_engine gufo_glm53_flash)
 endif()

@@ -16,11 +16,13 @@ int SwigluClamp(const float* gate, const float* up, float* act, int n,
 // Router: p = sigmoid(logits); the 8 experts with the largest p + bias are
 // chosen (ties to the lower index); weights = p / sum(p of chosen) * scale.
 int MoeRoute(const float* logits, const float* bias, float scale, int* ids,
-             float* weights, hipStream_t stream);
+             float* weights, hipStream_t stream, int tokens = 1);
 
-// out[c] = sum_i weights[i] * parts[i][c] + shared[c].
+// out[c] = sum_i weights[i] * parts[i][c] + shared[c]. Batched calls advance
+// every pointer by one token's worth per index (logits 288, ids/weights 8,
+// parts 8 * 4096, shared/out 4096); the router runs one block per token.
 int MoeCombine(const float* parts, const float* weights, const float* shared,
-               float* out, hipStream_t stream);
+               float* out, hipStream_t stream, int tokens = 1);
 
 }  // namespace gufo::models::glm53_flash::rocm
 

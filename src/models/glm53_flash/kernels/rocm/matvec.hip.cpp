@@ -1,5 +1,6 @@
 #include "src/models/glm53_flash/kernels/rocm/matvec.hpp"
 
+#include "ds4_mmq.h"
 #include "mmvq.hip.hpp"
 #include "quantize.hip.hpp"
 
@@ -54,7 +55,7 @@ std::size_t MatvecScratchBytes(int n, int k) {
 int Matvec(int type_code, const void* w, const float* x, float* out, int m,
            int n, int k, void* scratch, hipStream_t stream) {
   if (w == nullptr || x == nullptr || out == nullptr || m <= 0 || n <= 0 ||
-      k <= 0 || n > MMVQ_MAX_BATCH_SIZE) {
+      k <= 0) {
     return -1;
   }
   if (type_code == kTypeF32) {
@@ -62,7 +63,7 @@ int Matvec(int type_code, const void* w, const float* x, float* out, int m,
         static_cast<const float*>(w), x, out, m, n, k);
     return hipGetLastError() == hipSuccess ? 0 : -2;
   }
-  if (scratch == nullptr) {
+  if (scratch == nullptr || n > MMVQ_MAX_BATCH_SIZE) {
     return -1;
   }
   const auto type = static_cast<ggml_type>(type_code);
@@ -130,6 +131,49 @@ int MatvecExperts(int type_code, const void* w, const float* x, float* out,
                             channels_y, n_used, m * stride_row_x, stride_col_y,
                             m, 1, 1, 0, 0, 0, 0, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+int Gemm(int type_code, const void* w, const float* x, float* out, int m, int n,
+         int k, void* scratch, hipStream_t stream) {
+  if (type_code == kTypeF32 || n <= MMVQ_MAX_BATCH_SIZE) {
+    return Matvec(type_code, w, x, out, m, n, k, scratch, stream);
+  }
+  if ((k % 256) != 0) {
+    for (int col = 0; col < n; col += MMVQ_MAX_BATCH_SIZE) {
+      const int cols =
+          n - col < MMVQ_MAX_BATCH_SIZE ? n - col : MMVQ_MAX_BATCH_SIZE;
+      const int rc = Matvec(type_code, w, x + static_cast<std::size_t>(col) * k,
+                            out + static_cast<std::size_t>(col) * m, m, cols, k,
+                            scratch, stream);
+      if (rc != 0) {
+        return rc;
+      }
+    }
+    return 0;
+  }
+  switch (type_code) {
+    case kTypeQ6_K:
+      return ds4_mmq_q6_K_dense(w, x, out, m, n, k, stream);
+    case kTypeQ8_0:
+      return ds4_mmq_q8_0_dense(w, x, out, m, n, k, stream);
+    default:
+      return -1;
+  }
+}
+
+int ExpertsGemm(int type_code, const void* w, const float* x, float* out, int m,
+                int k, int tokens, int n_experts, int n_used, const int* ids,
+                hipStream_t stream) {
+  switch (type_code) {
+    case kTypeIQ2_XXS:
+      return ds4_mmq_iq2_xxs_moe(w, x, ids, out, m, k, tokens, n_experts,
+                                 n_used, stream);
+    case kTypeIQ2_S:
+      return ds4_mmq_iq2_s_moe(w, x, ids, out, m, k, tokens, n_experts, n_used,
+                               stream);
+    default:
+      return -1;
+  }
 }
 
 }  // namespace gufo::models::glm53_flash::rocm

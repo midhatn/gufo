@@ -12,6 +12,8 @@
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
 
+extern "C" int ds4_mmq_init(int device);
+
 namespace gufo::models::glm53_flash::rocm {
 
 namespace {
@@ -94,9 +96,11 @@ struct Executor::LayerWeights {
 
 struct Executor::Scratch {
   void* matvec{nullptr};
+  float* x[2]{nullptr, nullptr};
   float *y{}, *post{}, *comb{}, *block{}, *ffn_out{};
   // KDA
-  float *qkv{}, *decay{}, *beta{}, *fa{}, *fproj{}, *braw{}, *ga{}, *g2{}, *o{};
+  float *kq{}, *kk{}, *kv{}, *decay{}, *beta{}, *fa{}, *fproj{}, *braw{}, *ga{},
+      *g2{}, *o{};
   // DSA
   float *qr{}, *q{}, *lat{}, *iq{}, *ik{}, *gt{}, *wp{}, *scores{}, *qabs{},
       *ctx{}, *vout{};
@@ -107,13 +111,10 @@ struct Executor::Scratch {
   int* ids{};
   // Head
   float *head_in{}, *logits{};
+  std::vector<void*> all;
 };
 
 Executor::Session::~Session() {
-  for (float* r : residual) {
-    if (r != nullptr)
-      hipFree(r);
-  }
   for (auto& l : layers) {
     for (void* p :
          {static_cast<void*>(l.conv), static_cast<void*>(l.state),
@@ -135,48 +136,8 @@ Executor::~Executor() {
       hipFree(t.data);
   }
   if (scratch_) {
-    for (void* p : {scratch_->matvec,
-                    static_cast<void*>(scratch_->y),
-                    static_cast<void*>(scratch_->post),
-                    static_cast<void*>(scratch_->comb),
-                    static_cast<void*>(scratch_->block),
-                    static_cast<void*>(scratch_->ffn_out),
-                    static_cast<void*>(scratch_->qkv),
-                    static_cast<void*>(scratch_->decay),
-                    static_cast<void*>(scratch_->beta),
-                    static_cast<void*>(scratch_->fa),
-                    static_cast<void*>(scratch_->fproj),
-                    static_cast<void*>(scratch_->braw),
-                    static_cast<void*>(scratch_->ga),
-                    static_cast<void*>(scratch_->g2),
-                    static_cast<void*>(scratch_->o),
-                    static_cast<void*>(scratch_->qr),
-                    static_cast<void*>(scratch_->q),
-                    static_cast<void*>(scratch_->lat),
-                    static_cast<void*>(scratch_->iq),
-                    static_cast<void*>(scratch_->ik),
-                    static_cast<void*>(scratch_->gt),
-                    static_cast<void*>(scratch_->wp),
-                    static_cast<void*>(scratch_->scores),
-                    static_cast<void*>(scratch_->qabs),
-                    static_cast<void*>(scratch_->ctx),
-                    static_cast<void*>(scratch_->vout),
-                    static_cast<void*>(scratch_->sel),
-                    static_cast<void*>(scratch_->gate),
-                    static_cast<void*>(scratch_->up),
-                    static_cast<void*>(scratch_->act),
-                    static_cast<void*>(scratch_->rlogits),
-                    static_cast<void*>(scratch_->wts),
-                    static_cast<void*>(scratch_->parts),
-                    static_cast<void*>(scratch_->sg),
-                    static_cast<void*>(scratch_->su),
-                    static_cast<void*>(scratch_->sact),
-                    static_cast<void*>(scratch_->shared),
-                    static_cast<void*>(scratch_->ids),
-                    static_cast<void*>(scratch_->head_in),
-                    static_cast<void*>(scratch_->logits)}) {
-      if (p != nullptr)
-        hipFree(p);
+    for (void* p : scratch_->all) {
+      hipFree(p);
     }
   }
 }
@@ -305,6 +266,11 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       *error = "no HIP device";
     return nullptr;
   }
+  if (ds4_mmq_init(0) != 0) {
+    if (error != nullptr)
+      *error = "mmq init failed";
+    return nullptr;
+  }
   const bool full = ex->layers_ == ex->config_.TrunkLayers();
   const bool head = options.head && full;
   ex->options_.head = head;
@@ -414,43 +380,67 @@ bool Executor::Resolve(std::string* error) {
 bool Executor::AllocScratch(std::string* error) {
   scratch_ = std::make_unique<Scratch>();
   Scratch& s = *scratch_;
+  const std::size_t c = options_.prefill_chunk;
   const std::size_t pools = options_.max_context / kDsaPool + 1;
-  bool ok =
-      Alloc(reinterpret_cast<char**>(&s.matvec), kMatvecScratchBytes, error);
-  ok = ok && Alloc(&s.y, kHidden, error) && Alloc(&s.post, kStreams, error) &&
-       Alloc(&s.comb, kStreams * kStreams, error) &&
-       Alloc(&s.block, kHidden, error) && Alloc(&s.ffn_out, kHidden, error);
-  ok = ok && Alloc(&s.qkv, 3 * kKdaInner, error) &&
-       Alloc(&s.decay, kKdaInner, error) && Alloc(&s.beta, kKdaHeads, error) &&
-       Alloc(&s.fa, kKdaHeadDim, error) && Alloc(&s.fproj, kKdaInner, error) &&
-       Alloc(&s.braw, kKdaHeads, error) && Alloc(&s.ga, kKdaHeadDim, error) &&
-       Alloc(&s.g2, kKdaInner, error) && Alloc(&s.o, kKdaInner, error);
-  ok = ok && Alloc(&s.qr, kQLora, error) && Alloc(&s.q, kMlaQ, error) &&
-       Alloc(&s.lat, kDsaLatent, error) &&
-       Alloc(&s.iq, kDsaIndexHeads * kDsaIndexDim, error) &&
-       Alloc(&s.ik, kDsaIndexDim, error) && Alloc(&s.gt, kDsaIndexDim, error) &&
-       Alloc(&s.wp, kDsaIndexHeads, error) && Alloc(&s.scores, pools, error) &&
-       Alloc(&s.qabs, kDsaHeads * kDsaLatent, error) &&
-       Alloc(&s.ctx, kDsaHeads * kDsaLatent, error) &&
-       Alloc(&s.vout, kMlaQ, error) && Alloc(&s.sel, kDsaTopPools, error);
-  ok = ok && Alloc(&s.gate, kFfnScratch, error) &&
-       Alloc(&s.up, kFfnScratch, error) && Alloc(&s.act, kFfnScratch, error) &&
-       Alloc(&s.rlogits, kMoeExperts, error) &&
-       Alloc(&s.wts, kMoeUsed, error) &&
-       Alloc(&s.parts, kMoeUsed * kHidden, error) &&
-       Alloc(&s.sg, kExpertFf, error) && Alloc(&s.su, kExpertFf, error) &&
-       Alloc(&s.sact, kExpertFf, error) && Alloc(&s.shared, kHidden, error) &&
-       Alloc(&s.ids, kMoeUsed, error);
-  ok = ok && Alloc(&s.head_in, kHidden, error) &&
-       Alloc(&s.logits, config_.vocab_size, error);
+  bool ok = true;
+  const auto take = [&](auto** ptr, std::size_t count) {
+    if (!ok)
+      return;
+    ok = Alloc(ptr, count, error);
+    if (ok)
+      s.all.push_back(static_cast<void*>(*ptr));
+  };
+  take(reinterpret_cast<char**>(&s.matvec), kMatvecScratchBytes);
+  take(&s.x[0], c * kStreams * kHidden);
+  take(&s.x[1], c * kStreams * kHidden);
+  take(&s.y, c * kHidden);
+  take(&s.post, c * kStreams);
+  take(&s.comb, c * kStreams * kStreams);
+  take(&s.block, c * kHidden);
+  take(&s.ffn_out, c * kHidden);
+  take(&s.kq, c * kKdaInner);
+  take(&s.kk, c * kKdaInner);
+  take(&s.kv, c * kKdaInner);
+  take(&s.decay, c * kKdaInner);
+  take(&s.beta, c * kKdaHeads);
+  take(&s.fa, c * kKdaHeadDim);
+  take(&s.fproj, c * kKdaInner);
+  take(&s.braw, c * kKdaHeads);
+  take(&s.ga, c * kKdaHeadDim);
+  take(&s.g2, c * kKdaInner);
+  take(&s.o, c * kKdaInner);
+  take(&s.qr, c * kQLora);
+  take(&s.q, c * kMlaQ);
+  take(&s.lat, c * kDsaLatent);
+  take(&s.iq, c * kDsaIndexHeads * kDsaIndexDim);
+  take(&s.ik, c * kDsaIndexDim);
+  take(&s.gt, c * kDsaIndexDim);
+  take(&s.wp, c * kDsaIndexHeads);
+  take(&s.scores, pools);
+  take(&s.qabs, kDsaHeads * kDsaLatent);
+  take(&s.ctx, kDsaHeads * kDsaLatent);
+  take(&s.vout, c * kMlaQ);
+  take(&s.sel, kDsaTopPools);
+  take(&s.gate, c * kFfnScratch);
+  take(&s.up, c * kFfnScratch);
+  take(&s.act, c * kFfnScratch);
+  take(&s.rlogits, c * kMoeExperts);
+  take(&s.wts, c * kMoeUsed);
+  take(&s.ids, c * kMoeUsed);
+  take(&s.parts, c * kMoeUsed * kHidden);
+  take(&s.sg, c * kExpertFf);
+  take(&s.su, c * kExpertFf);
+  take(&s.sact, c * kExpertFf);
+  take(&s.shared, c * kHidden);
+  take(&s.head_in, kHidden);
+  take(&s.logits, config_.vocab_size);
   return ok;
 }
 
 std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
   auto s = std::make_unique<Session>();
   s->layers.resize(layers_);
-  bool ok = Alloc(&s->residual[0], kStreams * kHidden, error) &&
-            Alloc(&s->residual[1], kStreams * kHidden, error);
+  bool ok = true;
   const std::size_t ctx = options_.max_context;
   for (std::uint32_t l = 0; ok && l < layers_; ++l) {
     LayerState& st = s->layers[l];
@@ -470,171 +460,221 @@ std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
   return ok ? std::move(s) : nullptr;
 }
 
-void Executor::Matvec(const DeviceTensor& w, const float* x, float* out) const {
-  rocm::Matvec(w.type, w.data, x, out, static_cast<int>(w.rows), 1,
-               static_cast<int>(w.k), scratch_->matvec, stream_);
+void Executor::Proj(const DeviceTensor& w, const float* x, float* out,
+                    int tokens) const {
+  Gemm(w.type, w.data, x, out, static_cast<int>(w.rows), tokens,
+       static_cast<int>(w.k), scratch_->matvec, stream_);
 }
 
-void Executor::KdaBlock(std::uint32_t layer, Session& s, const float* y,
-                        float* block) const {
+void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
   LayerState& st = s.layers[layer];
-  Matvec(*w.attn_q, y, b.qkv);
-  Matvec(*w.attn_k, y, b.qkv + kKdaInner);
-  Matvec(*w.attn_v, y, b.qkv + 2 * kKdaInner);
-  KdaConv(b.qkv, st.conv, w.conv_q->f32(), w.conv_k->f32(), w.conv_v->f32(),
-          stream_);
-  Matvec(*w.ssm_f_a, y, b.fa);
-  Matvec(*w.ssm_f_b, b.fa, b.fproj);
-  Matvec(*w.ssm_beta, y, b.braw);
+  Proj(*w.attn_q, b.y, b.kq, T);
+  Proj(*w.attn_k, b.y, b.kk, T);
+  Proj(*w.attn_v, b.y, b.kv, T);
+  KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
+          w.conv_v->f32(), stream_, T);
+  Proj(*w.ssm_f_a, b.y, b.fa, T);
+  Proj(*w.ssm_f_b, b.fa, b.fproj, T);
+  Proj(*w.ssm_beta, b.y, b.braw, T);
   KdaGates(b.fproj, w.ssm_dt->f32(), w.ssm_a->f32(), b.braw, b.decay, b.beta,
-           stream_);
-  KdaRecur(b.qkv, b.decay, b.beta, st.state, b.o, stream_);
-  Matvec(*w.ssm_g_a, y, b.ga);
-  Matvec(*w.ssm_g_b, b.ga, b.g2);
-  KdaOut(b.o, w.ssm_norm->f32(), b.g2, stream_);
-  Matvec(*w.attn_output, b.o, block);
+           stream_, T);
+  KdaRecur(b.kq, b.kk, b.kv, b.decay, b.beta, st.state, b.o, stream_, T);
+  Proj(*w.ssm_g_a, b.y, b.ga, T);
+  Proj(*w.ssm_g_b, b.ga, b.g2, T);
+  KdaOut(b.o, w.ssm_norm->f32(), b.g2, stream_, T);
+  Proj(*w.attn_output, b.o, b.block, T);
 }
 
-void Executor::DsaBlock(std::uint32_t layer, Session& s, const float* y,
-                        float* block) const {
+void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
   LayerState& st = s.layers[layer];
-  const int pos = static_cast<int>(s.position);
-  Matvec(*w.q_a, y, b.qr);
-  RmsNorm(b.qr, w.q_a_norm->f32(), kQLora, kRmsEps, stream_);
-  Matvec(*w.q_b, b.qr, b.q);
-  Matvec(*w.kv_a, y, b.lat);
-  RmsNorm(b.lat, w.kv_a_norm->f32(), kDsaLatent, kRmsEps, stream_);
-  Matvec(*w.idx_q_b, b.qr, b.iq);
-  Matvec(*w.idx_k, y, b.ik);
+  Proj(*w.q_a, b.y, b.qr, T);
+  RmsNorm(b.qr, w.q_a_norm->f32(), kQLora, kRmsEps, stream_, T);
+  Proj(*w.q_b, b.qr, b.q, T);
+  Proj(*w.kv_a, b.y, b.lat, T);
+  RmsNorm(b.lat, w.kv_a_norm->f32(), kDsaLatent, kRmsEps, stream_, T);
+  Proj(*w.idx_q_b, b.qr, b.iq, T);
+  Proj(*w.idx_k, b.y, b.ik, T);
   LayerNorm(b.ik, w.idx_k_norm_w->f32(), w.idx_k_norm_b->f32(), kDsaIndexDim,
-            kKNormEps, stream_);
-  Matvec(*w.idx_gate, y, b.gt);
-  DsaAppend(st.cache, b.lat, b.ik, b.gt, w.idx_ape->f32(), pos, stream_);
-  Matvec(*w.idx_proj, y, b.wp);
-  const int npool = (pos + 1) / kDsaPool;
-  const int nsel = std::min<int>(npool, options_.top_pools);
-  DsaScores(b.iq, b.wp, st.cache.pooled, npool, b.scores, stream_);
-  DsaSelect(b.scores, npool, static_cast<int>(options_.top_pools), b.sel,
-            stream_);
-  rocm::MatvecBatched(w.k_b->type, w.k_b->data, b.q, b.qabs, kDsaLatent, 256,
-                      kDsaHeads, b.matvec, stream_);
-  DsaAttend(b.qabs, st.cache.lat, b.sel, nsel, pos, 1.0F / 16.0F, b.ctx,
-            stream_);
-  rocm::MatvecBatched(w.v_b->type, w.v_b->data, b.ctx, b.vout, 256, kDsaLatent,
-                      kDsaHeads, b.matvec, stream_);
-  Matvec(*w.attn_output, b.vout, block);
+            kKNormEps, stream_, T);
+  Proj(*w.idx_gate, b.y, b.gt, T);
+  Proj(*w.idx_proj, b.y, b.wp, T);
+  for (int t = 0; t < T; ++t) {
+    const int pos = static_cast<int>(s.position) + t;
+    DsaAppend(st.cache, b.lat + static_cast<std::size_t>(t) * kDsaLatent,
+              b.ik + static_cast<std::size_t>(t) * kDsaIndexDim,
+              b.gt + static_cast<std::size_t>(t) * kDsaIndexDim,
+              w.idx_ape->f32(), pos, stream_);
+    const int npool = (pos + 1) / kDsaPool;
+    const int nsel = std::min<int>(npool, options_.top_pools);
+    DsaScores(
+        b.iq + static_cast<std::size_t>(t) * kDsaIndexHeads * kDsaIndexDim,
+        b.wp + static_cast<std::size_t>(t) * kDsaIndexHeads, st.cache.pooled,
+        npool, b.scores, stream_);
+    DsaSelect(b.scores, npool, static_cast<int>(options_.top_pools), b.sel,
+              stream_);
+    MatvecBatched(w.k_b->type, w.k_b->data,
+                  b.q + static_cast<std::size_t>(t) * kMlaQ, b.qabs, kDsaLatent,
+                  256, kDsaHeads, b.matvec, stream_);
+    DsaAttend(b.qabs, st.cache.lat, b.sel, nsel, pos, 1.0F / 16.0F, b.ctx,
+              stream_);
+    MatvecBatched(w.v_b->type, w.v_b->data, b.ctx,
+                  b.vout + static_cast<std::size_t>(t) * kMlaQ, 256, kDsaLatent,
+                  kDsaHeads, b.matvec, stream_);
+  }
+  Proj(*w.attn_output, b.vout, b.block, T);
 }
 
-void Executor::FfnBlock(std::uint32_t layer, const float* y, float* out) const {
+void Executor::FfnBlock(std::uint32_t layer, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
   if (w.dense) {
-    Matvec(*w.ffn_gate, y, b.gate);
-    Matvec(*w.ffn_up, y, b.up);
-    SwigluClamp(b.gate, b.up, b.act, kDenseFf, stream_);
-    Matvec(*w.ffn_down, b.act, out);
+    Proj(*w.ffn_gate, b.y, b.gate, T);
+    Proj(*w.ffn_up, b.y, b.up, T);
+    SwigluClamp(b.gate, b.up, b.act, T * kDenseFf, stream_);
+    Proj(*w.ffn_down, b.act, b.ffn_out, T);
     return;
   }
-  Matvec(*w.router, y, b.rlogits);
+  Proj(*w.router, b.y, b.rlogits, T);
   MoeRoute(b.rlogits, w.router_bias->f32(), config_.expert_weights_scale, b.ids,
-           b.wts, stream_);
-  rocm::MatvecExperts(w.exp_gate->type, w.exp_gate->data, y, b.gate, kExpertFf,
-                      kHidden, kMoeExperts, kMoeUsed, b.ids, false, b.matvec,
-                      stream_);
-  rocm::MatvecExperts(w.exp_up->type, w.exp_up->data, y, b.up, kExpertFf,
-                      kHidden, kMoeExperts, kMoeUsed, b.ids, false, b.matvec,
-                      stream_);
-  SwigluClamp(b.gate, b.up, b.act, kMoeUsed * kExpertFf, stream_);
-  rocm::MatvecExperts(w.exp_down->type, w.exp_down->data, b.act, b.parts,
-                      kHidden, kExpertFf, kMoeExperts, kMoeUsed, b.ids, true,
-                      b.matvec, stream_);
-  Matvec(*w.sh_gate, y, b.sg);
-  Matvec(*w.sh_up, y, b.su);
-  SwigluClamp(b.sg, b.su, b.sact, kExpertFf, stream_);
-  Matvec(*w.sh_down, b.sact, b.shared);
-  MoeCombine(b.parts, b.wts, b.shared, out, stream_);
+           b.wts, stream_, T);
+  if (T == 1) {
+    MatvecExperts(w.exp_gate->type, w.exp_gate->data, b.y, b.gate, kExpertFf,
+                  kHidden, kMoeExperts, kMoeUsed, b.ids, false, b.matvec,
+                  stream_);
+    MatvecExperts(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf, kHidden,
+                  kMoeExperts, kMoeUsed, b.ids, false, b.matvec, stream_);
+    SwigluClamp(b.gate, b.up, b.act, kMoeUsed * kExpertFf, stream_);
+    MatvecExperts(w.exp_down->type, w.exp_down->data, b.act, b.parts, kHidden,
+                  kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
+                  stream_);
+  } else {
+    ExpertsGemm(w.exp_gate->type, w.exp_gate->data, b.y, b.gate, kExpertFf,
+                kHidden, T, kMoeExperts, kMoeUsed, b.ids, stream_);
+    ExpertsGemm(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf, kHidden,
+                T, kMoeExperts, kMoeUsed, b.ids, stream_);
+    SwigluClamp(b.gate, b.up, b.act, T * kMoeUsed * kExpertFf, stream_);
+    ExpertsGemm(w.exp_down->type, w.exp_down->data, b.act, b.parts, kHidden,
+                kExpertFf, T * kMoeUsed, kMoeExperts, 1, b.ids, stream_);
+  }
+  Proj(*w.sh_gate, b.y, b.sg, T);
+  Proj(*w.sh_up, b.y, b.su, T);
+  SwigluClamp(b.sg, b.su, b.sact, T * kExpertFf, stream_);
+  Proj(*w.sh_down, b.sact, b.shared, T);
+  MoeCombine(b.parts, b.wts, b.shared, b.ffn_out, stream_, T);
 }
 
-bool Executor::Evaluate(Session& session, std::int32_t token,
-                        std::string* error) {
-  if (session.position >= options_.max_context) {
+bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
+                       bool want_logits, std::string* error) {
+  if (T <= 0 || T > static_cast<int>(options_.prefill_chunk)) {
+    if (error != nullptr)
+      *error = "bad chunk size";
+    return false;
+  }
+  if (session.position + static_cast<std::uint32_t>(T) > options_.max_context) {
     if (error != nullptr)
       *error = "context full";
     return false;
   }
   const auto* embd = reader_->FindTensor("token_embd.weight");
-  if (token < 0 || static_cast<std::uint64_t>(token) >= embd->dimensions[1]) {
-    if (error != nullptr)
-      *error = "token out of range";
-    return false;
-  }
-  std::vector<float> row(kHidden);
+  std::vector<float> host(static_cast<std::size_t>(T) * kStreams * kHidden);
   const std::size_t row_bytes = embd->size_bytes / embd->dimensions[1];
-  const char* src = static_cast<const char*>(embd->data) +
-                    static_cast<std::size_t>(token) * row_bytes;
-  switch (embd->type) {
-    case GgmlType::kQ6_K:
-      quant::DequantizeQ6_K(src, row.data(), kHidden);
-      break;
-    case GgmlType::kQ8_0:
-      quant::DequantizeQ8_0(src, row.data(), kHidden);
-      break;
-    case GgmlType::kF32:
-      std::memcpy(row.data(), src, kHidden * sizeof(float));
-      break;
-    default:
+  for (int t = 0; t < T; ++t) {
+    const std::int32_t token = tokens[t];
+    if (token < 0 || static_cast<std::uint64_t>(token) >= embd->dimensions[1]) {
       if (error != nullptr)
-        *error = "unsupported embedding type";
+        *error = "token out of range";
       return false;
+    }
+    float* row = host.data() + static_cast<std::size_t>(t) * kStreams * kHidden;
+    const char* src = static_cast<const char*>(embd->data) +
+                      static_cast<std::size_t>(token) * row_bytes;
+    switch (embd->type) {
+      case GgmlType::kQ6_K:
+        quant::DequantizeQ6_K(src, row, kHidden);
+        break;
+      case GgmlType::kQ8_0:
+        quant::DequantizeQ8_0(src, row, kHidden);
+        break;
+      case GgmlType::kF32:
+        std::memcpy(row, src, kHidden * sizeof(float));
+        break;
+      default:
+        if (error != nullptr)
+          *error = "unsupported embedding type";
+        return false;
+    }
+    for (int s = 1; s < kStreams; ++s) {
+      std::memcpy(row + s * kHidden, row, kHidden * sizeof(float));
+    }
   }
-  float* x = session.residual[session.current];
-  for (int s = 0; s < kStreams; ++s) {
-    hipMemcpyAsync(x + s * kHidden, row.data(), kHidden * sizeof(float),
-                   hipMemcpyHostToDevice, stream_);
-  }
+  Scratch& b = *scratch_;
+  int cur = 0;
+  hipMemcpyAsync(b.x[cur], host.data(), host.size() * sizeof(float),
+                 hipMemcpyHostToDevice, stream_);
   hipStreamSynchronize(stream_);
 
-  const Scratch& b = *scratch_;
   for (std::uint32_t layer = 0; layer < layers_; ++layer) {
     const LayerWeights& w = weights_[layer];
-    float* cur = session.residual[session.current];
-    float* nxt = session.residual[1 - session.current];
-
-    HcPre(cur, w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
+    HcPre(b.x[cur], w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
           w.hc_attn_base->f32(), w.attn_norm->f32(), config_.hc_eps, b.y,
-          b.post, b.comb, stream_);
+          b.post, b.comb, stream_, T);
     if (w.kda) {
-      KdaBlock(layer, session, b.y, b.block);
+      KdaBlock(layer, session, T);
     } else {
-      DsaBlock(layer, session, b.y, b.block);
+      DsaBlock(layer, session, T);
     }
-    HcPost(cur, b.block, b.post, b.comb, nxt, stream_);
-    session.current = 1 - session.current;
+    HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
+    cur = 1 - cur;
 
-    cur = session.residual[session.current];
-    nxt = session.residual[1 - session.current];
-    HcPre(cur, w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(), w.hc_ffn_base->f32(),
-          w.ffn_norm->f32(), config_.hc_eps, b.y, b.post, b.comb, stream_);
-    FfnBlock(layer, b.y, b.ffn_out);
-    HcPost(cur, b.ffn_out, b.post, b.comb, nxt, stream_);
-    session.current = 1 - session.current;
+    HcPre(b.x[cur], w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(),
+          w.hc_ffn_base->f32(), w.ffn_norm->f32(), config_.hc_eps, b.y, b.post,
+          b.comb, stream_, T);
+    FfnBlock(layer, T);
+    HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
+    cur = 1 - cur;
   }
-  if (options_.head) {
+  last_residual_ =
+      b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
+  if (want_logits && options_.head) {
     const DeviceTensor& norm = *Find("output_norm.weight");
     const DeviceTensor& out = *Find("output.weight");
-    HeadNorm(session.residual[session.current], norm.f32(), b.head_in, stream_);
-    Matvec(out, b.head_in, b.logits);
+    HeadNorm(last_residual_, norm.f32(), b.head_in, stream_);
+    Proj(out, b.head_in, b.logits, 1);
   }
-  ++session.position;
+  session.position += static_cast<std::uint32_t>(T);
   if (hipStreamSynchronize(stream_) != hipSuccess ||
       hipGetLastError() != hipSuccess) {
     if (error != nullptr)
-      *error = "HIP error during evaluate";
+      *error = "HIP error during forward";
     return false;
+  }
+  return true;
+}
+
+bool Executor::Evaluate(Session& session, std::int32_t token,
+                        std::string* error) {
+  return Forward(session, &token, 1, true, error);
+}
+
+bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
+                       std::string* error) {
+  if (tokens.empty()) {
+    if (error != nullptr)
+      *error = "empty prompt";
+    return false;
+  }
+  const std::size_t chunk = options_.prefill_chunk;
+  for (std::size_t at = 0; at < tokens.size(); at += chunk) {
+    const std::size_t n = std::min(chunk, tokens.size() - at);
+    const bool last = at + n == tokens.size();
+    if (!Forward(session, tokens.data() + at, static_cast<int>(n), last,
+                 error)) {
+      return false;
+    }
   }
   return true;
 }
@@ -646,10 +686,10 @@ std::vector<float> Executor::Logits(const Session&) {
   return out;
 }
 
-std::vector<float> Executor::Residual(const Session& session) {
+std::vector<float> Executor::Residual(const Session&) {
   std::vector<float> out(kStreams * kHidden);
-  hipMemcpy(out.data(), session.residual[session.current],
-            out.size() * sizeof(float), hipMemcpyDeviceToHost);
+  hipMemcpy(out.data(), last_residual_, out.size() * sizeof(float),
+            hipMemcpyDeviceToHost);
   return out;
 }
 

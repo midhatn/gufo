@@ -40,6 +40,10 @@ __global__ __launch_bounds__(kThreads) void HcPreKernel(
     const float* __restrict__ scale, const float* __restrict__ base,
     const float* __restrict__ norm_w, float eps, float* __restrict__ y,
     float* __restrict__ post_out, float* __restrict__ comb_out) {
+  x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
+  y += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
+  post_out += blockIdx.x * kHcStreams;
+  comb_out += blockIdx.x * kHcStreams * kHcStreams;
   __shared__ float partial[kReduceSlots][kMaxWaves];
   __shared__ float mixes[kHcMixes];
   __shared__ float pre[kHcStreams];
@@ -160,6 +164,12 @@ __global__ void HcPostKernel(const float* __restrict__ x,
   if (i >= kHcHidden) {
     return;
   }
+  const int token = blockIdx.y;
+  x += static_cast<std::size_t>(token) * kStreamsFlat;
+  next += static_cast<std::size_t>(token) * kStreamsFlat;
+  block += static_cast<std::size_t>(token) * kHcHidden;
+  post += token * kHcStreams;
+  comb += token * kHcStreams * kHcStreams;
   const float b = block[i];
   float xs[kHcStreams];
   for (int s = 0; s < kHcStreams; ++s) {
@@ -201,17 +211,17 @@ __global__ __launch_bounds__(kThreads) void HeadNormKernel(
 
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
-          float* post, float* comb, hipStream_t stream) {
-  HcPreKernel<<<1, kThreads, 0, stream>>>(x, fn, scale, base, norm_w, hc_eps, y,
-                                          post, comb);
+          float* post, float* comb, hipStream_t stream, int tokens) {
+  HcPreKernel<<<tokens, kThreads, 0, stream>>>(x, fn, scale, base, norm_w,
+                                               hc_eps, y, post, comb);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
 int HcPost(const float* x, const float* block, const float* post,
-           const float* comb, float* next, hipStream_t stream) {
+           const float* comb, float* next, hipStream_t stream, int tokens) {
   constexpr int kBlock = 256;
-  HcPostKernel<<<(kHcHidden + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
-      x, block, post, comb, next);
+  HcPostKernel<<<dim3((kHcHidden + kBlock - 1) / kBlock, tokens), kBlock, 0,
+                 stream>>>(x, block, post, comb, next);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

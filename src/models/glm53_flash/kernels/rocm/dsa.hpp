@@ -15,9 +15,11 @@ inline constexpr int kDsaTopPools = 512;
 inline constexpr int kDsaMaxVisible = kDsaTopPools * kDsaPool + kDsaPool - 1;
 
 // In-place single-block norms for n <= 16384 elements.
-int RmsNorm(float* x, const float* w, int n, float eps, hipStream_t stream);
+// `rows` consecutive rows of n elements are normalized independently.
+int RmsNorm(float* x, const float* w, int n, float eps, hipStream_t stream,
+            int rows = 1);
 int LayerNorm(float* x, const float* w, const float* b, int n, float eps,
-              hipStream_t stream);
+              hipStream_t stream, int rows = 1);
 
 // Per-layer device caches, one row per token (pooled: one per complete pool).
 struct DsaCache {

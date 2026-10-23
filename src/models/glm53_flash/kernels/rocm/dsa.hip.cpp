@@ -65,6 +65,7 @@ __device__ float BlockMax(float v, float* scratch) {
 __global__ __launch_bounds__(kThreads) void RmsNormKernel(
     float* __restrict__ x, const float* __restrict__ w, int n, float eps) {
   __shared__ float scratch[kMaxWaves];
+  x += static_cast<std::size_t>(blockIdx.x) * n;
   float sq = 0.0F;
   for (int i = threadIdx.x; i < n; i += kThreads) {
     sq += x[i] * x[i];
@@ -79,6 +80,7 @@ __global__ __launch_bounds__(kThreads) void LayerNormKernel(
     float* __restrict__ x, const float* __restrict__ w,
     const float* __restrict__ b, int n, float eps) {
   __shared__ float scratch[kMaxWaves];
+  x += static_cast<std::size_t>(blockIdx.x) * n;
   float sum = 0.0F;
   for (int i = threadIdx.x; i < n; i += kThreads) {
     sum += x[i];
@@ -335,14 +337,15 @@ __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
 
 }  // namespace
 
-int RmsNorm(float* x, const float* w, int n, float eps, hipStream_t stream) {
-  RmsNormKernel<<<1, kThreads, 0, stream>>>(x, w, n, eps);
+int RmsNorm(float* x, const float* w, int n, float eps, hipStream_t stream,
+            int rows) {
+  RmsNormKernel<<<rows, kThreads, 0, stream>>>(x, w, n, eps);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
 int LayerNorm(float* x, const float* w, const float* b, int n, float eps,
-              hipStream_t stream) {
-  LayerNormKernel<<<1, kThreads, 0, stream>>>(x, w, b, n, eps);
+              hipStream_t stream, int rows) {
+  LayerNormKernel<<<rows, kThreads, 0, stream>>>(x, w, b, n, eps);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

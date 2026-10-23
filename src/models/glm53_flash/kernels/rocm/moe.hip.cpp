@@ -28,6 +28,9 @@ __global__ void SwigluClampKernel(const float* __restrict__ gate,
 __global__ __launch_bounds__(kRouteThreads) void MoeRouteKernel(
     const float* __restrict__ logits, const float* __restrict__ bias,
     float scale, int* __restrict__ ids, float* __restrict__ weights) {
+  logits += blockIdx.x * kMoeExperts;
+  ids += blockIdx.x * kMoeUsed;
+  weights += blockIdx.x * kMoeUsed;
   __shared__ float prob[kMoeExperts];
   __shared__ float sel[kMoeExperts];
   __shared__ bool taken[kMoeExperts];
@@ -89,6 +92,11 @@ __global__ void MoeCombineKernel(const float* __restrict__ parts,
   if (c >= kMoeHidden) {
     return;
   }
+  const int token = blockIdx.y;
+  parts += static_cast<std::size_t>(token) * kMoeUsed * kMoeHidden;
+  weights += token * kMoeUsed;
+  shared += static_cast<std::size_t>(token) * kMoeHidden;
+  out += static_cast<std::size_t>(token) * kMoeHidden;
   float acc = 0.0F;
   for (int i = 0; i < kMoeUsed; ++i) {
     acc += weights[i] * parts[i * kMoeHidden + c];
@@ -106,15 +114,16 @@ int SwigluClamp(const float* gate, const float* up, float* act, int n,
 }
 
 int MoeRoute(const float* logits, const float* bias, float scale, int* ids,
-             float* weights, hipStream_t stream) {
-  MoeRouteKernel<<<1, kRouteThreads, 0, stream>>>(logits, bias, scale, ids,
-                                                  weights);
+             float* weights, hipStream_t stream, int tokens) {
+  MoeRouteKernel<<<tokens, kRouteThreads, 0, stream>>>(logits, bias, scale, ids,
+                                                       weights);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
 int MoeCombine(const float* parts, const float* weights, const float* shared,
-               float* out, hipStream_t stream) {
-  MoeCombineKernel<<<(kMoeHidden + kElemThreads - 1) / kElemThreads,
+               float* out, hipStream_t stream, int tokens) {
+  MoeCombineKernel<<<dim3((kMoeHidden + kElemThreads - 1) / kElemThreads,
+                          tokens),
                      kElemThreads, 0, stream>>>(parts, weights, shared, out);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }

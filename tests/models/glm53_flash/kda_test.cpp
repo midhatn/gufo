@@ -190,9 +190,11 @@ bool CheckLayer(const gufo::core::GgufReader& reader, int layer) {
     hipMemcpy(df, f.data(), f.size() * 4, hipMemcpyHostToDevice);
     hipMemcpy(dbraw, braw.data(), braw.size() * 4, hipMemcpyHostToDevice);
     hipMemcpy(dg, g.data(), g.size() * 4, hipMemcpyHostToDevice);
-    int rc = rocm::KdaConv(dqkv, dhist, dcq, dck, dcv, nullptr);
+    int rc = rocm::KdaConv(dqkv, dqkv + kInner, dqkv + 2 * kInner, dhist, dcq,
+                           dck, dcv, nullptr);
     rc |= rocm::KdaGates(df, ddt, da, dbraw, ddecay, dbeta, nullptr);
-    rc |= rocm::KdaRecur(dqkv, ddecay, dbeta, dstate, do_, nullptr);
+    rc |= rocm::KdaRecur(dqkv, dqkv + kInner, dqkv + 2 * kInner, ddecay, dbeta,
+                         dstate, do_, nullptr);
     rc |= rocm::KdaOut(do_, dnorm, dg, nullptr);
     hipDeviceSynchronize();
     const double e = Rel(Host(do_, kInner), ref);

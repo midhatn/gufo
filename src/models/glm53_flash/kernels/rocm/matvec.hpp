@@ -42,6 +42,19 @@ int MatvecExperts(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int n_experts, int n_used, const int* ids,
                   bool x_per_expert, void* scratch, hipStream_t stream);
 
+// Dense GEMM for any n: out[col * m + row], x is [n][k]. Up to 8 columns use
+// the mmvq path, larger batches the mmq GEMM (K a multiple of 256; narrower K
+// falls back to chunks of 8 columns). scratch must hold
+// MatvecScratchBytes(min(n, 8), k). Returns 0 on success.
+int Gemm(int type_code, const void* w, const float* x, float* out, int m, int n,
+         int k, void* scratch, hipStream_t stream);
+
+// Grouped routed-expert GEMM over `tokens` rows of x ([tokens][k]), ids
+// [tokens][n_used]; out[(token * n_used + slot) * m + row]. IQ2_XXS / IQ2_S.
+int ExpertsGemm(int type_code, const void* w, const float* x, float* out, int m,
+                int k, int tokens, int n_experts, int n_used, const int* ids,
+                hipStream_t stream);
+
 }  // namespace gufo::models::glm53_flash::rocm
 
 #endif  // GUFO_MODELS_GLM53_FLASH_KERNELS_ROCM_MATVEC_HPP_
