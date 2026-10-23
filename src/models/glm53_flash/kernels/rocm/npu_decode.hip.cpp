@@ -17,7 +17,8 @@ constexpr int kSliceCols = 1024;
 __global__ __launch_bounds__(kBlockGroups) void NpuDecodeFusedKernel(
     const std::uint8_t* const* __restrict__ hi_streams,
     const std::uint8_t* const* __restrict__ lo_streams, float* out0,
-    float* out1, float* out2, int per_tensor, std::size_t pitch) {
+    float* out1, float* out2, int per_tensor, std::size_t pitch,
+    bool residual) {
   const int slice = blockIdx.y;
   const std::size_t g0 = std::size_t{blockIdx.x} * kBlockGroups;
   __shared__ __attribute__((aligned(16))) std::uint8_t hi[kStageBytes];
@@ -26,8 +27,10 @@ __global__ __launch_bounds__(kBlockGroups) void NpuDecodeFusedKernel(
   if (t < kStageVec) {
     reinterpret_cast<uint4*>(hi)[t] =
         reinterpret_cast<const uint4*>(hi_streams[slice] + g0 * 9)[t];
-    reinterpret_cast<uint4*>(lo)[t] =
-        reinterpret_cast<const uint4*>(lo_streams[slice] + g0 * 9)[t];
+    if (residual) {
+      reinterpret_cast<uint4*>(lo)[t] =
+          reinterpret_cast<const uint4*>(lo_streams[slice] + g0 * 9)[t];
+    }
   }
   __syncthreads();
   const std::size_t tile = g0 / kGroupsPerTile;
@@ -45,7 +48,8 @@ __global__ __launch_bounds__(kBlockGroups) void NpuDecodeFusedKernel(
   const std::uint8_t* ph = hi + gi * 9;
   const std::uint8_t* pl = lo + gi * 9;
   const float mult_hi = ldexpf(1.0F, static_cast<int>(ph[0]) - 127) / 64.0F;
-  const float mult_lo = ldexpf(1.0F, static_cast<int>(pl[0]) - 127) / 64.0F;
+  const float mult_lo =
+      residual ? ldexpf(1.0F, static_cast<int>(pl[0]) - 127) / 64.0F : 0.0F;
   const std::size_t row =
       tile_row * kTileRows + static_cast<std::size_t>((sr * 2 + br) * 8 + rib);
   const int col = tile_col * kTileCols + cc * 8;
@@ -55,8 +59,10 @@ __global__ __launch_bounds__(kBlockGroups) void NpuDecodeFusedKernel(
   float v[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    v[i] = static_cast<float>(static_cast<std::int8_t>(ph[1 + i])) * mult_hi +
-           static_cast<float>(static_cast<std::int8_t>(pl[1 + i])) * mult_lo;
+    v[i] = static_cast<float>(static_cast<std::int8_t>(ph[1 + i])) * mult_hi;
+    if (residual) {
+      v[i] += static_cast<float>(static_cast<std::int8_t>(pl[1 + i])) * mult_lo;
+    }
   }
   *reinterpret_cast<float4*>(dst) = make_float4(v[0], v[1], v[2], v[3]);
   *reinterpret_cast<float4*>(dst + 4) = make_float4(v[4], v[5], v[6], v[7]);
@@ -66,11 +72,11 @@ __global__ __launch_bounds__(kBlockGroups) void NpuDecodeFusedKernel(
 
 int NpuDecodeFused(const std::uint8_t* const* hi, const std::uint8_t* const* lo,
                    float* out0, float* out1, float* out2, int tokens,
-                   int slices, int per_tensor, std::size_t pitch,
+                   int slices, int per_tensor, std::size_t pitch, bool residual,
                    hipStream_t stream) {
   const int blocks = tokens * kSliceCols / 8 / kBlockGroups;
   NpuDecodeFusedKernel<<<dim3(blocks, slices), kBlockGroups, 0, stream>>>(
-      hi, lo, out0, out1, out2, per_tensor, pitch);
+      hi, lo, out0, out1, out2, per_tensor, pitch, residual);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

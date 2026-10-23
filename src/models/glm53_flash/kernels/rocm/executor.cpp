@@ -37,6 +37,7 @@ constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
 constexpr int kQkvSlices = 3 * kKdaInner / 1024;
 constexpr int kNpuPasses = 2;
+constexpr int kShexpSlices = 2 * kExpertFf / 1024;
 constexpr int kQLora = 1536;
 constexpr std::uint32_t kPairTileRows = 128;
 constexpr std::uint32_t kDownTileRows = 64;
@@ -181,7 +182,8 @@ Executor::~Executor() {
     hipStreamDestroy(capture_stream_);
   if (staging_ != nullptr)
     hipHostFree(staging_);
-  for (const auto* table : npu_tab_)
+  for (const auto* table :
+       {npu_tab_[0], npu_tab_[1], npu_sh_tab_[0], npu_sh_tab_[1]})
     if (table != nullptr)
       hipFree(const_cast<std::uint8_t**>(table));
   if (blas_ != nullptr)
@@ -364,6 +366,8 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     cfg.k = kHidden;
     std::string npu_error;
     ex->npu_ = qfn::NpuGemm::Create(cfg, &npu_error);
+    if (const char* p = std::getenv("GUFO_GLM53_NPU_PASSES"))
+      ex->npu_passes_ = std::atoi(p) == 1 ? 1 : 2;
     if (ex->npu_ == nullptr)
       std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
   }
@@ -468,6 +472,12 @@ bool Executor::SetupNpu(std::string*) {
         return drop("buffers", npu_error);
       npu_c_[bank].push_back(id);
     }
+    for (int i = 0; i < kShexpSlices; ++i) {
+      const int id = npu_->NewBuffer(npu_->CBytes(), &npu_error);
+      if (id < 0)
+        return drop("buffers", npu_error);
+      npu_sh_c_[bank].push_back(id);
+    }
   }
   for (int bank = 0; bank < 2; ++bank) {
     std::vector<const std::uint8_t*> table;
@@ -481,6 +491,38 @@ bool Executor::SetupNpu(std::string*) {
             hipSuccess)
       return drop("stream table", "");
     npu_tab_[bank] = static_cast<const std::uint8_t**>(dev);
+    std::vector<const std::uint8_t*> sh_table;
+    for (const int id : npu_sh_c_[bank])
+      sh_table.push_back(
+          static_cast<const std::uint8_t*>(npu_->Staged(nullptr, id)));
+    const std::size_t sh_bytes = sh_table.size() * sizeof(sh_table[0]);
+    void* sh_dev = nullptr;
+    if (hipMalloc(&sh_dev, sh_bytes) != hipSuccess ||
+        hipMemcpy(sh_dev, sh_table.data(), sh_bytes, hipMemcpyHostToDevice) !=
+            hipSuccess)
+      return drop("stream table", "");
+    npu_sh_tab_[bank] = static_cast<const std::uint8_t**>(sh_dev);
+  }
+  npu_sh_.assign(layers_, {});
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    if (w.dense || w.sh_gate == nullptr || w.sh_up == nullptr ||
+        w.sh_gate->rows != kExpertFf || w.sh_up->rows != kExpertFf)
+      continue;
+    std::vector<int> ids;
+    for (const DeviceTensor* t : {w.sh_gate, w.sh_up}) {
+      for (std::uint32_t slice = 0; slice < kExpertFf / npu_->n(); ++slice) {
+        const int id = npu_->NewBuffer(npu_->BBytes(), &npu_error);
+        if (id < 0)
+          return drop("weights", npu_error);
+        qfn::NpuEncodeWeightsQuant(t->data, static_cast<std::uint32_t>(t->type),
+                                   kHidden, slice * npu_->n(), npu_->n(),
+                                   kHidden, 0, kHidden, npu_->Device(id),
+                                   nullptr);
+        ids.push_back(id);
+      }
+    }
+    npu_sh_[layer] = std::move(ids);
   }
   npu_qkv_.assign(layers_, {});
   std::uint32_t staged = 0;
@@ -510,6 +552,19 @@ bool Executor::SetupNpu(std::string*) {
   for (std::uint32_t layer = 0; layer < layers_; ++layer) {
     for (const int id : npu_qkv_[layer])
       npu_->FinalizeWeights(id);
+    for (const int id : npu_sh_[layer])
+      npu_->FinalizeWeights(id);
+    if (!npu_sh_[layer].empty()) {
+      const LayerWeights& sw = weights_[layer];
+      for (const DeviceTensor* t : {sw.sh_gate, sw.sh_up}) {
+        auto* owned = const_cast<DeviceTensor*>(t);
+        if (owned->q8_owned && owned->q8 != nullptr) {
+          hipFree(owned->q8);
+          owned->q8 = nullptr;
+          owned->q8_owned = false;
+        }
+      }
+    }
     if (npu_qkv_[layer].empty())
       continue;
     const LayerWeights& w = weights_[layer];
@@ -927,7 +982,6 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
   namespace qfn = gufo::models::qwen38_flash_next::rocm;
   const Scratch& b = *scratch_;
   const std::uint32_t slots = static_cast<std::uint32_t>(T) * kMoeUsed;
-  ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
   qfn::ExpertCounts(b.ids, b.counts, T, kMoeExperts, kMoeUsed, stream_);
   hipMemcpyAsync(b.host_counts, b.counts, kMoeExperts * sizeof(std::uint32_t),
                  hipMemcpyDeviceToHost, stream_);
@@ -971,6 +1025,26 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
   (void)slots;
 }
 
+void Executor::NpuShexpQueue(std::uint32_t layer) const {
+  const Scratch& b = *scratch_;
+  const int bank = shexp_bank_;
+  qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
+                            npu_->tokens(), kHidden, 0, kHidden,
+                            npu_->Device(npu_a_[bank][0]), stream_, false);
+  npu_->Submit(stream_, npu_a_[bank][0], npu_sh_[layer].data(),
+               npu_sh_c_[bank].data(), kShexpSlices);
+  npu_sh_ticket_[bank] = npu_->Ticket();
+}
+
+void Executor::NpuShexpFinish() const {
+  const Scratch& b = *scratch_;
+  const int bank = shexp_bank_;
+  npu_->Wait(stream_, npu_sh_ticket_[bank]);
+  NpuDecodeFused(npu_sh_tab_[bank], npu_sh_tab_[bank], b.sg, b.su, b.su,
+                 static_cast<int>(npu_->tokens()), kShexpSlices,
+                 kShexpSlices / 2, kExpertFf, false, stream_);
+}
+
 void Executor::FfnBlock(std::uint32_t layer, int T) const {
   const LayerWeights& w = weights_[layer];
   const Scratch& b = *scratch_;
@@ -996,6 +1070,9 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
   }
   MoeRoute(b.rlogits, w.router_bias->f32(), config_.expert_weights_scale, b.ids,
            b.wts, stream_, T);
+  const bool shexp_npu = shexp_bank_ >= 0 && T > 1 &&
+                         T == static_cast<int>(npu_->tokens()) &&
+                         layer < npu_sh_.size() && !npu_sh_[layer].empty();
   if (T == 1) {
     MatvecExperts(w.exp_gate->type, w.exp_gate->data, b.y, b.gate, kExpertFf,
                   kHidden, kMoeExperts, kMoeUsed, b.ids, false, b.matvec,
@@ -1007,10 +1084,17 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                   kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
                   stream_);
   } else {
+    ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
+    if (shexp_npu)
+      NpuShexpQueue(layer);
     RoutedExpertsF16(w, T);
   }
-  Proj(*w.sh_gate, y, b.sg, T);
-  Proj(*w.sh_up, y, b.su, T);
+  if (shexp_npu) {
+    NpuShexpFinish();
+  } else {
+    Proj(*w.sh_gate, y, b.sg, T);
+    Proj(*w.sh_up, y, b.su, T);
+  }
   SwigluClamp(b.sg, b.su, b.sact, T * kExpertFf, stream_);
   Proj(*w.sh_down, Prep(b.sact, T, kExpertFf), b.shared, T);
   if (T == 1) {
@@ -1264,7 +1348,7 @@ void Executor::NpuQkvQueue(int bank, int T) {
   const Scratch& b = *scratch_;
   const std::vector<int>& ids = npu_qkv_[current_layer_];
   ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
-  for (int pass = 0; pass < kNpuPasses; ++pass) {
+  for (int pass = 0; pass < npu_passes_; ++pass) {
     const int a = npu_a_[bank][pass];
     qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
                               static_cast<std::uint32_t>(T), kHidden, 0,
@@ -1279,7 +1363,8 @@ void Executor::NpuQkvFinish(int bank, int T) const {
   const Scratch& b = *scratch_;
   npu_->Wait(stream_, npu_ticket_[bank]);
   NpuDecodeFused(npu_tab_[bank], npu_tab_[bank] + kQkvSlices, b.kq, b.kk, b.kv,
-                 T, kQkvSlices, kQkvSlices / 3, kKdaInner, stream_);
+                 T, kQkvSlices, kQkvSlices / 3, kKdaInner, npu_passes_ == 2,
+                 stream_);
 }
 
 void Executor::SwapBank() {
@@ -1338,9 +1423,11 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
         SwapBank();
       session.position = pos0 + static_cast<std::uint32_t>(bank * T);
       qkv_bank_ = prepared[bank] ? bank : -1;
+      shexp_bank_ = bank;
       RunLayer(layer, session, T, cur[bank], prepared[bank],
                FfnRows(layer, T, bank == 1 ? logit_rows : 0));
       qkv_bank_ = -1;
+      shexp_bank_ = -1;
       prefetch(bank, layer + 1);
       if (bank == 1)
         SwapBank();

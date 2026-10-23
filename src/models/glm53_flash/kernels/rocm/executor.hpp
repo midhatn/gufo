@@ -189,6 +189,8 @@ private:
   void NpuQkvQueue(int bank, int tokens);
   void NpuQkvFinish(int bank, int tokens) const;
   void SwapBank();
+  void NpuShexpQueue(std::uint32_t layer) const;
+  void NpuShexpFinish() const;
   bool ForwardPair(Session& session, const std::int32_t* tokens, int count,
                    int logit_rows, std::string* error);
   void HcPreStep(const float* x, const DeviceTensor& fn, const float* scale,
@@ -212,6 +214,12 @@ private:
   std::vector<int> npu_c_[2];
   std::uint64_t npu_ticket_[2]{};
   int qkv_bank_{-1};
+  int shexp_bank_{-1};
+  std::vector<std::vector<int>> npu_sh_;
+  std::vector<int> npu_sh_c_[2];
+  const std::uint8_t** npu_sh_tab_[2]{};
+  mutable std::uint64_t npu_sh_ticket_[2]{};
+  int npu_passes_{1};
   const std::uint8_t** npu_tab_[2]{};
   std::uint32_t current_layer_{0};
   hipStream_t stream_{nullptr};

@@ -14,7 +14,7 @@ namespace gufo::models::glm53_flash::rocm {
 // pointer per slice.
 int NpuDecodeFused(const std::uint8_t* const* hi, const std::uint8_t* const* lo,
                    float* out0, float* out1, float* out2, int tokens,
-                   int slices, int per_tensor, std::size_t pitch,
+                   int slices, int per_tensor, std::size_t pitch, bool residual,
                    hipStream_t stream);
 
 }  // namespace gufo::models::glm53_flash::rocm
