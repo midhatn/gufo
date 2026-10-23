@@ -1115,7 +1115,8 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                   kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
                   stream_);
   } else {
-    ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
+    if (!res_half_)
+      ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
     if (shexp_npu)
       NpuShexpQueue(layer);
     RoutedExpertsF16(w, T);
@@ -1359,7 +1360,8 @@ void Executor::HcPreStep(const void* x, const DeviceTensor& fn,
   const Scratch& b = *scratch_;
   if (res_half_) {
     HcPre(static_cast<const std::uint16_t*>(x), fn.f32(), scale, base, norm_w,
-          config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T);
+          config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T,
+          static_cast<std::uint16_t*>(b.x_half));
   } else {
     HcPre(static_cast<const float*>(x), fn.f32(), scale, base, norm_w,
           config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T);
@@ -1402,7 +1404,6 @@ bool Executor::Evaluate(Session& session, std::int32_t token,
 void Executor::NpuQkvQueue(int bank, int T) {
   const Scratch& b = *scratch_;
   const std::vector<int>& ids = npu_qkv_[current_layer_];
-  ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
   for (int pass = 0; pass < npu_passes_; ++pass) {
     const int a = npu_a_[bank][pass];
     qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,

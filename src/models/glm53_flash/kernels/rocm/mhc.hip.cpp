@@ -136,9 +136,13 @@ __global__ __launch_bounds__(32) void HcSinkKernel(
 template<typename X>
 __global__ __launch_bounds__(kThreads) void HcApplyKernel(
     const X* __restrict__ x, const float* __restrict__ scratch_in,
-    const float* __restrict__ norm_w, float* __restrict__ y) {
+    const float* __restrict__ norm_w, float* __restrict__ y,
+    _Float16* __restrict__ y_half) {
   x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
   y += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
+  if (y_half != nullptr) {
+    y_half += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
+  }
   const float* pre = scratch_in +
                      static_cast<std::size_t>(blockIdx.x) * kPreStride +
                      kReduceSlots;
@@ -158,7 +162,11 @@ __global__ __launch_bounds__(kThreads) void HcApplyKernel(
   const float inv = rsqrtf(BlockSum(sq, scratch) / kHcHidden + kRmsEps);
   for (int k = 0; k < kPerThread; ++k) {
     const int i = tid + k * kThreads;
-    y[i] = z[k] * inv * norm_w[i];
+    const float value = z[k] * inv * norm_w[i];
+    y[i] = value;
+    if (y_half != nullptr) {
+      y_half[i] = static_cast<_Float16>(value);
+    }
   }
 }
 
@@ -283,11 +291,12 @@ template<typename X>
 int HcPreImpl(const X* x, const float* fn, const float* scale,
               const float* base, const float* norm_w, float hc_eps, float* y,
               float* post, float* comb, float* scratch, hipStream_t stream,
-              int tokens) {
+              int tokens, _Float16* y_half) {
   HcMixKernel<X><<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
   HcSinkKernel<<<tokens, 32, 0, stream>>>(scratch, scale, base, hc_eps, post,
                                           comb, tokens);
-  HcApplyKernel<X><<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y);
+  HcApplyKernel<X>
+      <<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y, y_half);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -330,17 +339,18 @@ __global__ void HalfToFloatKernel(const _Float16* __restrict__ in,
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens) {
+          int tokens, std::uint16_t* y_half) {
   return HcPreImpl(x, fn, scale, base, norm_w, hc_eps, y, post, comb, scratch,
-                   stream, tokens);
+                   stream, tokens, reinterpret_cast<_Float16*>(y_half));
 }
 
 int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens) {
+          int tokens, std::uint16_t* y_half) {
   return HcPreImpl(reinterpret_cast<const _Float16*>(x), fn, scale, base,
-                   norm_w, hc_eps, y, post, comb, scratch, stream, tokens);
+                   norm_w, hc_eps, y, post, comb, scratch, stream, tokens,
+                   reinterpret_cast<_Float16*>(y_half));
 }
 
 int HcPost(const float* x, const float* block, const float* post,

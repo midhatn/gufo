@@ -22,13 +22,13 @@ inline constexpr int kHcPreScratch = kHcMixes + 1 + kHcStreams;
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens = 1);
+          int tokens = 1, std::uint16_t* y_half = nullptr);
 
 // The same with the residual streams held as F16 (raw bits).
 int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens = 1);
+          int tokens = 1, std::uint16_t* y_half = nullptr);
 
 // next[d] = block * post[d] + sum_s x[s] * comb[d + 4 * s]. next != x.
 int HcPost(const float* x, const float* block, const float* post,
