@@ -21,10 +21,12 @@ if(ENGINE_ENABLE_HIP)
   # and IQ2_S). Same dialect and feature macros as the tier it links.
   add_library(gufo_glm53_flash_rocm STATIC kernels/rocm/matvec.hip.cpp
     kernels/rocm/mhc.hip.cpp
-    kernels/rocm/kda.hip.cpp)
+    kernels/rocm/kda.hip.cpp
+    kernels/rocm/dsa.hip.cpp)
   set_source_files_properties(kernels/rocm/matvec.hip.cpp
     kernels/rocm/mhc.hip.cpp
     kernels/rocm/kda.hip.cpp
+    kernels/rocm/dsa.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_glm53_flash_rocm PROPERTIES
     HIP_STANDARD 17

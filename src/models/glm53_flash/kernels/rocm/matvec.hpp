@@ -26,6 +26,14 @@ std::size_t MatvecScratchBytes(int n, int k);
 int Matvec(int ggml_type, const void* w, const float* x, float* out, int m,
            int n, int k, void* scratch, hipStream_t stream);
 
+// Per-channel matvec: out[c * m + row] = sum_k W[c][row][k] * x[c * k + k'],
+// for `channels` stacked weight slabs of m rows each (attn_k_b / attn_v_b
+// heads). scratch must hold MatvecScratchBytes(channels, k). Returns 0 on
+// success.
+int MatvecBatched(int type_code, const void* w, const float* x, float* out,
+                  int m, int k, int channels, void* scratch,
+                  hipStream_t stream);
+
 }  // namespace gufo::models::glm53_flash::rocm
 
 #endif  // GUFO_MODELS_GLM53_FLASH_KERNELS_ROCM_MATVEC_HPP_

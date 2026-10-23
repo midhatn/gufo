@@ -130,4 +130,13 @@ if(ENGINE_ENABLE_HIP)
   set_tests_properties(glm53.kda PROPERTIES
     LABELS "gpu;glm53;kernel;external-model"
     SKIP_RETURN_CODE 77)
+
+  add_executable(glm53_dsa_test dsa_test.cpp)
+  target_link_libraries(glm53_dsa_test PRIVATE gufo_glm53_flash_rocm)
+  add_test(NAME glm53.dsa
+    COMMAND glm53_dsa_test "${GUFO_GLM53_FLASH_MODEL}")
+  set_tests_properties(glm53.dsa PROPERTIES
+    LABELS "gpu;glm53;kernel;external-model"
+    SKIP_RETURN_CODE 77
+    COST 120)
 endif()
