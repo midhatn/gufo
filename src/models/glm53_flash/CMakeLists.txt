@@ -43,4 +43,12 @@ if(ENGINE_ENABLE_HIP)
   target_include_directories(gufo_glm53_flash_rocm PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(gufo_glm53_flash_rocm PUBLIC
     gufo_glm53_flash gufo_deepseek_v4_flash_mmq)
+
+  # Host-side engine; plain C++20 (the kernel library keeps the C++17 dialect
+  # of the vendored mmq headers).
+  add_library(gufo_glm53_flash_engine STATIC kernels/rocm/executor.cpp)
+  target_include_directories(gufo_glm53_flash_engine PUBLIC
+    ${CMAKE_SOURCE_DIR})
+  target_link_libraries(gufo_glm53_flash_engine PUBLIC
+    gufo_glm53_flash_rocm gufo_core hip::host)
 endif()
