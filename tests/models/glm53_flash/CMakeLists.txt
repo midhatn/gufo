@@ -158,4 +158,15 @@ if(ENGINE_ENABLE_HIP)
     LABELS "gpu;glm53;reference;external-model;slow"
     SKIP_RETURN_CODE 77
     COST 600)
+
+  add_executable(glm53_executor_full_test executor_full_test.cpp)
+  target_link_libraries(glm53_executor_full_test PRIVATE
+    gufo_glm53_flash_engine gufo_glm53_flash)
+  add_test(NAME glm53.executor_full
+    COMMAND glm53_executor_full_test "${GUFO_GLM53_FLASH_MODEL}")
+  set_tests_properties(glm53.executor_full PROPERTIES
+    LABELS "gpu;glm53;reference;external-model;slow"
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "GUFO_GLM53_GOLDENS=$ENV{GUFO_GLM53_GOLDENS}"
+    COST 1200)
 endif()

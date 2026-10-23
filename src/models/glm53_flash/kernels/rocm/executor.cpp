@@ -1,5 +1,8 @@
 #include "src/models/glm53_flash/kernels/rocm/executor.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -16,12 +19,14 @@ namespace {
 using core::GgmlType;
 
 constexpr std::size_t kTailMargin = 4096;
+constexpr std::size_t kUploadChunk = std::size_t{128} << 20;
 constexpr std::size_t kMatvecScratchBytes = 1 << 20;
 constexpr int kHidden = kHcHidden;
 constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
 constexpr int kQLora = 1536;
+constexpr int kFfnScratch = std::max(kDenseFf, kMoeUsed* kExpertFf);
 constexpr int kMlaQ = kDsaHeads * 256;
 constexpr float kRmsEps = 1e-5F;
 constexpr float kKNormEps = 1e-6F;
@@ -123,6 +128,8 @@ Executor::Session::~Session() {
 
 Executor::~Executor() {
   hipDeviceSynchronize();
+  if (staging_ != nullptr)
+    hipHostFree(staging_);
   for (auto& [name, t] : tensors_) {
     if (t.data != nullptr)
       hipFree(t.data);
@@ -174,6 +181,65 @@ Executor::~Executor() {
   }
 }
 
+// Streams a tensor to the device through a pinned staging buffer with large
+// preads. Copying straight from the mapping faults the file in 128 KiB at a
+// time, which both crawls and thrashes the page cache against the device
+// allocations on a unified-memory machine.
+bool Executor::CopyToDevice(void* dst, const core::GgufTensorInfo& t,
+                            std::string* error) {
+  const char* src = static_cast<const char*>(t.data);
+  int fd = -1;
+  std::uint64_t file_offset = 0;
+  for (const auto& region : reader_->GetMappedRegions()) {
+    const char* base = static_cast<const char*>(region.data);
+    if (src >= base && src < base + region.size) {
+      fd = region.file_descriptor;
+      file_offset = static_cast<std::uint64_t>(src - base);
+      break;
+    }
+  }
+  if (fd < 0) {
+    if (hipMemcpy(dst, src, t.size_bytes, hipMemcpyHostToDevice) !=
+        hipSuccess) {
+      if (error != nullptr)
+        *error = "upload failed for " + std::string(t.name);
+      return false;
+    }
+    return true;
+  }
+  if (staging_ == nullptr &&
+      hipHostMalloc(&staging_, kUploadChunk, hipHostMallocDefault) !=
+          hipSuccess) {
+    if (error != nullptr)
+      *error = "pinned staging allocation failed";
+    return false;
+  }
+  for (std::size_t done = 0; done < t.size_bytes;) {
+    const std::size_t n = std::min(kUploadChunk, t.size_bytes - done);
+    std::size_t got = 0;
+    while (got < n) {
+      const ssize_t r = pread(fd, static_cast<char*>(staging_) + got, n - got,
+                              static_cast<off_t>(file_offset + done + got));
+      if (r <= 0) {
+        if (error != nullptr)
+          *error = "read failed for " + std::string(t.name);
+        return false;
+      }
+      got += static_cast<std::size_t>(r);
+    }
+    if (hipMemcpy(static_cast<char*>(dst) + done, staging_, n,
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      if (error != nullptr)
+        *error = "upload failed for " + std::string(t.name);
+      return false;
+    }
+    posix_fadvise(fd, static_cast<off_t>(file_offset + done),
+                  static_cast<off_t>(n), POSIX_FADV_DONTNEED);
+    done += n;
+  }
+  return true;
+}
+
 bool Executor::Upload(const std::string& name, std::string* error) {
   const auto* t = reader_->FindTensor(name);
   if (t == nullptr) {
@@ -201,10 +267,7 @@ bool Executor::Upload(const std::string& name, std::string* error) {
       *error = "hipMalloc failed for " + name;
     return false;
   }
-  if (hipMemcpy(d.data, t->data, t->size_bytes, hipMemcpyHostToDevice) !=
-      hipSuccess) {
-    if (error != nullptr)
-      *error = "upload failed for " + name;
+  if (!CopyToDevice(d.data, *t, error)) {
     hipFree(d.data);
     return false;
   }
@@ -370,8 +433,8 @@ bool Executor::AllocScratch(std::string* error) {
        Alloc(&s.qabs, kDsaHeads * kDsaLatent, error) &&
        Alloc(&s.ctx, kDsaHeads * kDsaLatent, error) &&
        Alloc(&s.vout, kMlaQ, error) && Alloc(&s.sel, kDsaTopPools, error);
-  ok = ok && Alloc(&s.gate, kDenseFf, error) && Alloc(&s.up, kDenseFf, error) &&
-       Alloc(&s.act, kDenseFf, error) &&
+  ok = ok && Alloc(&s.gate, kFfnScratch, error) &&
+       Alloc(&s.up, kFfnScratch, error) && Alloc(&s.act, kFfnScratch, error) &&
        Alloc(&s.rlogits, kMoeExperts, error) &&
        Alloc(&s.wts, kMoeUsed, error) &&
        Alloc(&s.parts, kMoeUsed * kHidden, error) &&

@@ -73,6 +73,8 @@ private:
   struct LayerWeights;
   struct Scratch;
 
+  bool CopyToDevice(void* dst, const core::GgufTensorInfo& t,
+                    std::string* error);
   bool Upload(const std::string& name, std::string* error);
   const DeviceTensor* Find(const std::string& name) const;
   bool Resolve(std::string* error);
@@ -93,6 +95,7 @@ private:
   std::vector<LayerWeights> weights_;
   std::unique_ptr<Scratch> scratch_;
   hipStream_t stream_{nullptr};
+  void* staging_{nullptr};
 };
 
 }  // namespace gufo::models::glm53_flash::rocm
