@@ -174,8 +174,8 @@ private:
   void Proj(const DeviceTensor& w, const Act& x, float* out, int tokens) const;
   void KdaBlock(std::uint32_t layer, Session& s, int tokens) const;
   void DsaBlock(std::uint32_t layer, Session& s, int tokens) const;
-  void HeadGemm(const DeviceTensor& w, const float* in, float* out, int tokens,
-                int k, int rows) const;
+  void HeadGemm(const DeviceTensor& w, float* out, int tokens, int k,
+                int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
   void ShexpGateUp(const LayerWeights& w, const Act& y, int tokens) const;

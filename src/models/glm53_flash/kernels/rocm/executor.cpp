@@ -116,7 +116,7 @@ struct Executor::Scratch {
       *g2{}, *o{};
   // DSA
   float *qr{}, *q{}, *lat{}, *iq{}, *ik{}, *gt{}, *wp{}, *scores{}, *qabs{},
-      *ctx{}, *vout{}, *q_heads{}, *v_heads{};
+      *ctx{}, *vout{}, *v_heads{};
   void* head_half{};
   int* sel{};
   // FFN
@@ -635,10 +635,9 @@ bool Executor::AllocScratch(std::string* error) {
   s.score_stride = static_cast<long long>(pools);
   take(&s.scores, c * pools);
   take(&s.qabs, c * kDsaHeads * kDsaLatent);
-  take(&s.ctx, c * kDsaHeads * kDsaLatent);
+  take(&s.ctx, std::size_t{kDsaHeads} * kDsaLatent);
   take(reinterpret_cast<std::uint16_t**>(&s.head_half),
        c * kDsaHeads * kDsaLatent);
-  take(&s.q_heads, c * kMlaQ);
   take(&s.v_heads, c * kMlaQ);
   take(&s.vout, c * kMlaQ);
   take(&s.sel, c * kDsaTopPools);
@@ -748,10 +747,9 @@ void Executor::Proj(const DeviceTensor& w, const Act& x, float* out,
 // out[h][t][r] = sum_k W_h[r][k] * in[h][t][k] for the 64 head slabs of a
 // stacked [64][rows][k] tensor: one strided-batched GEMM over F16 copies of
 // the slabs and the F16 activations.
-void Executor::HeadGemm(const DeviceTensor& w, const float* in, float* out,
-                        int T, int k, int rows) const {
+void Executor::HeadGemm(const DeviceTensor& w, float* out, int T, int k,
+                        int rows) const {
   const Scratch& b = *scratch_;
-  ToHalf(in, b.head_half, static_cast<long long>(kDsaHeads) * T * k, stream_);
   const auto handle = static_cast<hipblasHandle_t>(blas_);
   hipblasSetStream(handle, stream_);
   const float alpha = 1.0F;
@@ -848,13 +846,14 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     Mark(6);
     // attn_k_b / attn_v_b are 64 stacked per-head slabs: one GEMM per head
     // over all tokens, in the head-major layout the attention kernel reads.
-    HeadMajor(b.q, b.q_heads, T, kDsaHeads, 256, stream_);
-    HeadGemm(*w.k_b, b.q_heads, b.qabs, T, 256, kDsaLatent);
+    HeadMajor(b.q, static_cast<std::uint16_t*>(b.head_half), T, kDsaHeads, 256,
+              stream_);
+    HeadGemm(*w.k_b, b.qabs, T, 256, kDsaLatent);
     Mark(7);
     DsaAttendBatch(b.qabs, st.cache.lat_half, b.sel, pos0, T, top, 1.0F / 16.0F,
-                   b.ctx, stream_);
+                   static_cast<std::uint16_t*>(b.head_half), stream_);
     Mark(8);
-    HeadGemm(*w.v_b, b.ctx, b.v_heads, T, kDsaLatent, 256);
+    HeadGemm(*w.v_b, b.v_heads, T, kDsaLatent, 256);
     TokenMajor(b.v_heads, b.vout, T, kDsaHeads, 256, stream_);
     Mark(7);
   } else if (T == 1) {

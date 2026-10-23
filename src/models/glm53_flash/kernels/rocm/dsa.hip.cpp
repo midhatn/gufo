@@ -187,8 +187,8 @@ __global__ void DsaPoolKernel(DsaCache cache, const float* __restrict__ ape,
 
 // out[h][t][i] = in[t][h][i] for `heads` slabs of `width` floats.
 __global__ void HeadMajorKernel(const float* __restrict__ in,
-                                float* __restrict__ out, int tokens, int heads,
-                                int width) {
+                                _Float16* __restrict__ out, int tokens,
+                                int heads, int width) {
   const long long n = static_cast<long long>(tokens) * heads * width;
   for (long long i =
            static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -197,7 +197,8 @@ __global__ void HeadMajorKernel(const float* __restrict__ in,
     const long long th = i / width;
     const int h = static_cast<int>(th % heads);
     const int t = static_cast<int>(th / heads);
-    out[(static_cast<std::size_t>(h) * tokens + t) * width + w] = in[i];
+    out[(static_cast<std::size_t>(h) * tokens + t) * width + w] =
+        static_cast<_Float16>(in[i]);
   }
 }
 
@@ -570,7 +571,7 @@ constexpr int kAttnChanTiles = kDsaLatent / 2 / 16;
 __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
     const float* __restrict__ qf, const _Float16* __restrict__ lat,
     const int* __restrict__ selected, int pos0, int tokens, int top,
-    float scale, float* __restrict__ ctx) {
+    float scale, _Float16* __restrict__ ctx) {
   const int token = blockIdx.x;
   const int pos = pos0 + token;
   const int nselected = min((pos + 1) / kDsaPool, top);
@@ -706,7 +707,7 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
       const float inv = 1.0F / denom[group * 16 + h];
       ctx[(static_cast<std::size_t>(group * 16 + h) * tokens + token) *
               kDsaLatent +
-          c] = acc[t][i] * inv;
+          c] = static_cast<_Float16>(acc[t][i] * inv);
     }
   }
 }
@@ -838,16 +839,17 @@ int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
 
 int DsaAttendBatch(const float* qabs, const std::uint16_t* lat_half,
                    const int* selected, int pos0, int tokens, int top_pools,
-                   float scale, float* ctx, hipStream_t stream) {
+                   float scale, std::uint16_t* ctx_half, hipStream_t stream) {
   DsaAttendWmmaKernel<<<tokens, kAttnWaves * kWaveLanes, 0, stream>>>(
       qabs, reinterpret_cast<const _Float16*>(lat_half), selected, pos0, tokens,
-      top_pools, scale, ctx);
+      top_pools, scale, reinterpret_cast<_Float16*>(ctx_half));
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int HeadMajor(const float* in, float* out, int tokens, int heads, int width,
-              hipStream_t stream) {
-  HeadMajorKernel<<<2048, 256, 0, stream>>>(in, out, tokens, heads, width);
+int HeadMajor(const float* in, std::uint16_t* out, int tokens, int heads,
+              int width, hipStream_t stream) {
+  HeadMajorKernel<<<2048, 256, 0, stream>>>(
+      in, reinterpret_cast<_Float16*>(out), tokens, heads, width);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
