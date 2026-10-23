@@ -34,6 +34,14 @@ int MatvecBatched(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int channels, void* scratch,
                   hipStream_t stream);
 
+// Routed-expert matvec: out[i * m + row] = sum_k W[ids[i]][row][k] * x_i[k]
+// for i < n_used, with W stacked [n_experts][m][k] in its block format. x is
+// one [k] row shared by all experts, or [n_used][k] when x_per_expert.
+// scratch must hold MatvecScratchBytes(x_per_expert ? n_used : 1, k).
+int MatvecExperts(int type_code, const void* w, const float* x, float* out,
+                  int m, int k, int n_experts, int n_used, const int* ids,
+                  bool x_per_expert, void* scratch, hipStream_t stream);
+
 }  // namespace gufo::models::glm53_flash::rocm
 
 #endif  // GUFO_MODELS_GLM53_FLASH_KERNELS_ROCM_MATVEC_HPP_

@@ -96,4 +96,31 @@ int MatvecBatched(int type_code, const void* w, const float* x, float* out,
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
+int MatvecExperts(int type_code, const void* w, const float* x, float* out,
+                  int m, int k, int n_experts, int n_used, const int* ids,
+                  bool x_per_expert, void* scratch, hipStream_t stream) {
+  if (w == nullptr || x == nullptr || out == nullptr || scratch == nullptr ||
+      ids == nullptr || type_code == kTypeF32 || m <= 0 || k <= 0 ||
+      n_used <= 0 || n_experts <= 0) {
+    return -1;
+  }
+  const auto type = static_cast<ggml_type>(type_code);
+  const int channels_y = x_per_expert ? n_used : 1;
+  const std::int64_t padded =
+      GGML_PAD(static_cast<std::int64_t>(k), MATRIX_ROW_PADDING);
+  ds4_quantize_row_q8_1_hip(x, nullptr, scratch, type, k, k,
+                            static_cast<std::int64_t>(k) * channels_y,
+                            static_cast<std::int64_t>(k) * channels_y, padded,
+                            channels_y, 1, 1, stream);
+  const int blck = static_cast<int>(ggml_blck_size(type));
+  const int stride_row_x = k / blck;
+  const int stride_col_y = static_cast<int>(padded / QK8_1);
+  ds4_ggml_hip_mm_fusion_args_device fusion = {};
+  mul_mat_vec_q_switch_type(w, type, scratch, ids, fusion, out, k, m, 1,
+                            stride_row_x, stride_col_y, m, n_experts,
+                            channels_y, n_used, m * stride_row_x, stride_col_y,
+                            m, 1, 1, 0, 0, 0, 0, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
 }  // namespace gufo::models::glm53_flash::rocm
