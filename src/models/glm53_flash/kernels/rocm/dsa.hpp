@@ -75,7 +75,8 @@ int DsaScoresBatch(const float* iq, const float* proj, const float* pooled,
 int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
                    int tokens, int top_pools, int* selected,
                    hipStream_t stream);
-int DsaAttendBatch(const float* qabs, const float* lat, const int* selected,
+// qabs_half: the head-major absorbed queries as F16.
+int DsaAttendBatch(const void* qabs_half, const float* lat, const int* selected,
                    int pos0, int tokens, int top_pools, float scale, float* ctx,
                    hipStream_t stream);
 
