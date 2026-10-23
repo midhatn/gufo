@@ -34,7 +34,7 @@ constexpr int kHidden = kHcHidden;
 constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
-constexpr int kNpuShexpSlices = 8;
+constexpr int kNpuPassSlices = 8;
 constexpr int kQLora = 1536;
 constexpr std::uint32_t kPairTileRows = 128;
 constexpr std::uint32_t kDownTileRows = 64;
@@ -446,7 +446,7 @@ bool Executor::SetupNpu(std::string*) {
   npu_a_ = npu_->NewBuffer(npu_->ABytes(), &npu_error);
   npu_a_lo_ = npu_->NewBuffer(npu_->ABytes(), &npu_error);
   bool ok = npu_a_ >= 0 && npu_a_lo_ >= 0;
-  for (int i = 0; i < kNpuShexpSlices && ok; ++i) {
+  for (int i = 0; i < 2 * kNpuPassSlices && ok; ++i) {
     const int id = npu_->NewBuffer(npu_->CBytes(), &npu_error);
     ok = id >= 0;
     npu_c_.push_back(id);
@@ -476,17 +476,44 @@ bool Executor::SetupNpu(std::string*) {
       npu_shexp_[layer] = std::move(ids);
     ++staged_layers;
   }
+  npu_kv_.assign(layers_, {});
+  std::uint32_t kv_layers = 0;
+  for (std::uint32_t layer = 0; layer < layers_ && ok; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    if (!w.kda || w.attn_v == nullptr || w.attn_v->rows != kKdaInner)
+      continue;
+    std::vector<int> ids;
+    for (std::uint32_t slice = 0; slice < kKdaInner / npu_->n(); ++slice) {
+      const int id = npu_->NewBuffer(npu_->BBytes(), &npu_error);
+      if (id < 0) {
+        ok = false;
+        break;
+      }
+      qfn::NpuEncodeWeightsQuant(w.attn_v->data,
+                                 static_cast<std::uint32_t>(w.attn_v->type),
+                                 kHidden, slice * npu_->n(), npu_->n(), kHidden,
+                                 0, kHidden, npu_->Device(id), nullptr);
+      ids.push_back(id);
+    }
+    if (ok) {
+      npu_kv_[layer] = std::move(ids);
+      ++kv_layers;
+    }
+  }
   ok = ok && hipDeviceSynchronize() == hipSuccess;
   if (!ok) {
     std::fprintf(stderr, "NPU buffers unavailable: %s\n", npu_error.c_str());
     npu_.reset();
     npu_shexp_.clear();
+    npu_kv_.clear();
     return true;
   }
-  for (const auto& ids : npu_shexp_)
-    for (const int id : ids)
-      npu_->FinalizeWeights(id);
-  std::fprintf(stderr, "NPU: shared expert of %u layers\n", staged_layers);
+  for (const auto* table : {&npu_shexp_, &npu_kv_})
+    for (const auto& ids : *table)
+      for (const int id : ids)
+        npu_->FinalizeWeights(id);
+  std::fprintf(stderr, "NPU: shared expert of %u layers, KDA v of %u layers\n",
+               staged_layers, kv_layers);
   return true;
 }
 
@@ -741,11 +768,17 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   LayerState& st = s.layers[layer];
   arena_used_ = 0;
   const Act y = Prep(b.y, T, kHidden);
-  Proj(*w.attn_q, y, b.kq, T);
-  Proj(*w.attn_k, y, b.kk, T);
-  Proj(*w.attn_v, y, b.kv, T);
   const bool record = recording_ && !s.kda_log.empty() &&
                       T <= static_cast<int>(options_.logit_rows);
+  const bool v_on_npu =
+      !record && layer < npu_kv_.size() && !npu_kv_[layer].empty() &&
+      T == 4096 &&
+      (ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_),
+       NpuQueue(npu_kv_[layer], T));
+  Proj(*w.attn_q, y, b.kq, T);
+  Proj(*w.attn_k, y, b.kk, T);
+  if (!v_on_npu)
+    Proj(*w.attn_v, y, b.kv, T);
   if (record) {
     const std::size_t bytes =
         static_cast<std::size_t>(T) * kKdaInner * sizeof(float);
@@ -756,8 +789,6 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
     hipMemcpyAsync(s.kda_log[layer].raw_v, b.kv, bytes, hipMemcpyDeviceToDevice,
                    stream_);
   }
-  KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
-          w.conv_v->f32(), stream_, T);
   Proj(*w.ssm_f_a, y, b.fa, T);
   Proj(*w.ssm_f_b, Prep(b.fa, T, kKdaHeadDim), b.fproj, T);
   Proj(*w.ssm_beta, y, b.braw, T);
@@ -771,9 +802,15 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
                    static_cast<std::size_t>(T) * kKdaHeads * sizeof(float),
                    hipMemcpyDeviceToDevice, stream_);
   }
-  KdaRecur(b.kq, b.kk, b.kv, b.decay, b.beta, st.state, b.o, stream_, T);
   Proj(*w.ssm_g_a, y, b.ga, T);
   Proj(*w.ssm_g_b, Prep(b.ga, T, kKdaHeadDim), b.g2, T);
+  if (v_on_npu) {
+    float* const outs[] = {b.kv};
+    NpuFinish(outs, kKdaInner, T);
+  }
+  KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
+          w.conv_v->f32(), stream_, T);
+  KdaRecur(b.kq, b.kk, b.kv, b.decay, b.beta, st.state, b.o, stream_, T);
   KdaOut(b.o, w.ssm_norm->f32(), b.g2, stream_, T);
   Proj(*w.attn_output, Prep(b.o, T, kKdaInner), b.block, T);
 }
@@ -915,38 +952,34 @@ void Executor::ShexpGateUp(const LayerWeights& w, const Act& y, int T) const {
   Proj(*w.sh_up, y, b.su, T);
 }
 
-bool Executor::NpuShexp(std::uint32_t layer, int T) const {
-  if (npu_ == nullptr || !npu_->Healthy() || layer >= npu_shexp_.size() ||
-      npu_shexp_[layer].empty() || T != static_cast<int>(npu_->tokens()))
+bool Executor::NpuQueue(const std::vector<int>& ids, int T) const {
+  if (npu_ == nullptr || !npu_->Healthy() || ids.empty() ||
+      T != static_cast<int>(npu_->tokens()))
     return false;
   const Scratch& b = *scratch_;
-  const std::vector<int>& ids = npu_shexp_[layer];
-  const std::uint32_t slices = kExpertFf / npu_->n();
   for (int pass = 0; pass < 2; ++pass) {
-    qfn::NpuEncodeActivations(
-        static_cast<const __half*>(b.x_half), kHidden,
-        static_cast<std::uint32_t>(T), kHidden, 0, kHidden,
-        npu_->Device(pass == 0 ? npu_a_ : npu_a_lo_), stream_, pass == 1);
-    npu_->Submit(stream_, pass == 0 ? npu_a_ : npu_a_lo_, ids.data(),
-                 npu_c_.data() + pass * 2 * slices, 2 * slices);
+    const int a = pass == 0 ? npu_a_ : npu_a_lo_;
+    qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
+                              static_cast<std::uint32_t>(T), kHidden, 0,
+                              kHidden, npu_->Device(a), stream_, pass == 1);
+    npu_->Submit(stream_, a, ids.data(), npu_c_.data() + pass * kNpuPassSlices,
+                 static_cast<int>(ids.size()));
   }
   return true;
 }
 
-void Executor::NpuShexpFinish(std::uint32_t layer, int T) const {
-  const Scratch& b = *scratch_;
-  const std::uint32_t slices = kExpertFf / npu_->n();
+void Executor::NpuFinish(std::span<float* const> outs, std::uint32_t pitch,
+                         int T) const {
+  const std::uint32_t slices = pitch / npu_->n();
   npu_->Wait(stream_);
   for (int pass = 0; pass < 2; ++pass) {
-    for (std::uint32_t i = 0; i < 2 * slices; ++i) {
-      float* out = i < slices ? b.sg : b.su;
-      qfn::NpuDecodeOutput(npu_->Staged(stream_, npu_c_[pass * 2 * slices + i]),
-                           out, static_cast<std::uint32_t>(T), npu_->n(),
-                           kExpertFf, (i % slices) * npu_->n(), pass == 1,
-                           stream_);
+    for (std::uint32_t i = 0; i < outs.size() * slices; ++i) {
+      qfn::NpuDecodeOutput(
+          npu_->Staged(stream_, npu_c_[pass * kNpuPassSlices + i]),
+          outs[i / slices], static_cast<std::uint32_t>(T), npu_->n(), pitch,
+          (i % slices) * npu_->n(), pass == 1, stream_);
     }
   }
-  (void)layer;
 }
 
 void Executor::FfnBlock(std::uint32_t layer, int T) const {
@@ -986,11 +1019,13 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                   stream_);
   } else {
     ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
-    const bool on_npu = NpuShexp(layer, T);
+    const bool on_npu =
+        layer < npu_shexp_.size() && NpuQueue(npu_shexp_[layer], T);
     RoutedExpertsF16(w, T);
-    if (on_npu)
-      NpuShexpFinish(layer, T);
-    else
+    if (on_npu) {
+      float* const outs[] = {b.sg, b.su};
+      NpuFinish(outs, kExpertFf, T);
+    } else
       ShexpGateUp(w, y, T);
   }
   if (T == 1)
