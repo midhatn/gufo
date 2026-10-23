@@ -25,7 +25,8 @@ if(ENGINE_ENABLE_HIP)
     kernels/rocm/dsa.hip.cpp
     kernels/rocm/moe.hip.cpp
     kernels/rocm/npu_decode.hip.cpp
-    kernels/rocm/router.hip.cpp)
+    kernels/rocm/router.hip.cpp
+    kernels/rocm/embed.hip.cpp)
   set_source_files_properties(kernels/rocm/matvec.hip.cpp
     kernels/rocm/mhc.hip.cpp
     kernels/rocm/kda.hip.cpp
@@ -33,6 +34,7 @@ if(ENGINE_ENABLE_HIP)
     kernels/rocm/moe.hip.cpp
     kernels/rocm/npu_decode.hip.cpp
     kernels/rocm/router.hip.cpp
+    kernels/rocm/embed.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_glm53_flash_rocm PROPERTIES
     HIP_STANDARD 17

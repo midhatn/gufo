@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/glm53_flash/kernels/rocm/embed.hpp"
 #include "src/models/glm53_flash/kernels/rocm/kda.hpp"
 #include "src/models/glm53_flash/kernels/rocm/matvec.hpp"
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
@@ -125,6 +126,7 @@ struct Executor::Scratch {
   int* sel{};
   // FFN
   float *gate{}, *up{}, *act{};
+  int* tok_ids{};
   float *res_last{}, *hc_mixes{}, *rlogits{}, *wts{}, *parts{}, *sg{}, *su{},
       *sact{}, *shared{};
   int* ids{};
@@ -431,10 +433,10 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       }
     }
     ex->dflash_taps_ = options.dflash_layers;
-    if (!ex->Upload("token_embd.weight", error))
-      return nullptr;
-    ex->token_embd_dev_ = ex->tensors_.at("token_embd.weight");
   }
+  if (!ex->Upload("token_embd.weight", error))
+    return nullptr;
+  ex->token_embd_dev_ = ex->tensors_.at("token_embd.weight");
   if (head) {
     for (const char* name : {"output_norm.weight", "output.weight"}) {
       if (!ex->Upload(name, error))
@@ -751,6 +753,7 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.act, c * kFfnScratch);
   take(&s.hc_mixes, c * kHcPreScratch);
   take(&s.res_last, kStreams * kHidden);
+  take(&s.tok_ids, c);
   if (npu_ != nullptr && npu_->tokens() == c) {
     take(&bank_b_.x[0], c * kStreams * kHidden);
     take(&bank_b_.x[1], c * kStreams * kHidden);
@@ -1135,46 +1138,20 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
 bool Executor::EmbedRows(const std::int32_t* tokens, int T, float* dst,
                          std::string* error) {
   const auto* embd = reader_->FindTensor("token_embd.weight");
-  std::vector<float> host(static_cast<std::size_t>(T) * kStreams * kHidden);
   const std::size_t row_bytes = embd->size_bytes / embd->dimensions[1];
   for (int t = 0; t < T; ++t) {
-    const std::int32_t token = tokens[t];
-    if (token < 0 || static_cast<std::uint64_t>(token) >= embd->dimensions[1]) {
+    if (tokens[t] < 0 ||
+        static_cast<std::uint64_t>(tokens[t]) >= embd->dimensions[1]) {
       if (error != nullptr)
         *error = "token out of range";
       return false;
     }
-    float* row = host.data() + static_cast<std::size_t>(t) * kStreams * kHidden;
-    const char* src = static_cast<const char*>(embd->data) +
-                      static_cast<std::size_t>(token) * row_bytes;
-    switch (embd->type) {
-      case GgmlType::kQ6_K:
-        quant::DequantizeQ6_K(src, row, kHidden);
-        break;
-      case GgmlType::kQ8_0:
-        quant::DequantizeQ8_0(src, row, kHidden);
-        break;
-      case GgmlType::kF32:
-        std::memcpy(row, src, kHidden * sizeof(float));
-        break;
-      default:
-        if (error != nullptr)
-          *error = "unsupported embedding type";
-        return false;
-    }
-    for (int s = 1; s < kStreams; ++s) {
-      std::memcpy(row + s * kHidden, row, kHidden * sizeof(float));
-    }
   }
-  if (res_half_) {
-    float* staging = scratch_->parts;
-    hipMemcpyAsync(staging, host.data(), host.size() * sizeof(float),
-                   hipMemcpyHostToDevice, stream_);
-    ToHalf(staging, dst, static_cast<long long>(host.size()), stream_);
-  } else {
-    hipMemcpyAsync(dst, host.data(), host.size() * sizeof(float),
-                   hipMemcpyHostToDevice, stream_);
-  }
+  hipMemcpyAsync(scratch_->tok_ids, tokens,
+                 static_cast<std::size_t>(T) * sizeof(std::int32_t),
+                 hipMemcpyHostToDevice, stream_);
+  EmbedTokens(token_embd_dev_.data, static_cast<std::uint32_t>(embd->type),
+              row_bytes, scratch_->tok_ids, dst, res_half_, T, stream_);
   hipStreamSynchronize(stream_);
   return true;
 }
