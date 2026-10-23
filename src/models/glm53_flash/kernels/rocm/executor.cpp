@@ -16,6 +16,7 @@
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
 #include "src/models/glm53_flash/kernels/rocm/npu_decode.hpp"
+#include "src/models/glm53_flash/kernels/rocm/router.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
@@ -124,8 +125,8 @@ struct Executor::Scratch {
   int* sel{};
   // FFN
   float *gate{}, *up{}, *act{};
-  float *hc_mixes{}, *rlogits{}, *wts{}, *parts{}, *sg{}, *su{}, *sact{},
-      *shared{};
+  float *res_last{}, *hc_mixes{}, *rlogits{}, *wts{}, *parts{}, *sg{}, *su{},
+      *sact{}, *shared{};
   int* ids{};
   // Head
   float *head_in{}, *logits{}, *dflash_capture{};
@@ -182,6 +183,12 @@ Executor::~Executor() {
     hipStreamDestroy(capture_stream_);
   if (staging_ != nullptr)
     hipHostFree(staging_);
+  for (std::uint16_t* p : router_hi_)
+    if (p != nullptr)
+      hipFree(p);
+  for (std::uint16_t* p : router_lo_)
+    if (p != nullptr)
+      hipFree(p);
   for (const auto* table :
        {npu_tab_[0], npu_tab_[1], npu_sh_tab_[0], npu_sh_tab_[1]})
     if (table != nullptr)
@@ -443,9 +450,34 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       }
     }
   }
-  if (!ex->Resolve(error) || !ex->AllocScratch(error) || !ex->SetupNpu(error))
+  if (!ex->Resolve(error) || !ex->AllocScratch(error) ||
+      !ex->SetupRouter(error) || !ex->SetupNpu(error))
     return nullptr;
   return ex;
+}
+
+bool Executor::SetupRouter(std::string* error) {
+  router_hi_.assign(layers_, nullptr);
+  router_lo_.assign(layers_, nullptr);
+  const std::size_t count = std::size_t{kMoeExperts} * kHidden;
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    if (w.dense || w.router == nullptr || w.router->type != kTypeF32)
+      continue;
+    void* hi = nullptr;
+    void* lo = nullptr;
+    if (hipMalloc(&hi, count * 2) != hipSuccess ||
+        hipMalloc(&lo, count * 2) != hipSuccess) {
+      if (error != nullptr)
+        *error = "router split allocation failed";
+      return false;
+    }
+    router_hi_[layer] = static_cast<std::uint16_t*>(hi);
+    router_lo_[layer] = static_cast<std::uint16_t*>(lo);
+    SplitF16(w.router->f32(), router_hi_[layer], router_lo_[layer],
+             static_cast<long long>(count), nullptr);
+  }
+  return hipDeviceSynchronize() == hipSuccess;
 }
 
 bool Executor::SetupNpu(std::string*) {
@@ -718,6 +750,7 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.up, c * kFfnScratch);
   take(&s.act, c * kFfnScratch);
   take(&s.hc_mixes, c * kHcPreScratch);
+  take(&s.res_last, kStreams * kHidden);
   if (npu_ != nullptr && npu_->tokens() == c) {
     take(&bank_b_.x[0], c * kStreams * kHidden);
     take(&bank_b_.x[1], c * kStreams * kHidden);
@@ -1058,13 +1091,8 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
     return;
   }
   if (T >= kWideBatch && w.router->type == kTypeF32) {
-    const auto handle = static_cast<hipblasHandle_t>(blas_);
-    hipblasSetStream(handle, stream_);
-    const float alpha = 1.0F;
-    const float beta = 0.0F;
-    hipblasSgemm(handle, HIPBLAS_OP_T, HIPBLAS_OP_N, kMoeExperts, T, kHidden,
-                 &alpha, w.router->f32(), kHidden, b.y, kHidden, &beta,
-                 b.rlogits, kMoeExperts);
+    RouterGemm(b.y, router_hi_[layer], router_lo_[layer], b.rlogits, T,
+               stream_);
   } else {
     Proj(*w.router, Act{b.y, nullptr}, b.rlogits, T);
   }
@@ -1138,8 +1166,15 @@ bool Executor::EmbedRows(const std::int32_t* tokens, int T, float* dst,
       std::memcpy(row + s * kHidden, row, kHidden * sizeof(float));
     }
   }
-  hipMemcpyAsync(dst, host.data(), host.size() * sizeof(float),
-                 hipMemcpyHostToDevice, stream_);
+  if (res_half_) {
+    float* staging = scratch_->parts;
+    hipMemcpyAsync(staging, host.data(), host.size() * sizeof(float),
+                   hipMemcpyHostToDevice, stream_);
+    ToHalf(staging, dst, static_cast<long long>(host.size()), stream_);
+  } else {
+    hipMemcpyAsync(dst, host.data(), host.size() * sizeof(float),
+                   hipMemcpyHostToDevice, stream_);
+  }
   hipStreamSynchronize(stream_);
   return true;
 }
@@ -1153,12 +1188,31 @@ int Executor::FfnRows(std::uint32_t layer, int T, int logit_rows) const {
   return logit_rows;
 }
 
+void* Executor::ResidualAt(float* base, std::size_t rows_offset) const {
+  const std::size_t elems = rows_offset * kStreams * kHidden;
+  return res_half_ ? static_cast<void*>(reinterpret_cast<std::uint16_t*>(base) +
+                                        elems)
+                   : static_cast<void*>(base + elems);
+}
+
+void Executor::HcPostStep(const void* x, const float* block, void* next,
+                          int T) const {
+  const Scratch& b = *scratch_;
+  if (res_half_) {
+    HcPost(static_cast<const std::uint16_t*>(x), block, b.post, b.comb,
+           static_cast<std::uint16_t*>(next), stream_, T);
+  } else {
+    HcPost(static_cast<const float*>(x), block, b.post, b.comb,
+           static_cast<float*>(next), stream_, T);
+  }
+}
+
 void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
                         bool attn_prepared, int ffn_rows) {
   Scratch& b = *scratch_;
   const LayerWeights& w = weights_[layer];
   if (!attn_prepared) {
-    HcPreStep(b.x[cur], *w.hc_attn_fn, w.hc_attn_scale->f32(),
+    HcPreStep(ResidualAt(b.x[cur], 0), *w.hc_attn_fn, w.hc_attn_scale->f32(),
               w.hc_attn_base->f32(), w.attn_norm->f32(), T);
   }
   Mark(0);
@@ -1169,29 +1223,35 @@ void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
     DsaBlock(layer, session, T);
     Mark(2);
   }
-  HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
+  HcPostStep(ResidualAt(b.x[cur], 0), b.block, ResidualAt(b.x[1 - cur], 0), T);
   cur = 1 - cur;
 
   if (ffn_rows > 0) {
-    const std::size_t off =
-        static_cast<std::size_t>(T - ffn_rows) * kStreams * kHidden;
-    HcPreStep(b.x[cur] + off, *w.hc_ffn_fn, w.hc_ffn_scale->f32(),
+    const std::size_t first = static_cast<std::size_t>(T - ffn_rows);
+    HcPreStep(ResidualAt(b.x[cur], first), *w.hc_ffn_fn, w.hc_ffn_scale->f32(),
               w.hc_ffn_base->f32(), w.ffn_norm->f32(), ffn_rows);
     Mark(0);
     FfnBlock(layer, ffn_rows);
     Mark(w.dense ? 3 : 4);
-    HcPost(b.x[cur] + off, b.ffn_out, b.post, b.comb, b.x[1 - cur] + off,
-           stream_, ffn_rows);
+    HcPostStep(ResidualAt(b.x[cur], first), b.ffn_out,
+               ResidualAt(b.x[1 - cur], first), ffn_rows);
     cur = 1 - cur;
   }
   if (!dflash_taps_.empty()) {
     const auto tap = std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
     if (tap != dflash_taps_.end()) {
       const int rows = std::min<int>(T, options_.dflash_rows);
-      MeanStreams(b.x[cur], T - rows, rows, b.dflash_capture,
-                  static_cast<long long>(dflash_taps_.size()) * kHidden,
-                  static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
-                  stream_);
+      const long long stride =
+          static_cast<long long>(dflash_taps_.size()) * kHidden;
+      const long long offset =
+          static_cast<long long>(tap - dflash_taps_.begin()) * kHidden;
+      if (res_half_) {
+        MeanStreams(reinterpret_cast<const std::uint16_t*>(b.x[cur]), T - rows,
+                    rows, b.dflash_capture, stride, offset, stream_);
+      } else {
+        MeanStreams(b.x[cur], T - rows, rows, b.dflash_capture, stride, offset,
+                    stream_);
+      }
       capture_rows_ = static_cast<std::uint32_t>(rows);
       capture_position_ =
           session.position + static_cast<std::uint32_t>(T - rows);
@@ -1202,14 +1262,26 @@ void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
 
 void Executor::FinishHead(float* residual, int T, int logit_rows) {
   Scratch& b = *scratch_;
-  last_residual_ =
-      residual + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
+  if (res_half_) {
+    HalfToFloat(reinterpret_cast<const std::uint16_t*>(residual) +
+                    static_cast<std::size_t>(T - 1) * kStreams * kHidden,
+                b.res_last, kStreams * kHidden, stream_);
+    last_residual_ = b.res_last;
+  } else {
+    last_residual_ =
+        residual + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
+  }
   if (logit_rows > 0 && options_.head) {
     const DeviceTensor& norm = *Find("output_norm.weight");
     const DeviceTensor& out = *Find("output.weight");
-    HeadNorm(residual +
-                 static_cast<std::size_t>(T - logit_rows) * kStreams * kHidden,
-             norm.f32(), b.head_in, stream_, logit_rows);
+    const std::size_t first = static_cast<std::size_t>(T - logit_rows);
+    if (res_half_) {
+      HeadNorm(static_cast<const std::uint16_t*>(ResidualAt(residual, first)),
+               norm.f32(), b.head_in, stream_, logit_rows);
+    } else {
+      HeadNorm(static_cast<const float*>(ResidualAt(residual, first)),
+               norm.f32(), b.head_in, stream_, logit_rows);
+    }
     Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
     last_logit_rows_ = logit_rows;
   }
@@ -1229,6 +1301,7 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
   }
   Scratch& b = *scratch_;
   int cur = 0;
+  res_half_ = T >= kWideBatch && !std::getenv("GUFO_GLM53_F32_RESIDUAL");
   if (!EmbedRows(tokens, T, b.x[cur], error))
     return false;
 
@@ -1303,12 +1376,17 @@ void Executor::DropGraph() {
   graph_session_ = 0;
 }
 
-void Executor::HcPreStep(const float* x, const DeviceTensor& fn,
+void Executor::HcPreStep(const void* x, const DeviceTensor& fn,
                          const float* scale, const float* base,
                          const float* norm_w, int T) const {
   const Scratch& b = *scratch_;
-  HcPre(x, fn.f32(), scale, base, norm_w, config_.hc_eps, b.y, b.post, b.comb,
-        b.hc_mixes, stream_, T);
+  if (res_half_) {
+    HcPre(static_cast<const std::uint16_t*>(x), fn.f32(), scale, base, norm_w,
+          config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T);
+  } else {
+    HcPre(static_cast<const float*>(x), fn.f32(), scale, base, norm_w,
+          config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T);
+  }
 }
 
 void Executor::Mark(int bucket) const {
@@ -1392,6 +1470,7 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
   }
   Scratch& b = *scratch_;
   const std::uint32_t pos0 = session.position;
+  res_half_ = !std::getenv("GUFO_GLM53_F32_RESIDUAL");
   if (!EmbedRows(tokens, T, b.x[0], error))
     return false;
   SwapBank();
@@ -1406,8 +1485,9 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
     if (layer >= layers_ || npu_qkv_[layer].empty())
       return;
     const LayerWeights& w = weights_[layer];
-    HcPreStep(b.x[cur[bank]], *w.hc_attn_fn, w.hc_attn_scale->f32(),
-              w.hc_attn_base->f32(), w.attn_norm->f32(), T);
+    HcPreStep(ResidualAt(b.x[cur[bank]], 0), *w.hc_attn_fn,
+              w.hc_attn_scale->f32(), w.hc_attn_base->f32(), w.attn_norm->f32(),
+              T);
     current_layer_ = layer;
     NpuQkvQueue(bank, T);
     prepared[bank] = true;

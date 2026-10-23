@@ -134,6 +134,9 @@ if(ENGINE_ENABLE_HIP)
   add_executable(glm53_attend_test attend_test.cpp)
   target_link_libraries(glm53_attend_test PRIVATE gufo_glm53_flash_rocm)
 
+  add_executable(glm53_dense_bench EXCLUDE_FROM_ALL dense_bench.cpp)
+  target_link_libraries(glm53_dense_bench PRIVATE gufo_glm53_flash_engine)
+
   add_executable(glm53_dsa_test dsa_test.cpp)
   target_link_libraries(glm53_dsa_test PRIVATE gufo_glm53_flash_rocm)
   add_test(NAME glm53.dsa

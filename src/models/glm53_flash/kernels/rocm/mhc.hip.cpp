@@ -41,8 +41,9 @@ constexpr int kMixStride = kReduceSlots;
 constexpr int kPreStride = kReduceSlots + kHcStreams;
 
 // mixes[j] = fn_j . x and mixes[kHcMixes] = sum x^2 for one token.
+template<typename X>
 __global__ __launch_bounds__(kThreads) void HcMixKernel(
-    const float* __restrict__ x, const float* __restrict__ fn,
+    const X* __restrict__ x, const float* __restrict__ fn,
     float* __restrict__ scratch_out) {
   x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
   scratch_out += static_cast<std::size_t>(blockIdx.x) * kPreStride;
@@ -55,7 +56,7 @@ __global__ __launch_bounds__(kThreads) void HcMixKernel(
     acc[j] = 0.0F;
   }
   for (int i = tid; i < kStreamsFlat; i += kThreads) {
-    const float xv = x[i];
+    const float xv = static_cast<float>(x[i]);
     acc[kHcMixes] += xv * xv;
     for (int j = 0; j < kHcMixes; ++j) {
       acc[j] += fn[static_cast<std::size_t>(j) * kStreamsFlat + i] * xv;
@@ -132,8 +133,9 @@ __global__ __launch_bounds__(32) void HcSinkKernel(
   }
 }
 
+template<typename X>
 __global__ __launch_bounds__(kThreads) void HcApplyKernel(
-    const float* __restrict__ x, const float* __restrict__ scratch_in,
+    const X* __restrict__ x, const float* __restrict__ scratch_in,
     const float* __restrict__ norm_w, float* __restrict__ y) {
   x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
   y += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
@@ -148,7 +150,7 @@ __global__ __launch_bounds__(kThreads) void HcApplyKernel(
     const int i = tid + k * kThreads;
     float v = 0.0F;
     for (int s = 0; s < kHcStreams; ++s) {
-      v += x[s * kHcHidden + i] * pre[s];
+      v += static_cast<float>(x[s * kHcHidden + i]) * pre[s];
     }
     z[k] = v;
     sq += v * v;
@@ -160,11 +162,12 @@ __global__ __launch_bounds__(kThreads) void HcApplyKernel(
   }
 }
 
-__global__ void HcPostKernel(const float* __restrict__ x,
+template<typename X>
+__global__ void HcPostKernel(const X* __restrict__ x,
                              const float* __restrict__ block,
                              const float* __restrict__ post,
                              const float* __restrict__ comb,
-                             float* __restrict__ next) {
+                             X* __restrict__ next) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= kHcHidden) {
     return;
@@ -178,19 +181,20 @@ __global__ void HcPostKernel(const float* __restrict__ x,
   const float b = block[i];
   float xs[kHcStreams];
   for (int s = 0; s < kHcStreams; ++s) {
-    xs[s] = x[s * kHcHidden + i];
+    xs[s] = static_cast<float>(x[s * kHcHidden + i]);
   }
   for (int d = 0; d < kHcStreams; ++d) {
     float acc = b * post[d];
     for (int s = 0; s < kHcStreams; ++s) {
       acc += xs[s] * comb[d + kHcStreams * s];
     }
-    next[d * kHcHidden + i] = acc;
+    next[d * kHcHidden + i] = static_cast<X>(acc);
   }
 }
 
+template<typename X>
 __global__ __launch_bounds__(kThreads) void HeadNormKernel(
-    const float* __restrict__ x, const float* __restrict__ w,
+    const X* __restrict__ x, const float* __restrict__ w,
     float* __restrict__ out) {
   __shared__ float scratch[kMaxWaves];
   x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
@@ -202,7 +206,7 @@ __global__ __launch_bounds__(kThreads) void HeadNormKernel(
     const int i = tid + k * kThreads;
     float acc = 0.0F;
     for (int s = 0; s < kHcStreams; ++s) {
-      acc += x[s * kHcHidden + i];
+      acc += static_cast<float>(x[s * kHcHidden + i]);
     }
     v[k] = acc / kHcStreams;
     sq += v[k] * v[k];
@@ -214,16 +218,17 @@ __global__ __launch_bounds__(kThreads) void HeadNormKernel(
   }
 }
 
-__global__ void MeanStreamsKernel(const float* __restrict__ x, int first_row,
+template<typename X>
+__global__ void MeanStreamsKernel(const X* __restrict__ x, int first_row,
                                   float* __restrict__ dst, long long dst_stride,
                                   long long tap_offset) {
   const int r = blockIdx.x;
-  const float* row = x + static_cast<std::size_t>(first_row + r) * kStreamsFlat;
+  const X* row = x + static_cast<std::size_t>(first_row + r) * kStreamsFlat;
   float* out = dst + r * dst_stride + tap_offset;
   for (int i = threadIdx.x; i < kHcHidden; i += blockDim.x) {
     float acc = 0.0F;
     for (int s = 0; s < kHcStreams; ++s) {
-      acc += row[s * kHcHidden + i];
+      acc += static_cast<float>(row[s * kHcHidden + i]);
     }
     out[i] = acc / kHcStreams;
   }
@@ -266,42 +271,119 @@ __global__ __launch_bounds__(kArgmaxThreads) void ArgmaxRowsKernel(
 
 }  // namespace
 
-int MeanStreams(const float* x, int first_row, int rows, float* dst,
-                long long dst_stride, long long tap_offset,
-                hipStream_t stream) {
-  MeanStreamsKernel<<<rows, 256, 0, stream>>>(x, first_row, dst, dst_stride,
-                                              tap_offset);
-  return hipGetLastError() == hipSuccess ? 0 : -1;
-}
-
 int ArgmaxRows(const float* logits, int rows, int vocab, int* out,
                hipStream_t stream) {
   ArgmaxRowsKernel<<<rows, kArgmaxThreads, 0, stream>>>(logits, vocab, out);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
+namespace {
+
+template<typename X>
+int HcPreImpl(const X* x, const float* fn, const float* scale,
+              const float* base, const float* norm_w, float hc_eps, float* y,
+              float* post, float* comb, float* scratch, hipStream_t stream,
+              int tokens) {
+  HcMixKernel<X><<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
+  HcSinkKernel<<<tokens, 32, 0, stream>>>(scratch, scale, base, hc_eps, post,
+                                          comb, tokens);
+  HcApplyKernel<X><<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+template<typename X>
+int HcPostImpl(const X* x, const float* block, const float* post,
+               const float* comb, X* next, hipStream_t stream, int tokens) {
+  constexpr int kBlock = 256;
+  HcPostKernel<X>
+      <<<dim3((kHcHidden + kBlock - 1) / kBlock, tokens), kBlock, 0, stream>>>(
+          x, block, post, comb, next);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+template<typename X>
+int HeadNormImpl(const X* x, const float* w, float* out, hipStream_t stream,
+                 int rows) {
+  HeadNormKernel<X><<<rows, kThreads, 0, stream>>>(x, w, out);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+template<typename X>
+int MeanStreamsImpl(const X* x, int first_row, int rows, float* dst,
+                    long long dst_stride, long long tap_offset,
+                    hipStream_t stream) {
+  MeanStreamsKernel<X>
+      <<<rows, 256, 0, stream>>>(x, first_row, dst, dst_stride, tap_offset);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+__global__ void HalfToFloatKernel(const _Float16* __restrict__ in,
+                                  float* __restrict__ out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = static_cast<float>(in[i]);
+  }
+}
+
+}  // namespace
+
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
           int tokens) {
-  HcMixKernel<<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
-  HcSinkKernel<<<tokens, 32, 0, stream>>>(scratch, scale, base, hc_eps, post,
-                                          comb, tokens);
-  HcApplyKernel<<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y);
-  return hipGetLastError() == hipSuccess ? 0 : -1;
+  return HcPreImpl(x, fn, scale, base, norm_w, hc_eps, y, post, comb, scratch,
+                   stream, tokens);
+}
+
+int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
+          const float* base, const float* norm_w, float hc_eps, float* y,
+          float* post, float* comb, float* scratch, hipStream_t stream,
+          int tokens) {
+  return HcPreImpl(reinterpret_cast<const _Float16*>(x), fn, scale, base,
+                   norm_w, hc_eps, y, post, comb, scratch, stream, tokens);
 }
 
 int HcPost(const float* x, const float* block, const float* post,
            const float* comb, float* next, hipStream_t stream, int tokens) {
-  constexpr int kBlock = 256;
-  HcPostKernel<<<dim3((kHcHidden + kBlock - 1) / kBlock, tokens), kBlock, 0,
-                 stream>>>(x, block, post, comb, next);
-  return hipGetLastError() == hipSuccess ? 0 : -1;
+  return HcPostImpl(x, block, post, comb, next, stream, tokens);
+}
+
+int HcPost(const std::uint16_t* x, const float* block, const float* post,
+           const float* comb, std::uint16_t* next, hipStream_t stream,
+           int tokens) {
+  return HcPostImpl(reinterpret_cast<const _Float16*>(x), block, post, comb,
+                    reinterpret_cast<_Float16*>(next), stream, tokens);
 }
 
 int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream,
              int rows) {
-  HeadNormKernel<<<rows, kThreads, 0, stream>>>(x, w, out);
+  return HeadNormImpl(x, w, out, stream, rows);
+}
+
+int HeadNorm(const std::uint16_t* x, const float* w, float* out,
+             hipStream_t stream, int rows) {
+  return HeadNormImpl(reinterpret_cast<const _Float16*>(x), w, out, stream,
+                      rows);
+}
+
+int MeanStreams(const float* x, int first_row, int rows, float* dst,
+                long long dst_stride, long long tap_offset,
+                hipStream_t stream) {
+  return MeanStreamsImpl(x, first_row, rows, dst, dst_stride, tap_offset,
+                         stream);
+}
+
+int MeanStreams(const std::uint16_t* x, int first_row, int rows, float* dst,
+                long long dst_stride, long long tap_offset,
+                hipStream_t stream) {
+  return MeanStreamsImpl(reinterpret_cast<const _Float16*>(x), first_row, rows,
+                         dst, dst_stride, tap_offset, stream);
+}
+
+int HalfToFloat(const std::uint16_t* in, float* out, int n,
+                hipStream_t stream) {
+  HalfToFloatKernel<<<(n + 255) / 256, 256, 0, stream>>>(
+      reinterpret_cast<const _Float16*>(in), out, n);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

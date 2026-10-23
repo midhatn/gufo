@@ -161,6 +161,7 @@ private:
   const DeviceTensor* Find(const std::string& name) const;
   bool Resolve(std::string* error);
   bool SetupNpu(std::string* error);
+  bool SetupRouter(std::string* error);
   bool AllocScratch(std::string* error);
 
   bool Forward(Session& session, const std::int32_t* tokens, int count,
@@ -193,8 +194,11 @@ private:
   void NpuShexpFinish() const;
   bool ForwardPair(Session& session, const std::int32_t* tokens, int count,
                    int logit_rows, std::string* error);
-  void HcPreStep(const float* x, const DeviceTensor& fn, const float* scale,
+  void HcPreStep(const void* x, const DeviceTensor& fn, const float* scale,
                  const float* base, const float* norm_w, int tokens) const;
+  void HcPostStep(const void* x, const float* block, void* next,
+                  int tokens) const;
+  void* ResidualAt(float* base, std::size_t rows_offset) const;
 
   std::unique_ptr<core::GgufReader> reader_;
   Config config_;
@@ -214,6 +218,9 @@ private:
   std::vector<int> npu_c_[2];
   std::uint64_t npu_ticket_[2]{};
   int qkv_bank_{-1};
+  std::vector<std::uint16_t*> router_hi_;
+  std::vector<std::uint16_t*> router_lo_;
+  bool res_half_{false};
   int shexp_bank_{-1};
   std::vector<std::vector<int>> npu_sh_;
   std::vector<int> npu_sh_c_[2];

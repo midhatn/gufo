@@ -3,6 +3,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
+
 namespace gufo::models::glm53_flash::rocm {
 
 inline constexpr int kHcStreams = 4;
@@ -22,9 +24,24 @@ int HcPre(const float* x, const float* fn, const float* scale,
           float* post, float* comb, float* scratch, hipStream_t stream,
           int tokens = 1);
 
+// The same with the residual streams held as F16 (raw bits).
+int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
+          const float* base, const float* norm_w, float hc_eps, float* y,
+          float* post, float* comb, float* scratch, hipStream_t stream,
+          int tokens = 1);
+
 // next[d] = block * post[d] + sum_s x[s] * comb[d + 4 * s]. next != x.
 int HcPost(const float* x, const float* block, const float* post,
            const float* comb, float* next, hipStream_t stream, int tokens = 1);
+
+int HcPost(const std::uint16_t* x, const float* block, const float* post,
+           const float* comb, std::uint16_t* next, hipStream_t stream,
+           int tokens = 1);
+int HeadNorm(const std::uint16_t* x, const float* w, float* out,
+             hipStream_t stream, int rows = 1);
+int MeanStreams(const std::uint16_t* x, int first_row, int rows, float* dst,
+                long long dst_stride, long long tap_offset, hipStream_t stream);
+int HalfToFloat(const std::uint16_t* in, float* out, int n, hipStream_t stream);
 
 // out = RMSNorm(mean_s x_s) * w.
 int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream,
