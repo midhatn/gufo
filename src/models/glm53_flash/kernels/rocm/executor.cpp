@@ -853,7 +853,17 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
     Proj(*w.ffn_down, Prep(b.act, T, kDenseFf), b.ffn_out, T);
     return;
   }
-  Proj(*w.router, Act{b.y, nullptr}, b.rlogits, T);
+  if (T >= kWideBatch && w.router->type == kTypeF32) {
+    const auto handle = static_cast<hipblasHandle_t>(blas_);
+    hipblasSetStream(handle, stream_);
+    const float alpha = 1.0F;
+    const float beta = 0.0F;
+    hipblasSgemm(handle, HIPBLAS_OP_T, HIPBLAS_OP_N, kMoeExperts, T, kHidden,
+                 &alpha, w.router->f32(), kHidden, b.y, kHidden, &beta,
+                 b.rlogits, kMoeExperts);
+  } else {
+    Proj(*w.router, Act{b.y, nullptr}, b.rlogits, T);
+  }
   MoeRoute(b.rlogits, w.router_bias->f32(), config_.expert_weights_scale, b.ids,
            b.wts, stream_, T);
   if (T == 1) {
