@@ -85,8 +85,8 @@ int DsaAttendBatch(const float* qabs, const std::uint16_t* lat_half,
 // [token][head][width] <-> [head][token][width] (the per-head GEMM layout).
 int HeadMajor(const float* in, std::uint16_t* out, int tokens, int heads,
               int width, hipStream_t stream);
-int TokenMajor(const float* in, float* out, int tokens, int heads, int width,
-               hipStream_t stream);
+int TokenMajor(const std::uint16_t* in, float* out, int tokens, int heads,
+               int width, hipStream_t stream);
 
 }  // namespace gufo::models::glm53_flash::rocm
 

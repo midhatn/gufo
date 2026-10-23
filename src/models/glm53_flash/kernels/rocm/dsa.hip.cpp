@@ -229,7 +229,7 @@ __global__ void HeadMajorKernel(const float* __restrict__ in,
 }
 
 // out[t][h][i] = in[h][t][i].
-__global__ void TokenMajorKernel(const float* __restrict__ in,
+__global__ void TokenMajorKernel(const _Float16* __restrict__ in,
                                  float* __restrict__ out, int tokens, int heads,
                                  int width) {
   const long long n = static_cast<long long>(tokens) * heads * width;
@@ -240,7 +240,8 @@ __global__ void TokenMajorKernel(const float* __restrict__ in,
     const long long th = i / width;
     const int h = static_cast<int>(th % heads);
     const int t = static_cast<int>(th / heads);
-    out[i] = in[(static_cast<std::size_t>(h) * tokens + t) * width + w];
+    out[i] = static_cast<float>(
+        in[(static_cast<std::size_t>(h) * tokens + t) * width + w]);
   }
 }
 
@@ -890,9 +891,10 @@ int HeadMajor(const float* in, std::uint16_t* out, int tokens, int heads,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int TokenMajor(const float* in, float* out, int tokens, int heads, int width,
-               hipStream_t stream) {
-  TokenMajorKernel<<<2048, 256, 0, stream>>>(in, out, tokens, heads, width);
+int TokenMajor(const std::uint16_t* in, float* out, int tokens, int heads,
+               int width, hipStream_t stream) {
+  TokenMajorKernel<<<2048, 256, 0, stream>>>(
+      reinterpret_cast<const _Float16*>(in), out, tokens, heads, width);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

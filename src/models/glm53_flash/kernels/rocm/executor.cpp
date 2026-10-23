@@ -651,8 +651,8 @@ void Executor::Proj(const DeviceTensor& w, const Act& x, float* out,
 // out[h][t][r] = sum_k W_h[r][k] * in[h][t][k] for the 64 head slabs of a
 // stacked [64][rows][k] tensor: one strided-batched GEMM over F16 copies of
 // the slabs and the F16 activations.
-void Executor::HeadGemm(const DeviceTensor& w, float* out, int T, int k,
-                        int rows) const {
+void Executor::HeadGemm(const DeviceTensor& w, void* out, bool half_out, int T,
+                        int k, int rows) const {
   const Scratch& b = *scratch_;
   const auto handle = static_cast<hipblasHandle_t>(blas_);
   hipblasSetStream(handle, stream_);
@@ -662,8 +662,9 @@ void Executor::HeadGemm(const DeviceTensor& w, float* out, int T, int k,
       handle, HIPBLAS_OP_T, HIPBLAS_OP_N, rows, T, k, &alpha, w.f16,
       HIPBLAS_R_16F, k, static_cast<long long>(rows) * k, b.head_half,
       HIPBLAS_R_16F, k, static_cast<long long>(T) * k, &beta, out,
-      HIPBLAS_R_32F, rows, static_cast<long long>(T) * rows, kDsaHeads,
-      HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+      half_out ? HIPBLAS_R_16F : HIPBLAS_R_32F, rows,
+      static_cast<long long>(T) * rows, kDsaHeads, HIPBLAS_COMPUTE_32F,
+      HIPBLAS_GEMM_DEFAULT);
 }
 
 void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
@@ -742,13 +743,14 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     // over all tokens, in the head-major layout the attention kernel reads.
     HeadMajor(b.q, static_cast<std::uint16_t*>(b.head_half), T, kDsaHeads, 256,
               stream_);
-    HeadGemm(*w.k_b, b.qabs, T, 256, kDsaLatent);
+    HeadGemm(*w.k_b, b.qabs, false, T, 256, kDsaLatent);
     Mark(7);
     DsaAttendBatch(b.qabs, st.cache.lat_half, b.sel, pos0, T, top, 1.0F / 16.0F,
                    static_cast<std::uint16_t*>(b.head_half), stream_);
     Mark(8);
-    HeadGemm(*w.v_b, b.v_heads, T, kDsaLatent, 256);
-    TokenMajor(b.v_heads, b.vout, T, kDsaHeads, 256, stream_);
+    HeadGemm(*w.v_b, b.v_heads, true, T, kDsaLatent, 256);
+    TokenMajor(reinterpret_cast<const std::uint16_t*>(b.v_heads), b.vout, T,
+               kDsaHeads, 256, stream_);
     Mark(7);
   } else if (T == 1) {
     const int top = static_cast<int>(options_.top_pools);
