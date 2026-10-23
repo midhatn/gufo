@@ -15,6 +15,10 @@
 #include "src/models/glm53_flash/kernels/rocm/dsa.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
 
+namespace gufo::models::qwen38_flash_next::rocm {
+class NpuGemm;
+}
+
 namespace gufo::models::glm53_flash::rocm {
 
 struct ExecutorOptions {
@@ -156,6 +160,7 @@ private:
   bool Upload(const std::string& name, std::string* error);
   const DeviceTensor* Find(const std::string& name) const;
   bool Resolve(std::string* error);
+  bool SetupNpu(std::string* error);
   bool AllocScratch(std::string* error);
 
   bool Forward(Session& session, const std::int32_t* tokens, int count,
@@ -174,6 +179,16 @@ private:
                 int k, int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
+  void RunLayer(std::uint32_t layer, Session& session, int tokens, int& cur,
+                bool attn_prepared);
+  void FinishHead(float* residual, int tokens, int logit_rows);
+  bool EmbedRows(const std::int32_t* tokens, int count, float* dst,
+                 std::string* error);
+  void NpuQkvQueue(int bank, int tokens);
+  void NpuQkvFinish(int bank, int tokens) const;
+  void SwapBank();
+  bool ForwardPair(Session& session, const std::int32_t* tokens, int count,
+                   int logit_rows, std::string* error);
   void HcPreStep(const float* x, const DeviceTensor& fn, const float* scale,
                  const float* base, const float* norm_w, int tokens) const;
 
@@ -184,6 +199,19 @@ private:
   std::unordered_map<std::string, DeviceTensor> tensors_;
   std::vector<LayerWeights> weights_;
   std::unique_ptr<Scratch> scratch_;
+  struct BankFields {
+    float* x[2]{};
+    float *y{}, *post{}, *comb{}, *hc_mixes{};
+  };
+  BankFields bank_b_;
+  std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu_;
+  std::vector<std::vector<int>> npu_qkv_;
+  int npu_a_[2][2]{{-1, -1}, {-1, -1}};
+  std::vector<int> npu_c_[2];
+  std::uint64_t npu_ticket_[2]{};
+  int qkv_bank_{-1};
+  const std::uint8_t** npu_tab_[2]{};
+  std::uint32_t current_layer_{0};
   hipStream_t stream_{nullptr};
   void* staging_{nullptr};
   void* blas_{nullptr};  // hipblasHandle_t

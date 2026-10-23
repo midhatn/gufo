@@ -87,7 +87,18 @@ int main(int argc, char** argv) {
     std::printf("prefill failed: %s\n", error.c_str());
     return 1;
   }
-  const double t_bat = Seconds(start);
+  double t_bat = Seconds(start);
+  if (const char* v = std::getenv("GUFO_GLM53_REPEAT")) {
+    for (int i = 0; i < std::atoi(v); ++i) {
+      auto again = executor->CreateSession(&error);
+      const auto t = std::chrono::steady_clock::now();
+      if (!executor->Prefill(*again, tokens, &error, split))
+        return 1;
+      t_bat = Seconds(t);
+      std::printf("repeat %d: %.2f s (%.1f tok/s)\n", i, t_bat,
+                  tokens.size() / t_bat);
+    }
+  }
   std::printf("prefill stages:\n");
   executor->PrintProfile();
   const auto b = executor->Logits(*bat);
@@ -104,6 +115,20 @@ int main(int argc, char** argv) {
     return d / std::sqrt(xx * yy);
   };
   const bool have_head = executor->layers() >= 45;
+  if (const char* v = std::getenv("GUFO_GLM53_REF_CHUNK")) {
+    auto ref = executor->CreateSession(&error);
+    if (!executor->Prefill(*ref, tokens, &error, std::atoi(v)))
+      return 1;
+    const auto lr = executor->Logits(*ref);
+    const auto rr = executor->Residual(*ref);
+    std::printf(
+        "vs chunk %s prefill: logits cos %.5f residual cos %.5f top1 %s\n", v,
+        cosine_fn(b, lr), cosine_fn(rb, rr),
+        std::max_element(b.begin(), b.end()) - b.begin() ==
+                std::max_element(lr.begin(), lr.end()) - lr.begin()
+            ? "same"
+            : "DIFFERENT");
+  }
   if (skip_seq) {
     std::printf("prefill %.2f s (%.1f tok/s)\n", t_bat, tokens.size() / t_bat);
     return 0;

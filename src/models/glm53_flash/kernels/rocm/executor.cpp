@@ -15,7 +15,9 @@
 #include "src/models/glm53_flash/kernels/rocm/matvec.hpp"
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 #include "src/models/glm53_flash/kernels/rocm/moe.hpp"
+#include "src/models/glm53_flash/kernels/rocm/npu_decode.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
 
 extern "C" int ds4_mmq_init(int device);
 
@@ -24,6 +26,7 @@ namespace gufo::models::glm53_flash::rocm {
 namespace {
 
 using core::GgmlType;
+namespace qfn = gufo::models::qwen38_flash_next::rocm;
 
 constexpr std::size_t kTailMargin = 4096;
 constexpr std::size_t kUploadChunk = std::size_t{128} << 20;
@@ -32,6 +35,8 @@ constexpr int kHidden = kHcHidden;
 constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
+constexpr int kQkvSlices = 3 * kKdaInner / 1024;
+constexpr int kNpuPasses = 2;
 constexpr int kQLora = 1536;
 constexpr std::uint32_t kPairTileRows = 128;
 constexpr std::uint32_t kDownTileRows = 64;
@@ -176,6 +181,9 @@ Executor::~Executor() {
     hipStreamDestroy(capture_stream_);
   if (staging_ != nullptr)
     hipHostFree(staging_);
+  for (const auto* table : npu_tab_)
+    if (table != nullptr)
+      hipFree(const_cast<std::uint8_t**>(table));
   if (blas_ != nullptr)
     hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
   for (auto& [name, t] : tensors_) {
@@ -345,6 +353,21 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     return nullptr;
   ex->config_ = *config;
   ex->options_ = options;
+#ifdef GUFO_NPU
+  if (const char* dir = std::getenv("GUFO_NPU_DIR");
+      dir != nullptr && dir[0] != '\0') {
+    qfn::NpuGemm::Config cfg;
+    cfg.xclbin =
+        std::string(dir) + "/runtime_k/final_4096xKx1024_128x64x128.xclbin";
+    cfg.insts =
+        std::string(dir) + "/runtime_k/insts_4096x4096x1024_128x64x128.txt";
+    cfg.k = kHidden;
+    std::string npu_error;
+    ex->npu_ = qfn::NpuGemm::Create(cfg, &npu_error);
+    if (ex->npu_ == nullptr)
+      std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
+  }
+#endif
   ex->profile_ = std::getenv("GUFO_GLM53_PROFILE") != nullptr;
   ex->layers_ = options.layers == 0
                     ? ex->config_.TrunkLayers()
@@ -416,9 +439,100 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       }
     }
   }
-  if (!ex->Resolve(error) || !ex->AllocScratch(error))
+  if (!ex->Resolve(error) || !ex->AllocScratch(error) || !ex->SetupNpu(error))
     return nullptr;
   return ex;
+}
+
+bool Executor::SetupNpu(std::string*) {
+  if (npu_ == nullptr)
+    return true;
+  const auto drop = [&](const char* why, const std::string& detail) {
+    std::fprintf(stderr, "NPU off: %s %s\n", why, detail.c_str());
+    npu_.reset();
+    npu_qkv_.clear();
+    return true;
+  };
+  if (bank_b_.x[0] == nullptr)
+    return drop("chunk is not the NPU row count", "");
+  std::string npu_error;
+  for (int bank = 0; bank < 2; ++bank) {
+    for (int pass = 0; pass < kNpuPasses; ++pass) {
+      npu_a_[bank][pass] = npu_->NewBuffer(npu_->ABytes(), &npu_error);
+      if (npu_a_[bank][pass] < 0)
+        return drop("buffers", npu_error);
+    }
+    for (int i = 0; i < kNpuPasses * kQkvSlices; ++i) {
+      const int id = npu_->NewBuffer(npu_->CBytes(), &npu_error);
+      if (id < 0)
+        return drop("buffers", npu_error);
+      npu_c_[bank].push_back(id);
+    }
+  }
+  for (int bank = 0; bank < 2; ++bank) {
+    std::vector<const std::uint8_t*> table;
+    for (const int id : npu_c_[bank])
+      table.push_back(
+          static_cast<const std::uint8_t*>(npu_->Staged(nullptr, id)));
+    const std::size_t bytes = table.size() * sizeof(table[0]);
+    void* dev = nullptr;
+    if (hipMalloc(&dev, bytes) != hipSuccess ||
+        hipMemcpy(dev, table.data(), bytes, hipMemcpyHostToDevice) !=
+            hipSuccess)
+      return drop("stream table", "");
+    npu_tab_[bank] = static_cast<const std::uint8_t**>(dev);
+  }
+  npu_qkv_.assign(layers_, {});
+  std::uint32_t staged = 0;
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    if (!w.kda || w.attn_q->rows != kKdaInner || w.attn_k->rows != kKdaInner ||
+        w.attn_v->rows != kKdaInner)
+      continue;
+    std::vector<int> ids;
+    for (const DeviceTensor* t : {w.attn_q, w.attn_k, w.attn_v}) {
+      for (std::uint32_t slice = 0; slice < kKdaInner / npu_->n(); ++slice) {
+        const int id = npu_->NewBuffer(npu_->BBytes(), &npu_error);
+        if (id < 0)
+          return drop("weights", npu_error);
+        qfn::NpuEncodeWeightsQuant(t->data, static_cast<std::uint32_t>(t->type),
+                                   kHidden, slice * npu_->n(), npu_->n(),
+                                   kHidden, 0, kHidden, npu_->Device(id),
+                                   nullptr);
+        ids.push_back(id);
+      }
+    }
+    npu_qkv_[layer] = std::move(ids);
+    ++staged;
+  }
+  if (hipDeviceSynchronize() != hipSuccess)
+    return drop("upload", "");
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    for (const int id : npu_qkv_[layer])
+      npu_->FinalizeWeights(id);
+    if (npu_qkv_[layer].empty())
+      continue;
+    const LayerWeights& w = weights_[layer];
+    for (const DeviceTensor* t : {w.attn_q, w.attn_k, w.attn_v}) {
+      auto* owned = const_cast<DeviceTensor*>(t);
+      if (owned->q8_owned && owned->q8 != nullptr) {
+        hipFree(owned->q8);
+        owned->q8 = nullptr;
+        owned->q8_owned = false;
+      }
+    }
+  }
+  if (!npu_qkv_.empty()) {
+    const std::vector<int>& warm =
+        npu_qkv_[0].empty() ? npu_qkv_[1] : npu_qkv_[0];
+    if (!warm.empty()) {
+      npu_->Submit(stream_, npu_a_[0][0], warm.data(), npu_c_[0].data(), 1);
+      npu_->Wait(stream_);
+      hipStreamSynchronize(stream_);
+    }
+  }
+  std::fprintf(stderr, "NPU: KDA q/k/v of %u layers\n", staged);
+  return true;
 }
 
 bool Executor::Resolve(std::string* error) {
@@ -549,6 +663,14 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.up, c * kFfnScratch);
   take(&s.act, c * kFfnScratch);
   take(&s.hc_mixes, c * kHcPreScratch);
+  if (npu_ != nullptr && npu_->tokens() == c) {
+    take(&bank_b_.x[0], c * kStreams * kHidden);
+    take(&bank_b_.x[1], c * kStreams * kHidden);
+    take(&bank_b_.y, c * kHidden);
+    take(&bank_b_.post, c * kStreams);
+    take(&bank_b_.comb, c * kStreams * kStreams);
+    take(&bank_b_.hc_mixes, c * kHcPreScratch);
+  }
   take(&s.rlogits, c * kMoeExperts);
   take(&s.wts, c * kMoeUsed);
   take(&s.ids, c * kMoeUsed);
@@ -673,9 +795,13 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   LayerState& st = s.layers[layer];
   arena_used_ = 0;
   const Act y = Prep(b.y, T, kHidden);
-  Proj(*w.attn_q, y, b.kq, T);
-  Proj(*w.attn_k, y, b.kk, T);
-  Proj(*w.attn_v, y, b.kv, T);
+  if (qkv_bank_ >= 0) {
+    NpuQkvFinish(qkv_bank_, T);
+  } else {
+    Proj(*w.attn_q, y, b.kq, T);
+    Proj(*w.attn_k, y, b.kk, T);
+    Proj(*w.attn_v, y, b.kv, T);
+  }
   const bool record = recording_ && !s.kda_log.empty() &&
                       T <= static_cast<int>(options_.logit_rows);
   if (record) {
@@ -894,18 +1020,8 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
   }
 }
 
-bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
-                       int logit_rows, std::string* error) {
-  if (T <= 0 || T > static_cast<int>(options_.prefill_chunk)) {
-    if (error != nullptr)
-      *error = "bad chunk size";
-    return false;
-  }
-  if (session.position + static_cast<std::uint32_t>(T) > options_.max_context) {
-    if (error != nullptr)
-      *error = "context full";
-    return false;
-  }
+bool Executor::EmbedRows(const std::int32_t* tokens, int T, float* dst,
+                         std::string* error) {
   const auto* embd = reader_->FindTensor("token_embd.weight");
   std::vector<float> host(static_cast<std::size_t>(T) * kStreams * kHidden);
   const std::size_t row_bytes = embd->size_bytes / embd->dimensions[1];
@@ -938,69 +1054,96 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
       std::memcpy(row + s * kHidden, row, kHidden * sizeof(float));
     }
   }
-  Scratch& b = *scratch_;
-  int cur = 0;
-  hipMemcpyAsync(b.x[cur], host.data(), host.size() * sizeof(float),
+  hipMemcpyAsync(dst, host.data(), host.size() * sizeof(float),
                  hipMemcpyHostToDevice, stream_);
   hipStreamSynchronize(stream_);
+  return true;
+}
+
+void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
+                        bool attn_prepared) {
+  Scratch& b = *scratch_;
+  const LayerWeights& w = weights_[layer];
+  if (!attn_prepared) {
+    HcPreStep(b.x[cur], *w.hc_attn_fn, w.hc_attn_scale->f32(),
+              w.hc_attn_base->f32(), w.attn_norm->f32(), T);
+  }
+  Mark(0);
+  if (w.kda) {
+    KdaBlock(layer, session, T);
+    Mark(1);
+  } else {
+    DsaBlock(layer, session, T);
+    Mark(2);
+  }
+  HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
+  cur = 1 - cur;
+
+  HcPreStep(b.x[cur], *w.hc_ffn_fn, w.hc_ffn_scale->f32(), w.hc_ffn_base->f32(),
+            w.ffn_norm->f32(), T);
+  Mark(0);
+  FfnBlock(layer, T);
+  Mark(w.dense ? 3 : 4);
+  HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
+  cur = 1 - cur;
+  if (!dflash_taps_.empty()) {
+    const auto tap = std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
+    if (tap != dflash_taps_.end()) {
+      const int rows = std::min<int>(T, options_.dflash_rows);
+      MeanStreams(b.x[cur], T - rows, rows, b.dflash_capture,
+                  static_cast<long long>(dflash_taps_.size()) * kHidden,
+                  static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
+                  stream_);
+      capture_rows_ = static_cast<std::uint32_t>(rows);
+      capture_position_ =
+          session.position + static_cast<std::uint32_t>(T - rows);
+    }
+  }
+  Mark(0);
+}
+
+void Executor::FinishHead(float* residual, int T, int logit_rows) {
+  Scratch& b = *scratch_;
+  last_residual_ =
+      residual + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
+  if (logit_rows > 0 && options_.head) {
+    const DeviceTensor& norm = *Find("output_norm.weight");
+    const DeviceTensor& out = *Find("output.weight");
+    HeadNorm(residual +
+                 static_cast<std::size_t>(T - logit_rows) * kStreams * kHidden,
+             norm.f32(), b.head_in, stream_, logit_rows);
+    Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
+    last_logit_rows_ = logit_rows;
+  }
+}
+
+bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
+                       int logit_rows, std::string* error) {
+  if (T <= 0 || T > static_cast<int>(options_.prefill_chunk)) {
+    if (error != nullptr)
+      *error = "bad chunk size";
+    return false;
+  }
+  if (session.position + static_cast<std::uint32_t>(T) > options_.max_context) {
+    if (error != nullptr)
+      *error = "context full";
+    return false;
+  }
+  Scratch& b = *scratch_;
+  int cur = 0;
+  if (!EmbedRows(tokens, T, b.x[cur], error))
+    return false;
 
   if (T == 1) {
     const int pos = static_cast<int>(session.position);
     hipMemcpy(b.pos_dev, &pos, sizeof(int), hipMemcpyHostToDevice);
   }
   const auto run = [&]() {
-    auto mark = [&](int bucket) { Mark(bucket); };
     profile_mark_ = std::chrono::steady_clock::now();
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      const LayerWeights& w = weights_[layer];
-      HcPreStep(b.x[cur], *w.hc_attn_fn, w.hc_attn_scale->f32(),
-                w.hc_attn_base->f32(), w.attn_norm->f32(), T);
-      mark(0);
-      if (w.kda) {
-        KdaBlock(layer, session, T);
-        mark(1);
-      } else {
-        DsaBlock(layer, session, T);
-        mark(2);
-      }
-      HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
-      cur = 1 - cur;
-
-      HcPreStep(b.x[cur], *w.hc_ffn_fn, w.hc_ffn_scale->f32(),
-                w.hc_ffn_base->f32(), w.ffn_norm->f32(), T);
-      mark(0);
-      FfnBlock(layer, T);
-      mark(w.dense ? 3 : 4);
-      HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
-      cur = 1 - cur;
-      if (!dflash_taps_.empty()) {
-        const auto tap =
-            std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
-        if (tap != dflash_taps_.end()) {
-          const int rows = std::min<int>(T, options_.dflash_rows);
-          MeanStreams(
-              b.x[cur], T - rows, rows, b.dflash_capture,
-              static_cast<long long>(dflash_taps_.size()) * kHidden,
-              static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
-              stream_);
-          capture_rows_ = static_cast<std::uint32_t>(rows);
-          capture_position_ =
-              session.position + static_cast<std::uint32_t>(T - rows);
-        }
-      }
-      mark(0);
+      RunLayer(layer, session, T, cur, false);
     }
-    last_residual_ =
-        b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
-    if (logit_rows > 0 && options_.head) {
-      const DeviceTensor& norm = *Find("output_norm.weight");
-      const DeviceTensor& out = *Find("output.weight");
-      HeadNorm(b.x[cur] + static_cast<std::size_t>(T - logit_rows) * kStreams *
-                              kHidden,
-               norm.f32(), b.head_in, stream_, logit_rows);
-      Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
-      last_logit_rows_ = logit_rows;
-    }
+    FinishHead(b.x[cur], T, logit_rows);
   };
   const bool graphable = T == 1 && !recording_ && !profile_;
   if (!graphable || !graph_warm_) {
@@ -1103,6 +1246,110 @@ bool Executor::Evaluate(Session& session, std::int32_t token,
   return Forward(session, &token, 1, 1, error);
 }
 
+void Executor::NpuQkvQueue(int bank, int T) {
+  const Scratch& b = *scratch_;
+  const std::vector<int>& ids = npu_qkv_[current_layer_];
+  ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
+  for (int pass = 0; pass < kNpuPasses; ++pass) {
+    const int a = npu_a_[bank][pass];
+    qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
+                              static_cast<std::uint32_t>(T), kHidden, 0,
+                              kHidden, npu_->Device(a), stream_, pass == 1);
+    npu_->Submit(stream_, a, ids.data(),
+                 npu_c_[bank].data() + pass * kQkvSlices, kQkvSlices);
+  }
+  npu_ticket_[bank] = npu_->Ticket();
+}
+
+void Executor::NpuQkvFinish(int bank, int T) const {
+  const Scratch& b = *scratch_;
+  npu_->Wait(stream_, npu_ticket_[bank]);
+  NpuDecodeFused(npu_tab_[bank], npu_tab_[bank] + kQkvSlices, b.kq, b.kk, b.kv,
+                 T, kQkvSlices, kQkvSlices / 3, kKdaInner, stream_);
+}
+
+void Executor::SwapBank() {
+  Scratch& b = *scratch_;
+  std::swap(b.x[0], bank_b_.x[0]);
+  std::swap(b.x[1], bank_b_.x[1]);
+  std::swap(b.y, bank_b_.y);
+  std::swap(b.post, bank_b_.post);
+  std::swap(b.comb, bank_b_.comb);
+  std::swap(b.hc_mixes, bank_b_.hc_mixes);
+}
+
+bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
+                           int count, int logit_rows, std::string* error) {
+  const int T = count / 2;
+  if (npu_ == nullptr || !npu_->Healthy() ||
+      T != static_cast<int>(npu_->tokens()) || count != 2 * T ||
+      T > static_cast<int>(options_.prefill_chunk) ||
+      session.position + static_cast<std::uint32_t>(count) >
+          options_.max_context ||
+      logit_rows > T) {
+    if (error != nullptr)
+      *error = "pair batch not supported";
+    return false;
+  }
+  Scratch& b = *scratch_;
+  const std::uint32_t pos0 = session.position;
+  if (!EmbedRows(tokens, T, b.x[0], error))
+    return false;
+  SwapBank();
+  const bool second = EmbedRows(tokens + T, T, b.x[0], error);
+  SwapBank();
+  if (!second)
+    return false;
+  int cur[2] = {0, 0};
+  bool prepared[2] = {false, false};
+  const auto prefetch = [&](int bank, std::uint32_t layer) {
+    prepared[bank] = false;
+    if (layer >= layers_ || npu_qkv_[layer].empty())
+      return;
+    const LayerWeights& w = weights_[layer];
+    HcPreStep(b.x[cur[bank]], *w.hc_attn_fn, w.hc_attn_scale->f32(),
+              w.hc_attn_base->f32(), w.attn_norm->f32(), T);
+    current_layer_ = layer;
+    NpuQkvQueue(bank, T);
+    prepared[bank] = true;
+  };
+  prefetch(0, 0);
+  SwapBank();
+  prefetch(1, 0);
+  SwapBank();
+  profile_mark_ = std::chrono::steady_clock::now();
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    for (int bank = 0; bank < 2; ++bank) {
+      if (bank == 1)
+        SwapBank();
+      session.position = pos0 + static_cast<std::uint32_t>(bank * T);
+      qkv_bank_ = prepared[bank] ? bank : -1;
+      RunLayer(layer, session, T, cur[bank], prepared[bank]);
+      qkv_bank_ = -1;
+      prefetch(bank, layer + 1);
+      if (bank == 1)
+        SwapBank();
+    }
+  }
+  SwapBank();
+  session.position = pos0 + static_cast<std::uint32_t>(T);
+  FinishHead(b.x[cur[1]], T, logit_rows);
+  SwapBank();
+  session.position = pos0 + static_cast<std::uint32_t>(count);
+  if (hipStreamSynchronize(stream_) != hipSuccess ||
+      hipGetLastError() != hipSuccess) {
+    if (error != nullptr)
+      *error = "HIP error during forward";
+    return false;
+  }
+  if (!npu_->Healthy()) {
+    if (error != nullptr)
+      *error = "NPU run timed out; the batch result is discarded";
+    return false;
+  }
+  return true;
+}
+
 bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
                        std::string* error, std::size_t chunk_size) {
   if (tokens.empty()) {
@@ -1114,13 +1361,25 @@ bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
       chunk_size == 0
           ? options_.prefill_chunk
           : std::min<std::size_t>(chunk_size, options_.prefill_chunk);
-  for (std::size_t at = 0; at < tokens.size(); at += chunk) {
+  const bool pairs = npu_ != nullptr && npu_->Healthy() &&
+                     chunk == options_.prefill_chunk && chunk == npu_->tokens();
+  for (std::size_t at = 0; at < tokens.size();) {
+    if (pairs && tokens.size() - at >= 2 * chunk) {
+      const bool last = at + 2 * chunk == tokens.size();
+      if (!ForwardPair(session, tokens.data() + at, static_cast<int>(2 * chunk),
+                       last ? 1 : 0, error)) {
+        return false;
+      }
+      at += 2 * chunk;
+      continue;
+    }
     const std::size_t n = std::min(chunk, tokens.size() - at);
     const bool last = at + n == tokens.size();
     if (!Forward(session, tokens.data() + at, static_cast<int>(n), last ? 1 : 0,
                  error)) {
       return false;
     }
+    at += n;
   }
   return true;
 }

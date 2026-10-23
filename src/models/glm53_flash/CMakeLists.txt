@@ -23,12 +23,14 @@ if(ENGINE_ENABLE_HIP)
     kernels/rocm/mhc.hip.cpp
     kernels/rocm/kda.hip.cpp
     kernels/rocm/dsa.hip.cpp
-    kernels/rocm/moe.hip.cpp)
+    kernels/rocm/moe.hip.cpp
+    kernels/rocm/npu_decode.hip.cpp)
   set_source_files_properties(kernels/rocm/matvec.hip.cpp
     kernels/rocm/mhc.hip.cpp
     kernels/rocm/kda.hip.cpp
     kernels/rocm/dsa.hip.cpp
     kernels/rocm/moe.hip.cpp
+    kernels/rocm/npu_decode.hip.cpp
     PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_glm53_flash_rocm PROPERTIES
     HIP_STANDARD 17
