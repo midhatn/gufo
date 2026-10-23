@@ -742,9 +742,7 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     HeadMajor(b.q, b.q_heads, T, kDsaHeads, 256, stream_);
     HeadGemm(*w.k_b, b.q_heads, b.qabs, T, 256, kDsaLatent);
     Mark(7);
-    ToHalf(b.qabs, b.head_half,
-           static_cast<long long>(kDsaHeads) * T * kDsaLatent, stream_);
-    DsaAttendBatch(b.head_half, st.cache.lat, b.sel, pos0, T, top, 1.0F / 16.0F,
+    DsaAttendBatch(b.qabs, st.cache.lat, b.sel, pos0, T, top, 1.0F / 16.0F,
                    b.ctx, stream_);
     Mark(8);
     HeadGemm(*w.v_b, b.ctx, b.v_heads, T, kDsaLatent, 256);

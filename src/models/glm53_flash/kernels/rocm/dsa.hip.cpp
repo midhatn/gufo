@@ -465,7 +465,7 @@ constexpr int kAttnChanTiles = kDsaLatent / 2 / 16;
 // channels. Selected latent rows are gathered once per chunk of 32 keys into
 // LDS as F16 and serve as both keys and values; softmax is online over chunks.
 __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
-    const _Float16* __restrict__ qh, const float* __restrict__ lat,
+    const float* __restrict__ qf, const float* __restrict__ lat,
     const int* __restrict__ selected, int pos0, int tokens, int top,
     float scale, float* __restrict__ ctx) {
   const int token = blockIdx.x;
@@ -496,8 +496,8 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
   for (int t = 0; t < kAttnChanTiles; ++t) {
     acc[t] = v8f{};
   }
-  const _Float16* q_row =
-      qh + (static_cast<std::size_t>(group * 16 + col) * tokens + token) *
+  const float* q_row =
+      qf + (static_cast<std::size_t>(group * 16 + col) * tokens + token) *
                kDsaLatent;
 
   for (int base = 0; base < nvis; base += kAttnKeys) {
@@ -526,9 +526,21 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
       v8f s = v8f{};
       const _Float16* k_row = &rows[half * 16 + col][0];
       for (int step = 0; step < kDsaLatent / 16; ++step) {
-        const v16h a = *reinterpret_cast<const v16h*>(q_row + step * 16);
+        v16h a;
+        v16h a_lo;
+        for (int e = 0; e < 16; e += 4) {
+          const float4 f =
+              *reinterpret_cast<const float4*>(q_row + step * 16 + e);
+          const float fv[4] = {f.x, f.y, f.z, f.w};
+          for (int u = 0; u < 4; ++u) {
+            const _Float16 hi = static_cast<_Float16>(fv[u]);
+            a[e + u] = hi;
+            a_lo[e + u] = static_cast<_Float16>(fv[u] - static_cast<float>(hi));
+          }
+        }
         const v16h b = *reinterpret_cast<const v16h*>(k_row + step * 16);
         s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
+        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b, s);
       }
       for (int i = 0; i < 8; ++i) {
         score[group][2 * i + row_hi][half * 16 + col] = s[i] * scale;
@@ -722,12 +734,11 @@ int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int DsaAttendBatch(const void* qabs_half, const float* lat, const int* selected,
+int DsaAttendBatch(const float* qabs, const float* lat, const int* selected,
                    int pos0, int tokens, int top_pools, float scale, float* ctx,
                    hipStream_t stream) {
   DsaAttendWmmaKernel<<<tokens, kAttnWaves * kWaveLanes, 0, stream>>>(
-      static_cast<const _Float16*>(qabs_half), lat, selected, pos0, tokens,
-      top_pools, scale, ctx);
+      qabs, lat, selected, pos0, tokens, top_pools, scale, ctx);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
