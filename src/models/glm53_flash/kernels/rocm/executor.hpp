@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -64,14 +65,18 @@ public:
 
   // Runs a prompt in chunks of prefill_chunk tokens; logits (via Logits) are
   // those of the final token.
+  // `chunk` (0 = prefill_chunk) may be smaller than the configured capacity.
   bool Prefill(Session& session, std::span<const std::int32_t> tokens,
-               std::string* error);
+               std::string* error, std::size_t chunk = 0);
 
   // Host copies; valid after Evaluate returns.
   std::vector<float> Logits(const Session& session);
   std::vector<float> Residual(const Session& session);
 
   [[nodiscard]] std::uint32_t layers() const { return layers_; }
+
+  // Per-stage wall times when GUFO_GLM53_PROFILE is set (adds syncs).
+  void PrintProfile();
 
 private:
   Executor() = default;
@@ -104,6 +109,9 @@ private:
   hipStream_t stream_{nullptr};
   void* staging_{nullptr};
   float* last_residual_{nullptr};
+  bool profile_{false};
+  double profile_seconds_[5]{};
+  std::chrono::steady_clock::time_point profile_mark_{};
 };
 
 }  // namespace gufo::models::glm53_flash::rocm

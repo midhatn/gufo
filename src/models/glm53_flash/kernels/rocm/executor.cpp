@@ -4,6 +4,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "src/core/quant/ggml_dequant.hpp"
@@ -253,6 +256,7 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     return nullptr;
   ex->config_ = *config;
   ex->options_ = options;
+  ex->profile_ = std::getenv("GUFO_GLM53_PROFILE") != nullptr;
   ex->layers_ = options.layers == 0
                     ? ex->config_.TrunkLayers()
                     : std::min(options.layers, ex->config_.TrunkLayers());
@@ -617,15 +621,29 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
                  hipMemcpyHostToDevice, stream_);
   hipStreamSynchronize(stream_);
 
+  const bool profile = profile_;
+  auto mark = [&](int bucket) {
+    if (!profile)
+      return;
+    hipStreamSynchronize(stream_);
+    const auto now = std::chrono::steady_clock::now();
+    profile_seconds_[bucket] +=
+        std::chrono::duration<double>(now - profile_mark_).count();
+    profile_mark_ = now;
+  };
+  profile_mark_ = std::chrono::steady_clock::now();
   for (std::uint32_t layer = 0; layer < layers_; ++layer) {
     const LayerWeights& w = weights_[layer];
     HcPre(b.x[cur], w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
           w.hc_attn_base->f32(), w.attn_norm->f32(), config_.hc_eps, b.y,
           b.post, b.comb, stream_, T);
+    mark(0);
     if (w.kda) {
       KdaBlock(layer, session, T);
+      mark(1);
     } else {
       DsaBlock(layer, session, T);
+      mark(2);
     }
     HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
     cur = 1 - cur;
@@ -633,9 +651,12 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     HcPre(b.x[cur], w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(),
           w.hc_ffn_base->f32(), w.ffn_norm->f32(), config_.hc_eps, b.y, b.post,
           b.comb, stream_, T);
+    mark(0);
     FfnBlock(layer, T);
+    mark(w.dense ? 3 : 4);
     HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
     cur = 1 - cur;
+    mark(0);
   }
   last_residual_ =
       b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
@@ -655,19 +676,36 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
   return true;
 }
 
+void Executor::PrintProfile() {
+  if (!profile_)
+    return;
+  static const char* kNames[] = {"hc", "kda", "dsa", "ffn-dense", "ffn-moe"};
+  double total = 0.0;
+  for (const double v : profile_seconds_)
+    total += v;
+  for (int i = 0; i < 5; ++i) {
+    std::printf("  %-10s %7.3f s %5.1f%%\n", kNames[i], profile_seconds_[i],
+                100.0 * profile_seconds_[i] / std::max(total, 1e-9));
+  }
+  std::fill(std::begin(profile_seconds_), std::end(profile_seconds_), 0.0);
+}
+
 bool Executor::Evaluate(Session& session, std::int32_t token,
                         std::string* error) {
   return Forward(session, &token, 1, true, error);
 }
 
 bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
-                       std::string* error) {
+                       std::string* error, std::size_t chunk_size) {
   if (tokens.empty()) {
     if (error != nullptr)
       *error = "empty prompt";
     return false;
   }
-  const std::size_t chunk = options_.prefill_chunk;
+  const std::size_t chunk =
+      chunk_size == 0
+          ? options_.prefill_chunk
+          : std::min<std::size_t>(chunk_size, options_.prefill_chunk);
   for (std::size_t at = 0; at < tokens.size(); at += chunk) {
     const std::size_t n = std::min(chunk, tokens.size() - at);
     const bool last = at + n == tokens.size();
