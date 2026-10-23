@@ -15,10 +15,6 @@
 #include "src/models/glm53_flash/kernels/rocm/dsa.hpp"
 #include "src/models/glm53_flash/runtime/config.hpp"
 
-namespace gufo::models::qwen38_flash_next::rocm {
-class NpuGemm;
-}
-
 namespace gufo::models::glm53_flash::rocm {
 
 struct ExecutorOptions {
@@ -178,13 +174,9 @@ private:
                 int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
-  void ShexpGateUp(const LayerWeights& w, const Act& y, int tokens) const;
-  bool NpuShexp(std::uint32_t layer, int tokens) const;
-  void NpuShexpFinish(std::uint32_t layer, int tokens) const;
   void HcPreStep(const float* x, const DeviceTensor& fn, const float* scale,
                  const float* base, const float* norm_w, int tokens) const;
 
-  bool SetupNpu(std::string* error);
   std::unique_ptr<core::GgufReader> reader_;
   Config config_;
   ExecutorOptions options_;
@@ -192,11 +184,6 @@ private:
   std::unordered_map<std::string, DeviceTensor> tensors_;
   std::vector<LayerWeights> weights_;
   std::unique_ptr<Scratch> scratch_;
-  std::unique_ptr<gufo::models::qwen38_flash_next::rocm::NpuGemm> npu_;
-  std::vector<std::vector<int>> npu_shexp_;
-  int npu_a_{-1};
-  int npu_a_lo_{-1};
-  std::vector<int> npu_c_;
   hipStream_t stream_{nullptr};
   void* staging_{nullptr};
   void* blas_{nullptr};  // hipblasHandle_t
