@@ -26,6 +26,12 @@ struct ExecutorOptions {
   std::uint32_t prefill_chunk{256};
   // Skip the output head (embedding to residual only).
   bool head{true};
+  // Drafter feature taps: after each listed layer the stream mean of the last
+  // `dflash_rows` rows of a forward pass is kept in DflashCapture().
+  std::vector<std::uint32_t> dflash_layers;
+  std::uint32_t dflash_rows{0};
+  // Largest number of trailing rows whose logits one forward can return.
+  std::uint32_t logit_rows{1};
 };
 
 struct DeviceTensor {
@@ -58,6 +64,14 @@ public:
   struct Session {
     std::uint32_t position{0};
     std::vector<LayerState> layers;
+    std::vector<float*> saved_conv;  // SaveState snapshots
+    std::vector<float*> saved_state;
+    std::uint32_t saved_position{0};
+    // KDA operands of the last recorded forward, per layer, for Rollback.
+    struct KdaLog {
+      float *raw_q{}, *raw_k{}, *raw_v{}, *decay{}, *beta{};
+    };
+    std::vector<KdaLog> kda_log;
     ~Session();
   };
 
@@ -73,6 +87,45 @@ public:
   // Runs one token through the trunk (and head unless disabled).
   bool Evaluate(Session& session, std::int32_t token, std::string* error);
 
+  // Runs `tokens` (at most prefill_chunk) as one batch and leaves the logits of
+  // the last `rows` of them (rows <= logit_rows); ArgmaxRows() reads the
+  // greedy choice for each.
+  bool Verify(Session& session, std::span<const std::int32_t> tokens,
+              std::uint32_t rows, std::string* error);
+  // Greedy token of each of the last `rows` verified rows.
+  std::vector<std::int32_t> ArgmaxRows(std::uint32_t rows);
+  // Saves / restores the recurrent state (KDA) so a rejected draft can be
+  // replayed; the caller restores session.position itself.
+  bool SaveState(Session& session, std::string* error);
+  void RestoreState(Session& session);
+  // After SaveState + a recorded Step: undo the forward and re-apply only its
+  // first `keep` tokens to the recurrent state (conv history and delta state
+  // rebuilt from the recorded operands), leaving session.position at
+  // saved position + keep. Attention caches need no repair.
+  bool Rollback(Session& session, std::uint32_t keep, std::string* error);
+  // Records the KDA operands of the next Steps (set before a verification).
+  void SetRecording(bool on) { recording_ = on; }
+
+  // Drafter features of the last forward: [rows][taps * 4096] on the device,
+  // for absolute positions DflashPosition() ...
+  [[nodiscard]] const float* DflashCapture() const;
+  [[nodiscard]] std::uint32_t DflashRows() const { return capture_rows_; }
+  [[nodiscard]] std::uint32_t DflashPosition() const {
+    return capture_position_;
+  }
+  // Device views of the embedding and output head for the drafter.
+  [[nodiscard]] const DeviceTensor* TokenEmbedding() const;
+  [[nodiscard]] const DeviceTensor* Output() const;
+  [[nodiscard]] const Config& config() const { return config_; }
+
+  // One batched forward of `tokens` (at most prefill_chunk) that keeps the
+  // logits of the last `logit_rows` of them and the drafter taps.
+  bool Step(Session& session, std::span<const std::int32_t> tokens,
+            std::uint32_t logit_rows, std::string* error) {
+    return Forward(session, tokens.data(), static_cast<int>(tokens.size()),
+                   static_cast<int>(logit_rows), error);
+  }
+
   // Runs a prompt in chunks of prefill_chunk tokens; logits (via Logits) are
   // those of the final token.
   // `chunk` (0 = prefill_chunk) may be smaller than the configured capacity.
@@ -84,6 +137,9 @@ public:
   std::vector<float> Residual(const Session& session);
 
   [[nodiscard]] std::uint32_t layers() const { return layers_; }
+  [[nodiscard]] std::uint32_t PrefillChunk() const {
+    return options_.prefill_chunk;
+  }
 
   // Per-stage wall times when GUFO_GLM53_PROFILE is set (adds syncs).
   void PrintProfile();
@@ -102,7 +158,7 @@ private:
   bool AllocScratch(std::string* error);
 
   bool Forward(Session& session, const std::int32_t* tokens, int count,
-               bool want_logits, std::string* error);
+               int logit_rows, std::string* error);
   // A projection input: F32 rows and, for wide batches, the same rows
   // quantized once into the tiled Q8 layout the W8A8 GEMM reads.
   struct Act {
@@ -129,6 +185,12 @@ private:
   void* staging_{nullptr};
   void* blas_{nullptr};  // hipblasHandle_t
   float* last_residual_{nullptr};
+  std::vector<std::uint32_t> dflash_taps_;
+  std::uint32_t capture_rows_{0};
+  int last_logit_rows_{1};
+  std::uint32_t capture_position_{0};
+  DeviceTensor token_embd_dev_{};
+  bool recording_{false};
   bool profile_{false};
   mutable std::size_t arena_used_{0};
   mutable double profile_seconds_[10]{};

@@ -121,7 +121,8 @@ struct Executor::Scratch {
   float *rlogits{}, *wts{}, *parts{}, *sg{}, *su{}, *sact{}, *shared{};
   int* ids{};
   // Head
-  float *head_in{}, *logits{};
+  float *head_in{}, *logits{}, *dflash_capture{};
+  int* argmax{};
   char* q8_arena{};
   std::size_t q8_arena_bytes{0};
   // Routed-expert F16 route (prefill).
@@ -137,6 +138,23 @@ struct Executor::Scratch {
 };
 
 Executor::Session::~Session() {
+  for (auto& log : kda_log) {
+    for (void* p :
+         {static_cast<void*>(log.raw_q), static_cast<void*>(log.raw_k),
+          static_cast<void*>(log.raw_v), static_cast<void*>(log.decay),
+          static_cast<void*>(log.beta)}) {
+      if (p != nullptr)
+        hipFree(p);
+    }
+  }
+  for (float* p : saved_conv) {
+    if (p != nullptr)
+      hipFree(p);
+  }
+  for (float* p : saved_state) {
+    if (p != nullptr)
+      hipFree(p);
+  }
   for (auto& l : layers) {
     for (void* p :
          {static_cast<void*>(l.conv), static_cast<void*>(l.state),
@@ -360,6 +378,24 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       return nullptr;
     }
   }
+  if (!options.dflash_layers.empty()) {
+    if (options.dflash_rows == 0) {
+      if (error != nullptr)
+        *error = "drafter taps need dflash_rows";
+      return nullptr;
+    }
+    for (const auto tap : options.dflash_layers) {
+      if (tap >= ex->layers_) {
+        if (error != nullptr)
+          *error = "drafter tap layer exceeds the loaded trunk";
+        return nullptr;
+      }
+    }
+    ex->dflash_taps_ = options.dflash_layers;
+    if (!ex->Upload("token_embd.weight", error))
+      return nullptr;
+    ex->token_embd_dev_ = ex->tensors_.at("token_embd.weight");
+  }
   if (head) {
     for (const char* name : {"output_norm.weight", "output.weight"}) {
       if (!ex->Upload(name, error))
@@ -544,8 +580,13 @@ bool Executor::AllocScratch(std::string* error) {
   }
   s.q8_arena_bytes = c * std::size_t{160} * 1024;
   take(&s.q8_arena, s.q8_arena_bytes);
-  take(&s.head_in, kHidden);
-  take(&s.logits, config_.vocab_size);
+  take(&s.head_in, std::size_t{options_.logit_rows} * kHidden);
+  take(&s.argmax, options_.logit_rows);
+  if (options_.dflash_rows != 0) {
+    take(&s.dflash_capture, std::size_t{options_.dflash_rows} *
+                                options_.dflash_layers.size() * kHidden);
+  }
+  take(&s.logits, std::size_t{options_.logit_rows} * config_.vocab_size);
   return ok;
 }
 
@@ -626,6 +667,18 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   Proj(*w.attn_q, y, b.kq, T);
   Proj(*w.attn_k, y, b.kk, T);
   Proj(*w.attn_v, y, b.kv, T);
+  const bool record = recording_ && !s.kda_log.empty() &&
+                      T <= static_cast<int>(options_.logit_rows);
+  if (record) {
+    const std::size_t bytes =
+        static_cast<std::size_t>(T) * kKdaInner * sizeof(float);
+    hipMemcpyAsync(s.kda_log[layer].raw_q, b.kq, bytes, hipMemcpyDeviceToDevice,
+                   stream_);
+    hipMemcpyAsync(s.kda_log[layer].raw_k, b.kk, bytes, hipMemcpyDeviceToDevice,
+                   stream_);
+    hipMemcpyAsync(s.kda_log[layer].raw_v, b.kv, bytes, hipMemcpyDeviceToDevice,
+                   stream_);
+  }
   KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
           w.conv_v->f32(), stream_, T);
   Proj(*w.ssm_f_a, y, b.fa, T);
@@ -633,6 +686,14 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   Proj(*w.ssm_beta, y, b.braw, T);
   KdaGates(b.fproj, w.ssm_dt->f32(), w.ssm_a->f32(), b.braw, b.decay, b.beta,
            stream_, T);
+  if (record) {
+    hipMemcpyAsync(s.kda_log[layer].decay, b.decay,
+                   static_cast<std::size_t>(T) * kKdaInner * sizeof(float),
+                   hipMemcpyDeviceToDevice, stream_);
+    hipMemcpyAsync(s.kda_log[layer].beta, b.beta,
+                   static_cast<std::size_t>(T) * kKdaHeads * sizeof(float),
+                   hipMemcpyDeviceToDevice, stream_);
+  }
   KdaRecur(b.kq, b.kk, b.kv, b.decay, b.beta, st.state, b.o, stream_, T);
   Proj(*w.ssm_g_a, y, b.ga, T);
   Proj(*w.ssm_g_b, Prep(b.ga, T, kKdaHeadDim), b.g2, T);
@@ -798,7 +859,7 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
 }
 
 bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
-                       bool want_logits, std::string* error) {
+                       int logit_rows, std::string* error) {
   if (T <= 0 || T > static_cast<int>(options_.prefill_chunk)) {
     if (error != nullptr)
       *error = "bad chunk size";
@@ -873,15 +934,33 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     mark(w.dense ? 3 : 4);
     HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
     cur = 1 - cur;
+    if (!dflash_taps_.empty()) {
+      const auto tap =
+          std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
+      if (tap != dflash_taps_.end()) {
+        const int rows = std::min<int>(T, options_.dflash_rows);
+        MeanStreams(
+            b.x[cur], T - rows, rows, b.dflash_capture,
+            static_cast<long long>(dflash_taps_.size()) * kHidden,
+            static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
+            stream_);
+        capture_rows_ = static_cast<std::uint32_t>(rows);
+        capture_position_ =
+            session.position + static_cast<std::uint32_t>(T - rows);
+      }
+    }
     mark(0);
   }
   last_residual_ =
       b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
-  if (want_logits && options_.head) {
+  if (logit_rows > 0 && options_.head) {
     const DeviceTensor& norm = *Find("output_norm.weight");
     const DeviceTensor& out = *Find("output.weight");
-    HeadNorm(last_residual_, norm.f32(), b.head_in, stream_);
-    Proj(out, Act{b.head_in, nullptr}, b.logits, 1);
+    HeadNorm(b.x[cur] +
+                 static_cast<std::size_t>(T - logit_rows) * kStreams * kHidden,
+             norm.f32(), b.head_in, stream_, logit_rows);
+    Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
+    last_logit_rows_ = logit_rows;
   }
   session.position += static_cast<std::uint32_t>(T);
   if (hipStreamSynchronize(stream_) != hipSuccess ||
@@ -923,7 +1002,7 @@ void Executor::PrintProfile() {
 
 bool Executor::Evaluate(Session& session, std::int32_t token,
                         std::string* error) {
-  return Forward(session, &token, 1, true, error);
+  return Forward(session, &token, 1, 1, error);
 }
 
 bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
@@ -940,7 +1019,7 @@ bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
   for (std::size_t at = 0; at < tokens.size(); at += chunk) {
     const std::size_t n = std::min(chunk, tokens.size() - at);
     const bool last = at + n == tokens.size();
-    if (!Forward(session, tokens.data() + at, static_cast<int>(n), last,
+    if (!Forward(session, tokens.data() + at, static_cast<int>(n), last ? 1 : 0,
                  error)) {
       return false;
     }
@@ -948,10 +1027,141 @@ bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
+bool Executor::Verify(Session& session, std::span<const std::int32_t> tokens,
+                      std::uint32_t rows, std::string* error) {
+  if (rows == 0 || rows > options_.logit_rows || rows > tokens.size()) {
+    if (error != nullptr)
+      *error = "bad verification row count";
+    return false;
+  }
+  return Forward(session, tokens.data(), static_cast<int>(tokens.size()),
+                 static_cast<int>(rows), error);
+}
+
+std::vector<std::int32_t> Executor::ArgmaxRows(std::uint32_t rows) {
+  std::vector<std::int32_t> out(rows);
+  ::gufo::models::glm53_flash::rocm::ArgmaxRows(
+      scratch_->logits, static_cast<int>(rows),
+      static_cast<int>(config_.vocab_size), scratch_->argmax, stream_);
+  hipMemcpyAsync(out.data(), scratch_->argmax, rows * sizeof(std::int32_t),
+                 hipMemcpyDeviceToHost, stream_);
+  hipStreamSynchronize(stream_);
+  return out;
+}
+
+bool Executor::SaveState(Session& session, std::string* error) {
+  if (session.saved_conv.empty()) {
+    session.saved_conv.assign(layers_, nullptr);
+    session.saved_state.assign(layers_, nullptr);
+    for (std::uint32_t l = 0; l < layers_; ++l) {
+      if (!weights_[l].kda)
+        continue;
+      if (!Alloc(&session.saved_conv[l], 3 * 3 * kKdaInner, error) ||
+          !Alloc(
+              &session.saved_state[l],
+              static_cast<std::size_t>(kKdaHeads) * kKdaHeadDim * kKdaHeadDim,
+              error)) {
+        return false;
+      }
+    }
+  }
+  if (session.kda_log.empty()) {
+    session.kda_log.resize(layers_);
+    const std::size_t cap = options_.logit_rows;
+    for (std::uint32_t l = 0; l < layers_; ++l) {
+      if (!weights_[l].kda)
+        continue;
+      auto& log = session.kda_log[l];
+      if (!Alloc(&log.raw_q, cap * kKdaInner, error) ||
+          !Alloc(&log.raw_k, cap * kKdaInner, error) ||
+          !Alloc(&log.raw_v, cap * kKdaInner, error) ||
+          !Alloc(&log.decay, cap * kKdaInner, error) ||
+          !Alloc(&log.beta, cap * kKdaHeads, error)) {
+        return false;
+      }
+    }
+  }
+  session.saved_position = session.position;
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    if (!weights_[l].kda)
+      continue;
+    hipMemcpyAsync(session.saved_conv[l], session.layers[l].conv,
+                   3 * 3 * kKdaInner * sizeof(float), hipMemcpyDeviceToDevice,
+                   stream_);
+    hipMemcpyAsync(session.saved_state[l], session.layers[l].state,
+                   static_cast<std::size_t>(kKdaHeads) * kKdaHeadDim *
+                       kKdaHeadDim * sizeof(float),
+                   hipMemcpyDeviceToDevice, stream_);
+  }
+  return true;
+}
+
+bool Executor::Rollback(Session& session, std::uint32_t keep,
+                        std::string* error) {
+  if (session.kda_log.empty() || keep == 0 || keep > options_.logit_rows) {
+    if (error != nullptr)
+      *error = "nothing recorded to roll back to";
+    return false;
+  }
+  RestoreState(session);
+  Scratch& b = *scratch_;
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    if (!weights_[l].kda)
+      continue;
+    const LayerWeights& w = weights_[l];
+    const auto& log = session.kda_log[l];
+    const std::size_t bytes =
+        static_cast<std::size_t>(keep) * kKdaInner * sizeof(float);
+    hipMemcpyAsync(b.kq, log.raw_q, bytes, hipMemcpyDeviceToDevice, stream_);
+    hipMemcpyAsync(b.kk, log.raw_k, bytes, hipMemcpyDeviceToDevice, stream_);
+    hipMemcpyAsync(b.kv, log.raw_v, bytes, hipMemcpyDeviceToDevice, stream_);
+    KdaConv(b.kq, b.kk, b.kv, session.layers[l].conv, w.conv_q->f32(),
+            w.conv_k->f32(), w.conv_v->f32(), stream_, static_cast<int>(keep));
+    KdaRecur(b.kq, b.kk, b.kv, log.decay, log.beta, session.layers[l].state,
+             b.o, stream_, static_cast<int>(keep));
+  }
+  session.position = session.saved_position + keep;
+  if (hipStreamSynchronize(stream_) != hipSuccess) {
+    if (error != nullptr)
+      *error = "HIP error during rollback";
+    return false;
+  }
+  return true;
+}
+
+void Executor::RestoreState(Session& session) {
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    if (!weights_[l].kda || session.saved_conv.empty())
+      continue;
+    hipMemcpyAsync(session.layers[l].conv, session.saved_conv[l],
+                   3 * 3 * kKdaInner * sizeof(float), hipMemcpyDeviceToDevice,
+                   stream_);
+    hipMemcpyAsync(session.layers[l].state, session.saved_state[l],
+                   static_cast<std::size_t>(kKdaHeads) * kKdaHeadDim *
+                       kKdaHeadDim * sizeof(float),
+                   hipMemcpyDeviceToDevice, stream_);
+  }
+  hipStreamSynchronize(stream_);
+}
+
+const float* Executor::DflashCapture() const {
+  return scratch_->dflash_capture;
+}
+
+const DeviceTensor* Executor::TokenEmbedding() const {
+  return token_embd_dev_.data != nullptr ? &token_embd_dev_ : nullptr;
+}
+
+const DeviceTensor* Executor::Output() const {
+  return Find("output.weight");
+}
+
 std::vector<float> Executor::Logits(const Session&) {
   std::vector<float> out(config_.vocab_size);
-  hipMemcpy(out.data(), scratch_->logits, out.size() * sizeof(float),
-            hipMemcpyDeviceToHost);
+  hipMemcpy(out.data(),
+            scratch_->logits + static_cast<std::size_t>(last_logit_rows_ - 1) *
+                                   config_.vocab_size,
+            out.size() * sizeof(float), hipMemcpyDeviceToHost);
   return out;
 }
 

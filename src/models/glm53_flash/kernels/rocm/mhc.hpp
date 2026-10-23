@@ -24,7 +24,17 @@ int HcPost(const float* x, const float* block, const float* post,
            const float* comb, float* next, hipStream_t stream, int tokens = 1);
 
 // out = RMSNorm(mean_s x_s) * w.
-int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream);
+int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream,
+             int rows = 1);
+
+// dst[r * dst_stride + tap_offset + i] = mean over the 4 streams of
+// x[(first_row + r)][s][i] for r < rows (a drafter feature tap).
+int MeanStreams(const float* x, int first_row, int rows, float* dst,
+                long long dst_stride, long long tap_offset, hipStream_t stream);
+
+// out[r] = index of the largest logit of row r (lowest index on ties).
+int ArgmaxRows(const float* logits, int rows, int vocab, int* out,
+               hipStream_t stream);
 
 }  // namespace gufo::models::glm53_flash::rocm
 

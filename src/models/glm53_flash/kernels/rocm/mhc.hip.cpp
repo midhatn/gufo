@@ -188,6 +188,8 @@ __global__ __launch_bounds__(kThreads) void HeadNormKernel(
     const float* __restrict__ x, const float* __restrict__ w,
     float* __restrict__ out) {
   __shared__ float scratch[kMaxWaves];
+  x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
+  out += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
   const int tid = threadIdx.x;
   float v[kPerThread];
   float sq = 0.0F;
@@ -207,7 +209,71 @@ __global__ __launch_bounds__(kThreads) void HeadNormKernel(
   }
 }
 
+__global__ void MeanStreamsKernel(const float* __restrict__ x, int first_row,
+                                  float* __restrict__ dst, long long dst_stride,
+                                  long long tap_offset) {
+  const int r = blockIdx.x;
+  const float* row = x + static_cast<std::size_t>(first_row + r) * kStreamsFlat;
+  float* out = dst + r * dst_stride + tap_offset;
+  for (int i = threadIdx.x; i < kHcHidden; i += blockDim.x) {
+    float acc = 0.0F;
+    for (int s = 0; s < kHcStreams; ++s) {
+      acc += row[s * kHcHidden + i];
+    }
+    out[i] = acc / kHcStreams;
+  }
+}
+
+constexpr int kArgmaxThreads = 1024;
+
+__global__ __launch_bounds__(kArgmaxThreads) void ArgmaxRowsKernel(
+    const float* __restrict__ logits, int vocab, int* __restrict__ out) {
+  __shared__ float best_value[kArgmaxThreads];
+  __shared__ int best_index[kArgmaxThreads];
+  const float* row = logits + static_cast<std::size_t>(blockIdx.x) * vocab;
+  float value = -INFINITY;
+  int index = 0x7FFFFFFF;
+  for (int i = threadIdx.x; i < vocab; i += kArgmaxThreads) {
+    if (row[i] > value) {
+      value = row[i];
+      index = i;
+    }
+  }
+  best_value[threadIdx.x] = value;
+  best_index[threadIdx.x] = index;
+  __syncthreads();
+  for (int stride = kArgmaxThreads / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float ov = best_value[threadIdx.x + stride];
+      const int oi = best_index[threadIdx.x + stride];
+      if (ov > best_value[threadIdx.x] ||
+          (ov == best_value[threadIdx.x] && oi < best_index[threadIdx.x])) {
+        best_value[threadIdx.x] = ov;
+        best_index[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    out[blockIdx.x] = best_index[0];
+  }
+}
+
 }  // namespace
+
+int MeanStreams(const float* x, int first_row, int rows, float* dst,
+                long long dst_stride, long long tap_offset,
+                hipStream_t stream) {
+  MeanStreamsKernel<<<rows, 256, 0, stream>>>(x, first_row, dst, dst_stride,
+                                              tap_offset);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int ArgmaxRows(const float* logits, int rows, int vocab, int* out,
+               hipStream_t stream) {
+  ArgmaxRowsKernel<<<rows, kArgmaxThreads, 0, stream>>>(logits, vocab, out);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
 
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
@@ -225,8 +291,9 @@ int HcPost(const float* x, const float* block, const float* post,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream) {
-  HeadNormKernel<<<1, kThreads, 0, stream>>>(x, w, out);
+int HeadNorm(const float* x, const float* w, float* out, hipStream_t stream,
+             int rows) {
+  HeadNormKernel<<<rows, kThreads, 0, stream>>>(x, w, out);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
