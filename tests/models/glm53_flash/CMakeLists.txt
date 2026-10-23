@@ -131,6 +131,9 @@ if(ENGINE_ENABLE_HIP)
     LABELS "gpu;glm53;kernel;external-model"
     SKIP_RETURN_CODE 77)
 
+  add_executable(glm53_attend_test attend_test.cpp)
+  target_link_libraries(glm53_attend_test PRIVATE gufo_glm53_flash_rocm)
+
   add_executable(glm53_dsa_test dsa_test.cpp)
   target_link_libraries(glm53_dsa_test PRIVATE gufo_glm53_flash_rocm)
   add_test(NAME glm53.dsa

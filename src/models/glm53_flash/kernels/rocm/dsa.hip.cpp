@@ -16,6 +16,32 @@ constexpr int kAttendThreads = 256;
 constexpr int kAttendWaves = kAttendThreads / kWaveLanes;
 constexpr int kIndexElems = kDsaIndexDim / kWaveLanes;
 
+// Lane i receives lane (i ^ offset)'s value (DPP row_xmask below 16,
+// permlanex16 for 16) instead of an LDS crossbar round trip. Every lane must be
+// active.
+__device__ __forceinline__ int XorLane(int v, int offset) {
+#if defined(__gfx1151__)
+  switch (offset) {
+    case 1:
+      return __builtin_amdgcn_update_dpp(0, v, 0x161, 0xF, 0xF, false);
+    case 2:
+      return __builtin_amdgcn_update_dpp(0, v, 0x162, 0xF, 0xF, false);
+    case 4:
+      return __builtin_amdgcn_update_dpp(0, v, 0x164, 0xF, 0xF, false);
+    case 8:
+      return __builtin_amdgcn_update_dpp(0, v, 0x168, 0xF, 0xF, false);
+    case 16:
+      return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false,
+                                          false);
+  }
+#endif
+  return __shfl_xor(v, offset, kWaveLanes);
+}
+
+__device__ __forceinline__ float XorLane(float v, int offset) {
+  return __builtin_bit_cast(float, XorLane(__builtin_bit_cast(int, v), offset));
+}
+
 __device__ float WaveSum(float v) {
   for (int offset = kWaveLanes / 2; offset > 0; offset >>= 1) {
     v += __shfl_xor(v, offset, kWaveLanes);
@@ -587,7 +613,7 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
   const int row_hi = lane >> 4;
 
   __shared__ _Float16 rows[kAttnKeys][kAttnRowPad];
-  __shared__ float score[kAttnGroups][16][kAttnKeys + 1];
+  __shared__ float score[kAttnGroups][2][16][kAttnKeys + 1];
   __shared__ _Float16 prob[kAttnGroups][16][kAttnKeys];
   __shared__ float run_max[kAttnGroups * 16];
   __shared__ float alpha[kAttnGroups * 16];
@@ -624,9 +650,12 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
     }
     __syncthreads();
     {
-      v8f s = v8f{};
-      const _Float16* k_row = &rows[half * 16 + col][0];
-      for (int step = 0; step < kDsaLatent / 16; ++step) {
+      v8f s0 = v8f{};
+      v8f s1 = v8f{};
+      const _Float16* k0 = &rows[col][0];
+      const _Float16* k1 = &rows[16 + col][0];
+      for (int step = half * (kDsaLatent / 32);
+           step < (half + 1) * (kDsaLatent / 32); ++step) {
         v16h a;
         v16h a_lo;
         for (int e = 0; e < 16; e += 4) {
@@ -639,44 +668,52 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
             a_lo[e + u] = static_cast<_Float16>(fv[u] - static_cast<float>(hi));
           }
         }
-        const v16h b = *reinterpret_cast<const v16h*>(k_row + step * 16);
-        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, s);
-        s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b, s);
+        const v16h b0 = *reinterpret_cast<const v16h*>(k0 + step * 16);
+        const v16h b1 = *reinterpret_cast<const v16h*>(k1 + step * 16);
+        s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, s0);
+        s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, s1);
+        s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b0, s0);
+        s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b1, s1);
       }
       for (int i = 0; i < 8; ++i) {
-        score[group][2 * i + row_hi][half * 16 + col] = s[i] * scale;
+        score[group][half][2 * i + row_hi][col] = s0[i] * scale;
+        score[group][half][2 * i + row_hi][16 + col] = s1[i] * scale;
       }
     }
     __syncthreads();
-    if (tid < kAttnGroups * 16) {
-      const int g = tid >> 4;
-      const int h = tid & 15;
-      float best = score[g][h][0];
-      for (int j = 1; j < n; ++j) {
-        best = fmaxf(best, score[g][h][j]);
+    {
+      const int gh = tid >> 2;
+      const int part = tid & 3;
+      const int g = gh >> 4;
+      const int h = gh & 15;
+      constexpr int kPerLane = kAttnKeys / 4;
+      float best = -1e30F;
+      for (int j = part * kPerLane; j < (part + 1) * kPerLane; ++j) {
+        if (j < n) {
+          best = fmaxf(best, score[g][0][h][j] + score[g][1][h][j]);
+        }
       }
-      const float next = fmaxf(run_max[tid], best);
-      alpha[tid] = expf(run_max[tid] - next);
-      run_max[tid] = next;
-    }
-    __syncthreads();
-    for (int e = tid; e < kAttnGroups * 16 * kAttnKeys;
-         e += kAttnWaves * kWaveLanes) {
-      const int j = e % kAttnKeys;
-      const int gh = e / kAttnKeys;
-      const float p =
-          j < n ? expf(score[gh >> 4][gh & 15][j] - run_max[gh]) : 0.0F;
-      score[gh >> 4][gh & 15][j] = p;
-      prob[gh >> 4][gh & 15][j] = static_cast<_Float16>(p);
-    }
-    __syncthreads();
-    if (tid < kAttnGroups * 16) {
+      best = fmaxf(best, XorLane(best, 1));
+      best = fmaxf(best, XorLane(best, 2));
+      const float old_max = run_max[gh];
+      const float next = fmaxf(old_max, best);
       float sum = 0.0F;
-      for (int j = 0; j < kAttnKeys; ++j) {
-        sum += score[tid >> 4][tid & 15][j];
+      for (int j = part * kPerLane; j < (part + 1) * kPerLane; ++j) {
+        const float p =
+            j < n ? expf(score[g][0][h][j] + score[g][1][h][j] - next) : 0.0F;
+        prob[g][h][j] = static_cast<_Float16>(p);
+        sum += p;
       }
-      denom[tid] = denom[tid] * alpha[tid] + sum;
+      sum += XorLane(sum, 1);
+      sum += XorLane(sum, 2);
+      if (part == 0) {
+        const float scale_old = expf(old_max - next);
+        alpha[gh] = scale_old;
+        run_max[gh] = next;
+        denom[gh] = denom[gh] * scale_old + sum;
+      }
     }
+    __syncthreads();
     float a_scale[8];
     for (int i = 0; i < 8; ++i) {
       a_scale[i] = alpha[group * 16 + 2 * i + row_hi];
