@@ -1,5 +1,7 @@
 #include "src/models/glm53_flash/kernels/rocm/mhc.hpp"
 
+#include "src/models/glm53_flash/kernels/rocm/xor_lane.hpp"
+
 namespace gufo::models::glm53_flash::rocm {
 
 namespace {
@@ -78,69 +80,55 @@ __global__ __launch_bounds__(kThreads) void HcMixKernel(
   }
 }
 
-// One thread per token: the post / comb / pre mixing weights.
-__global__ void HcSinkKernel(float* __restrict__ scratch_io,
-                             const float* __restrict__ scale,
-                             const float* __restrict__ base, float eps,
-                             float* __restrict__ post_out,
-                             float* __restrict__ comb_out, int tokens) {
-  const int token = blockIdx.x * blockDim.x + threadIdx.x;
+// One wave per token: the post / comb / pre mixing weights. Lane i < 16 holds
+// comb[i] (dst i % 4, src i / 4); the row softmax and the Sinkhorn sums are
+// lane exchanges within groups of four.
+__global__ __launch_bounds__(32) void HcSinkKernel(
+    float* __restrict__ scratch_io, const float* __restrict__ scale,
+    const float* __restrict__ base, float eps, float* __restrict__ post_out,
+    float* __restrict__ comb_out, int tokens) {
+  const int token = blockIdx.x;
+  const int lane = threadIdx.x;
   if (token >= tokens) {
     return;
   }
   float* scratch = scratch_io + static_cast<std::size_t>(token) * kPreStride;
-  float* pre = scratch + kReduceSlots;
-  post_out += token * kHcStreams;
-  comb_out += token * kHcStreams * kHcStreams;
-  float mixes[kHcMixes];
   const float inv = rsqrtf(scratch[kHcMixes] / kStreamsFlat + kRmsEps);
-  for (int j = 0; j < kHcMixes; ++j) {
-    mixes[j] = scratch[j] * inv;
+  if (lane < kHcStreams) {
+    scratch[kReduceSlots + lane] =
+        Sigmoid(scratch[lane] * inv * scale[0] + base[lane]) + eps;
+  } else if (lane < 2 * kHcStreams) {
+    const int s = lane - kHcStreams;
+    post_out[token * kHcStreams + s] =
+        Sigmoid(scratch[kHcStreams + s] * inv * scale[1] +
+                base[kHcStreams + s]) *
+        2.0F;
   }
-  float comb[kHcStreams * kHcStreams];
-  for (int s = 0; s < kHcStreams; ++s) {
-    pre[s] = Sigmoid(mixes[s] * scale[0] + base[s]) + eps;
-    post_out[s] =
-        Sigmoid(mixes[kHcStreams + s] * scale[1] + base[kHcStreams + s]) * 2.0F;
-  }
-  for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
-    comb[i] = mixes[2 * kHcStreams + i] * scale[2] + base[2 * kHcStreams + i];
-  }
-  for (int src = 0; src < kHcStreams; ++src) {
-    double mx = -1e30;
-    double sum = 0.0;
-    for (int d = 0; d < kHcStreams; ++d) {
-      mx = fmax(mx, static_cast<double>(comb[d + kHcStreams * src]));
-    }
-    for (int d = 0; d < kHcStreams; ++d) {
-      comb[d + kHcStreams * src] =
-          static_cast<float>(exp(comb[d + kHcStreams * src] - mx));
-      sum += comb[d + kHcStreams * src];
-    }
-    for (int d = 0; d < kHcStreams; ++d) {
-      comb[d + kHcStreams * src] /= static_cast<float>(sum + eps);
-    }
-  }
+  const int mix = lane & 15;
+  float c = scratch[2 * kHcStreams + mix] * inv * scale[2] +
+            base[2 * kHcStreams + mix];
+  float mx = fmaxf(c, XorLane(c, 1));
+  mx = fmaxf(mx, XorLane(mx, 2));
+  c = static_cast<float>(exp(static_cast<double>(c) - static_cast<double>(mx)));
+  double sum = static_cast<double>(c);
+  sum += XorLane(sum, 1);
+  sum += XorLane(sum, 2);
+  c /= static_cast<float>(sum + eps);
   for (int round = 0; round <= kSinkhornRounds * 2; ++round) {
-    // First pass normalizes over src, then 19 x (over dst, over src).
     const bool over_src = round == 0 || (round % 2) == 0;
-    for (int a = 0; a < kHcStreams; ++a) {
-      double sum = 0.0;
-      for (int b = 0; b < kHcStreams; ++b) {
-        sum += over_src ? comb[a + kHcStreams * b] : comb[b + kHcStreams * a];
-      }
-      const float denom = static_cast<float>(sum + eps);
-      for (int b = 0; b < kHcStreams; ++b) {
-        if (over_src) {
-          comb[a + kHcStreams * b] /= denom;
-        } else {
-          comb[b + kHcStreams * a] /= denom;
-        }
-      }
+    double total = static_cast<double>(c);
+    if (over_src) {
+      total += XorLane(total, 4);
+      total += XorLane(total, 8);
+    } else {
+      total += XorLane(total, 1);
+      total += XorLane(total, 2);
     }
+    c /= static_cast<float>(total + eps);
   }
-  for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
-    comb_out[i] = comb[i];
+  if (lane < kHcStreams * kHcStreams) {
+    comb_out[static_cast<std::size_t>(token) * kHcStreams * kHcStreams + lane] =
+        c;
   }
 }
 
@@ -296,10 +284,9 @@ int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
           int tokens) {
-  constexpr int kSinkBlock = 64;
   HcMixKernel<<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
-  HcSinkKernel<<<(tokens + kSinkBlock - 1) / kSinkBlock, kSinkBlock, 0,
-                 stream>>>(scratch, scale, base, hc_eps, post, comb, tokens);
+  HcSinkKernel<<<tokens, 32, 0, stream>>>(scratch, scale, base, hc_eps, post,
+                                          comb, tokens);
   HcApplyKernel<<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
