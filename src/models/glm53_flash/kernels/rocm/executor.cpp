@@ -118,7 +118,8 @@ struct Executor::Scratch {
   int* sel{};
   // FFN
   float *gate{}, *up{}, *act{};
-  float *rlogits{}, *wts{}, *parts{}, *sg{}, *su{}, *sact{}, *shared{};
+  float *hc_mixes{}, *rlogits{}, *wts{}, *parts{}, *sg{}, *su{}, *sact{},
+      *shared{};
   int* ids{};
   // Head
   float *head_in{}, *logits{}, *dflash_capture{};
@@ -548,6 +549,7 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.gate, c * kFfnScratch);
   take(&s.up, c * kFfnScratch);
   take(&s.act, c * kFfnScratch);
+  take(&s.hc_mixes, c * kHcPreScratch);
   take(&s.rlogits, c * kMoeExperts);
   take(&s.wts, c * kMoeUsed);
   take(&s.ids, c * kMoeUsed);
@@ -949,9 +951,8 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     profile_mark_ = std::chrono::steady_clock::now();
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
       const LayerWeights& w = weights_[layer];
-      HcPre(b.x[cur], w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
-            w.hc_attn_base->f32(), w.attn_norm->f32(), config_.hc_eps, b.y,
-            b.post, b.comb, stream_, T);
+      HcPreStep(b.x[cur], *w.hc_attn_fn, w.hc_attn_scale->f32(),
+                w.hc_attn_base->f32(), w.attn_norm->f32(), T);
       mark(0);
       if (w.kda) {
         KdaBlock(layer, session, T);
@@ -963,9 +964,8 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
       HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
       cur = 1 - cur;
 
-      HcPre(b.x[cur], w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(),
-            w.hc_ffn_base->f32(), w.ffn_norm->f32(), config_.hc_eps, b.y,
-            b.post, b.comb, stream_, T);
+      HcPreStep(b.x[cur], *w.hc_ffn_fn, w.hc_ffn_scale->f32(),
+                w.hc_ffn_base->f32(), w.ffn_norm->f32(), T);
       mark(0);
       FfnBlock(layer, T);
       mark(w.dense ? 3 : 4);
@@ -1058,6 +1058,14 @@ void Executor::DropGraph() {
     graph_exec_ = nullptr;
   }
   graph_session_ = 0;
+}
+
+void Executor::HcPreStep(const float* x, const DeviceTensor& fn,
+                         const float* scale, const float* base,
+                         const float* norm_w, int T) const {
+  const Scratch& b = *scratch_;
+  HcPre(x, fn.f32(), scale, base, norm_w, config_.hc_eps, b.y, b.post, b.comb,
+        b.hc_mixes, stream_, T);
 }
 
 void Executor::Mark(int bucket) const {

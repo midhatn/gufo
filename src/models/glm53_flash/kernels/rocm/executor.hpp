@@ -174,6 +174,8 @@ private:
                 int k, int rows) const;
   void RoutedExpertsF16(const LayerWeights& w, int tokens) const;
   void FfnBlock(std::uint32_t layer, int tokens) const;
+  void HcPreStep(const float* x, const DeviceTensor& fn, const float* scale,
+                 const float* base, const float* norm_w, int tokens) const;
 
   std::unique_ptr<core::GgufReader> reader_;
   Config config_;

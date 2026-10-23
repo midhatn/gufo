@@ -35,24 +35,19 @@ __device__ float BlockSum(float v, float* scratch) {
   return total;
 }
 
-__global__ __launch_bounds__(kThreads) void HcPreKernel(
-    const float* __restrict__ x, const float* __restrict__ fn,
-    const float* __restrict__ scale, const float* __restrict__ base,
-    const float* __restrict__ norm_w, float eps, float* __restrict__ y,
-    float* __restrict__ post_out, float* __restrict__ comb_out) {
-  x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
-  y += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
-  post_out += blockIdx.x * kHcStreams;
-  comb_out += blockIdx.x * kHcStreams * kHcStreams;
-  __shared__ float partial[kReduceSlots][kMaxWaves];
-  __shared__ float mixes[kHcMixes];
-  __shared__ float pre[kHcStreams];
-  __shared__ float scratch[kMaxWaves];
+constexpr int kMixStride = kReduceSlots;
+constexpr int kPreStride = kReduceSlots + kHcStreams;
 
+// mixes[j] = fn_j . x and mixes[kHcMixes] = sum x^2 for one token.
+__global__ __launch_bounds__(kThreads) void HcMixKernel(
+    const float* __restrict__ x, const float* __restrict__ fn,
+    float* __restrict__ scratch_out) {
+  x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
+  scratch_out += static_cast<std::size_t>(blockIdx.x) * kPreStride;
+  __shared__ float partial[kReduceSlots][kMaxWaves];
   const int tid = threadIdx.x;
   const int wave = tid / warpSize;
   const int waves = blockDim.x / warpSize;
-
   float acc[kReduceSlots];
   for (int j = 0; j < kReduceSlots; ++j) {
     acc[j] = 0.0F;
@@ -79,64 +74,86 @@ __global__ __launch_bounds__(kThreads) void HcPreKernel(
     for (int w = 0; w < waves; ++w) {
       total += partial[tid][w];
     }
-    partial[tid][0] = total;
+    scratch_out[tid] = total;
   }
-  __syncthreads();
+}
 
-  if (tid == 0) {
-    const float inv = rsqrtf(partial[kHcMixes][0] / kStreamsFlat + kRmsEps);
-    for (int j = 0; j < kHcMixes; ++j) {
-      mixes[j] = partial[j][0] * inv;
+// One thread per token: the post / comb / pre mixing weights.
+__global__ void HcSinkKernel(float* __restrict__ scratch_io,
+                             const float* __restrict__ scale,
+                             const float* __restrict__ base, float eps,
+                             float* __restrict__ post_out,
+                             float* __restrict__ comb_out, int tokens) {
+  const int token = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token >= tokens) {
+    return;
+  }
+  float* scratch = scratch_io + static_cast<std::size_t>(token) * kPreStride;
+  float* pre = scratch + kReduceSlots;
+  post_out += token * kHcStreams;
+  comb_out += token * kHcStreams * kHcStreams;
+  float mixes[kHcMixes];
+  const float inv = rsqrtf(scratch[kHcMixes] / kStreamsFlat + kRmsEps);
+  for (int j = 0; j < kHcMixes; ++j) {
+    mixes[j] = scratch[j] * inv;
+  }
+  float comb[kHcStreams * kHcStreams];
+  for (int s = 0; s < kHcStreams; ++s) {
+    pre[s] = Sigmoid(mixes[s] * scale[0] + base[s]) + eps;
+    post_out[s] =
+        Sigmoid(mixes[kHcStreams + s] * scale[1] + base[kHcStreams + s]) * 2.0F;
+  }
+  for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
+    comb[i] = mixes[2 * kHcStreams + i] * scale[2] + base[2 * kHcStreams + i];
+  }
+  for (int src = 0; src < kHcStreams; ++src) {
+    double mx = -1e30;
+    double sum = 0.0;
+    for (int d = 0; d < kHcStreams; ++d) {
+      mx = fmax(mx, static_cast<double>(comb[d + kHcStreams * src]));
     }
-    float comb[kHcStreams * kHcStreams];
-    for (int s = 0; s < kHcStreams; ++s) {
-      pre[s] = Sigmoid(mixes[s] * scale[0] + base[s]) + eps;
-      post_out[s] =
-          Sigmoid(mixes[kHcStreams + s] * scale[1] + base[kHcStreams + s]) *
-          2.0F;
+    for (int d = 0; d < kHcStreams; ++d) {
+      comb[d + kHcStreams * src] =
+          static_cast<float>(exp(comb[d + kHcStreams * src] - mx));
+      sum += comb[d + kHcStreams * src];
     }
-    for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
-      comb[i] = mixes[2 * kHcStreams + i] * scale[2] + base[2 * kHcStreams + i];
+    for (int d = 0; d < kHcStreams; ++d) {
+      comb[d + kHcStreams * src] /= static_cast<float>(sum + eps);
     }
-    for (int src = 0; src < kHcStreams; ++src) {
-      double mx = -1e30;
+  }
+  for (int round = 0; round <= kSinkhornRounds * 2; ++round) {
+    // First pass normalizes over src, then 19 x (over dst, over src).
+    const bool over_src = round == 0 || (round % 2) == 0;
+    for (int a = 0; a < kHcStreams; ++a) {
       double sum = 0.0;
-      for (int d = 0; d < kHcStreams; ++d) {
-        mx = fmax(mx, static_cast<double>(comb[d + kHcStreams * src]));
+      for (int b = 0; b < kHcStreams; ++b) {
+        sum += over_src ? comb[a + kHcStreams * b] : comb[b + kHcStreams * a];
       }
-      for (int d = 0; d < kHcStreams; ++d) {
-        comb[d + kHcStreams * src] =
-            static_cast<float>(exp(comb[d + kHcStreams * src] - mx));
-        sum += comb[d + kHcStreams * src];
-      }
-      for (int d = 0; d < kHcStreams; ++d) {
-        comb[d + kHcStreams * src] /= static_cast<float>(sum + eps);
-      }
-    }
-    for (int round = 0; round <= kSinkhornRounds * 2; ++round) {
-      // First pass normalizes over src, then 19 x (over dst, over src).
-      const bool over_src = round == 0 || (round % 2) == 0;
-      for (int a = 0; a < kHcStreams; ++a) {
-        double sum = 0.0;
-        for (int b = 0; b < kHcStreams; ++b) {
-          sum += over_src ? comb[a + kHcStreams * b] : comb[b + kHcStreams * a];
-        }
-        const float denom = static_cast<float>(sum + eps);
-        for (int b = 0; b < kHcStreams; ++b) {
-          if (over_src) {
-            comb[a + kHcStreams * b] /= denom;
-          } else {
-            comb[b + kHcStreams * a] /= denom;
-          }
+      const float denom = static_cast<float>(sum + eps);
+      for (int b = 0; b < kHcStreams; ++b) {
+        if (over_src) {
+          comb[a + kHcStreams * b] /= denom;
+        } else {
+          comb[b + kHcStreams * a] /= denom;
         }
       }
-    }
-    for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
-      comb_out[i] = comb[i];
     }
   }
-  __syncthreads();
+  for (int i = 0; i < kHcStreams * kHcStreams; ++i) {
+    comb_out[i] = comb[i];
+  }
+}
 
+__global__ __launch_bounds__(kThreads) void HcApplyKernel(
+    const float* __restrict__ x, const float* __restrict__ scratch_in,
+    const float* __restrict__ norm_w, float* __restrict__ y) {
+  x += static_cast<std::size_t>(blockIdx.x) * kStreamsFlat;
+  y += static_cast<std::size_t>(blockIdx.x) * kHcHidden;
+  const float* pre = scratch_in +
+                     static_cast<std::size_t>(blockIdx.x) * kPreStride +
+                     kReduceSlots;
+  __shared__ float scratch[kMaxWaves];
+  const int tid = threadIdx.x;
   float z[kPerThread];
   float sq = 0.0F;
   for (int k = 0; k < kPerThread; ++k) {
@@ -277,9 +294,13 @@ int ArgmaxRows(const float* logits, int rows, int vocab, int* out,
 
 int HcPre(const float* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
-          float* post, float* comb, hipStream_t stream, int tokens) {
-  HcPreKernel<<<tokens, kThreads, 0, stream>>>(x, fn, scale, base, norm_w,
-                                               hc_eps, y, post, comb);
+          float* post, float* comb, float* scratch, hipStream_t stream,
+          int tokens) {
+  constexpr int kSinkBlock = 64;
+  HcMixKernel<<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
+  HcSinkKernel<<<(tokens + kSinkBlock - 1) / kSinkBlock, kSinkBlock, 0,
+                 stream>>>(scratch, scale, base, hc_eps, post, comb, tokens);
+  HcApplyKernel<<<tokens, kThreads, 0, stream>>>(x, scratch, norm_w, y);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

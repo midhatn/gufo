@@ -166,8 +166,10 @@ bool CheckLayer(const gufo::core::GgufReader& reader, int layer,
   hipMalloc(&dy, kH * 4);
   hipMalloc(&dpost, kHc * 4);
   hipMalloc(&dcomb, kHc * kHc * 4);
-  const int rc =
-      rocm::HcPre(dx, dfn, dsc, dbs, dnw, kEps, dy, dpost, dcomb, nullptr);
+  float* dscratch;
+  hipMalloc(&dscratch, rocm::kHcPreScratch * 4);
+  const int rc = rocm::HcPre(dx, dfn, dsc, dbs, dnw, kEps, dy, dpost, dcomb,
+                             dscratch, nullptr);
   hipDeviceSynchronize();
   const double ey = Rel(FromDevice(dy, kH), o.y);
   const double ep = Rel(FromDevice(dpost, kHc), o.post);
