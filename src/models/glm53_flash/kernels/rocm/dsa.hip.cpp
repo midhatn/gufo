@@ -562,19 +562,21 @@ __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
 }
 
 constexpr int kAttnKeys = 32;
+constexpr int kAttnGather = kAttnKeys * (kDsaLatent / 8) / (8 * 32);
 constexpr int kAttnWaves = 8;
 constexpr int kAttnRowPad = kDsaLatent + 8;
 constexpr int kAttnGroups = kDsaHeads / 16;
-constexpr int kAttnChanTiles = kDsaLatent / 2 / 16;
+constexpr int kAttnWaveTiles = kDsaLatent / kAttnWaves / 16;
+constexpr int kAttnChanTiles = kAttnGroups * kAttnWaveTiles;
 
 // Absorbed-MLA attention with WMMA: each block takes one token and all 64
 // heads; wave pairs own a 16-head group, the pair splitting the 512 latent
 // channels. Selected latent rows are gathered once per chunk of 32 keys into
 // LDS as F16 and serve as both keys and values; softmax is online over chunks.
 __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
-    const float* __restrict__ qf, const _Float16* __restrict__ lat,
-    const int* __restrict__ selected, int pos0, int tokens, int top,
-    float scale, _Float16* __restrict__ ctx) {
+    const _Float16* __restrict__ q_hi, const _Float16* __restrict__ q_lo,
+    const _Float16* __restrict__ lat, const int* __restrict__ selected,
+    int pos0, int tokens, int top, float scale, _Float16* __restrict__ ctx) {
   const int token = blockIdx.x;
   const int pos = pos0 + token;
   const int nselected = min((pos + 1) / kDsaPool, top);
@@ -603,27 +605,33 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
   for (int t = 0; t < kAttnChanTiles; ++t) {
     acc[t] = v8f{};
   }
-  const float* q_row =
-      qf + (static_cast<std::size_t>(group * 16 + col) * tokens + token) *
-               kDsaLatent;
+  const std::size_t q_off =
+      (static_cast<std::size_t>(group * 16 + col) * tokens + token) *
+      kDsaLatent;
 
-  for (int base = 0; base < nvis; base += kAttnKeys) {
-    const int n = min(kAttnKeys, nvis - base);
-    __syncthreads();
-    for (int idx = tid; idx < kAttnKeys * (kDsaLatent / 8);
-         idx += kAttnWaves * kWaveLanes) {
-      const int j = idx / (kDsaLatent / 8);
-      const int c8 = idx % (kDsaLatent / 8);
+  uint4 prefetch[kAttnGather];
+  const auto fetch = [&](int base) {
+    for (int i = 0; i < kAttnGather; ++i) {
+      const int j = (tid >> 6) + kAttnWaves * kWaveLanes / 64 * i;
+      const int p = base + j;
       uint4 v = make_uint4(0, 0, 0, 0);
-      if (j < n) {
-        const int p = base + j;
+      if (p < nvis) {
         const int row = p < nselected * kDsaPool
                             ? selected[p / kDsaPool] * kDsaPool + (p % kDsaPool)
                             : pos - (p - nselected * kDsaPool);
         v = *reinterpret_cast<const uint4*>(
-            lat + static_cast<std::size_t>(row) * kDsaLatent + c8 * 8);
+            lat + static_cast<std::size_t>(row) * kDsaLatent + (tid & 63) * 8);
       }
-      *reinterpret_cast<uint4*>(&rows[j][c8 * 8]) = v;
+      prefetch[i] = v;
+    }
+  };
+  fetch(0);
+  for (int base = 0; base < nvis; base += kAttnKeys) {
+    const int n = min(kAttnKeys, nvis - base);
+    __syncthreads();
+    for (int i = 0; i < kAttnGather; ++i) {
+      const int j = (tid >> 6) + kAttnWaves * kWaveLanes / 64 * i;
+      *reinterpret_cast<uint4*>(&rows[j][(tid & 63) * 8]) = prefetch[i];
     }
     __syncthreads();
     {
@@ -633,18 +641,9 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
       const _Float16* k1 = &rows[16 + col][0];
       for (int step = half * (kDsaLatent / 32);
            step < (half + 1) * (kDsaLatent / 32); ++step) {
-        v16h a;
-        v16h a_lo;
-        for (int e = 0; e < 16; e += 4) {
-          const float4 f =
-              *reinterpret_cast<const float4*>(q_row + step * 16 + e);
-          const float fv[4] = {f.x, f.y, f.z, f.w};
-          for (int u = 0; u < 4; ++u) {
-            const _Float16 hi = static_cast<_Float16>(fv[u]);
-            a[e + u] = hi;
-            a_lo[e + u] = static_cast<_Float16>(fv[u] - static_cast<float>(hi));
-          }
-        }
+        const v16h a = *reinterpret_cast<const v16h*>(q_hi + q_off + step * 16);
+        const v16h a_lo =
+            *reinterpret_cast<const v16h*>(q_lo + q_off + step * 16);
         const v16h b0 = *reinterpret_cast<const v16h*>(k0 + step * 16);
         const v16h b1 = *reinterpret_cast<const v16h*>(k1 + step * 16);
         s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, s0);
@@ -691,37 +690,46 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
       }
     }
     __syncthreads();
-    float a_scale[8];
-    for (int i = 0; i < 8; ++i) {
-      a_scale[i] = alpha[group * 16 + 2 * i + row_hi];
-    }
-    for (int t = 0; t < kAttnChanTiles; ++t) {
+    fetch(base + kAttnKeys);
+    for (int g = 0; g < kAttnGroups; ++g) {
+      float a_scale[8];
       for (int i = 0; i < 8; ++i) {
-        acc[t][i] *= a_scale[i];
+        a_scale[i] = alpha[g * 16 + 2 * i + row_hi];
+      }
+      for (int t = 0; t < kAttnWaveTiles; ++t) {
+        for (int i = 0; i < 8; ++i) {
+          acc[g * kAttnWaveTiles + t][i] *= a_scale[i];
+        }
       }
     }
     for (int step = 0; step < kAttnKeys / 16; ++step) {
-      const v16h a =
-          *reinterpret_cast<const v16h*>(&prob[group][col][step * 16]);
-      for (int t = 0; t < kAttnChanTiles; ++t) {
-        const int c = half * (kDsaLatent / 2) + t * 16 + col;
-        v16h b;
+      v16h b[kAttnWaveTiles];
+      for (int t = 0; t < kAttnWaveTiles; ++t) {
+        const int c = wave * (kAttnWaveTiles * 16) + t * 16 + col;
         for (int k = 0; k < 16; ++k) {
-          b[k] = rows[step * 16 + k][c];
+          b[t][k] = rows[step * 16 + k][c];
         }
-        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[t]);
+      }
+      for (int g = 0; g < kAttnGroups; ++g) {
+        const v16h a = *reinterpret_cast<const v16h*>(&prob[g][col][step * 16]);
+        for (int t = 0; t < kAttnWaveTiles; ++t) {
+          acc[g * kAttnWaveTiles + t] =
+              __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                  a, b[t], acc[g * kAttnWaveTiles + t]);
+        }
       }
     }
   }
   __syncthreads();
-  for (int t = 0; t < kAttnChanTiles; ++t) {
-    const int c = half * (kDsaLatent / 2) + t * 16 + col;
-    for (int i = 0; i < 8; ++i) {
-      const int h = 2 * i + row_hi;
-      const float inv = 1.0F / denom[group * 16 + h];
-      ctx[(static_cast<std::size_t>(group * 16 + h) * tokens + token) *
-              kDsaLatent +
-          c] = static_cast<_Float16>(acc[t][i] * inv);
+  for (int g = 0; g < kAttnGroups; ++g) {
+    for (int t = 0; t < kAttnWaveTiles; ++t) {
+      const int c = wave * (kAttnWaveTiles * 16) + t * 16 + col;
+      for (int i = 0; i < 8; ++i) {
+        const int h = g * 16 + 2 * i + row_hi;
+        const float inv = 1.0F / denom[h];
+        ctx[(static_cast<std::size_t>(h) * tokens + token) * kDsaLatent + c] =
+            static_cast<_Float16>(acc[g * kAttnWaveTiles + t][i] * inv);
+      }
     }
   }
 }
@@ -851,11 +859,14 @@ int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int DsaAttendBatch(const float* qabs, const std::uint16_t* lat_half,
-                   const int* selected, int pos0, int tokens, int top_pools,
-                   float scale, std::uint16_t* ctx_half, hipStream_t stream) {
+int DsaAttendBatch(const std::uint16_t* q_hi, const std::uint16_t* q_lo,
+                   const std::uint16_t* lat_half, const int* selected, int pos0,
+                   int tokens, int top_pools, float scale,
+                   std::uint16_t* ctx_half, hipStream_t stream) {
   DsaAttendWmmaKernel<<<tokens, kAttnWaves * kWaveLanes, 0, stream>>>(
-      qabs, reinterpret_cast<const _Float16*>(lat_half), selected, pos0, tokens,
+      reinterpret_cast<const _Float16*>(q_hi),
+      reinterpret_cast<const _Float16*>(q_lo),
+      reinterpret_cast<const _Float16*>(lat_half), selected, pos0, tokens,
       top_pools, scale, reinterpret_cast<_Float16*>(ctx_half));
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }

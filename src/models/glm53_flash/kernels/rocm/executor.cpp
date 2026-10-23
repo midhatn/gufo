@@ -962,8 +962,13 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
               stream_);
     HeadGemm(*w.k_b, b.qabs, false, T, 256, kDsaLatent);
     Mark(7);
-    DsaAttendBatch(b.qabs, st.cache.lat_half, b.sel, pos0, T, top, 1.0F / 16.0F,
-                   static_cast<std::uint16_t*>(b.head_half), stream_);
+    std::uint16_t* q_hi = reinterpret_cast<std::uint16_t*>(b.v_heads);
+    std::uint16_t* q_lo = reinterpret_cast<std::uint16_t*>(b.vout);
+    SplitF16(b.qabs, q_hi, q_lo,
+             static_cast<long long>(kDsaHeads) * T * kDsaLatent, stream_);
+    DsaAttendBatch(q_hi, q_lo, st.cache.lat_half, b.sel, pos0, T, top,
+                   1.0F / 16.0F, static_cast<std::uint16_t*>(b.head_half),
+                   stream_);
     Mark(8);
     HeadGemm(*w.v_b, b.v_heads, true, T, kDsaLatent, 256);
     TokenMajor(reinterpret_cast<const std::uint16_t*>(b.v_heads), b.vout, T,
