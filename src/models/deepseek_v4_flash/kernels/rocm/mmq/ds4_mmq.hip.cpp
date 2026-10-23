@@ -703,6 +703,13 @@ extern "C" int ds4_mmq_iq2_xxs_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
+/* GLM-5.3-Flash: Q6_K dense GEMM (attention / FFN projections). */
+extern "C" int ds4_mmq_q6_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, hipStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_dense", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, hipStream_t stream) {
@@ -1620,6 +1627,15 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
         hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
                                                n_tokens, n_experts, n_expert_used, stream);
+}
+
+/* GLM-5.3-Flash: IQ2_S routed experts (down projection of some layers). */
+extern "C" int ds4_mmq_iq2_s_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        hipStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_IQ2_S>("ds4_mmq_iq2_s_moe", W, X, ids, out, M, K,
+                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
 /* ds4 (P4 Inc3): mmq MoE over the aligned row-pair-SoA Q2_K artifact
@@ -4258,6 +4274,10 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);

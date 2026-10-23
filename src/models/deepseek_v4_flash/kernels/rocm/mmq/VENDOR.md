@@ -21,3 +21,7 @@ focused DS4 projection/attention checks through Nix. The backend and all six
 matrix translation units were also compared before and after preprocessing
 for `gfx1151`; only private symbol names and unsupported-kernel diagnostics
 changed. Current measurements belong in the model benchmark README.
+
+GLM-5.3-Flash adds `ds4_mmq_q6_K_dense` and `ds4_mmq_iq2_s_moe` (thin wrappers
+over the existing dense/MoE templates, plus their `mul_mat_q_case`
+instantiations) so its batched prefill can use the same GEMM tier.

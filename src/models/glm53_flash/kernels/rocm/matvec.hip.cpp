@@ -3,6 +3,15 @@
 #include "mmvq.hip.hpp"
 #include "quantize.hip.hpp"
 
+// The vendored mmq tier asks the DS4 backend for producer-folded activations.
+// GLM never registers any; the weak definition yields to the real one when the
+// DS4 backend is linked into the same binary.
+extern "C" __attribute__((weak)) int ds4_hip_q8_fold_take_q81(
+    const void*, std::uint64_t, const void** q81) {
+  *q81 = nullptr;
+  return 0;
+}
+
 namespace gufo::models::glm53_flash::rocm {
 
 namespace {

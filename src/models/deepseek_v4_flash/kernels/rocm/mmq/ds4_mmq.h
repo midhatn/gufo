@@ -166,6 +166,28 @@ int ds4_mmq_iq2_xxs_dense(
     int           K,
     hipStream_t  stream);
 
+// GLM-5.3-Flash additions (same contracts as the neighbouring entries).
+int ds4_mmq_q6_K_dense(
+    const void  * W_q6_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    hipStream_t  stream);
+
+int ds4_mmq_iq2_s_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    hipStream_t    stream);
+
 int ds4_mmq_q4_K_dense(
     const void  * W_q4_K,
     const float * X_f32,
