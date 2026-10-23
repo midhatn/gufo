@@ -62,6 +62,7 @@ public:
     DsaCache cache{};       // DSA
   };
   struct Session {
+    std::uint64_t id{0};
     std::uint32_t position{0};
     std::vector<LayerState> layers;
     std::vector<float*> saved_conv;  // SaveState snapshots
@@ -196,6 +197,13 @@ private:
   mutable double profile_seconds_[10]{};
   mutable std::chrono::steady_clock::time_point profile_mark_{};
   void Mark(int bucket) const;
+  void DropGraph();
+  hipGraphExec_t graph_exec_{nullptr};
+  std::uint64_t graph_session_{0};
+  std::uint64_t session_counter_{0};
+  int graph_logit_rows_{0};
+  bool graph_warm_{false};
+  hipStream_t capture_stream_{nullptr};
 };
 
 }  // namespace gufo::models::glm53_flash::rocm

@@ -123,6 +123,7 @@ struct Executor::Scratch {
   // Head
   float *head_in{}, *logits{}, *dflash_capture{};
   int* argmax{};
+  int* pos_dev{};
   char* q8_arena{};
   std::size_t q8_arena_bytes{0};
   // Routed-expert F16 route (prefill).
@@ -169,6 +170,9 @@ Executor::Session::~Session() {
 
 Executor::~Executor() {
   hipDeviceSynchronize();
+  DropGraph();
+  if (capture_stream_ != nullptr)
+    hipStreamDestroy(capture_stream_);
   if (staging_ != nullptr)
     hipHostFree(staging_);
   if (blas_ != nullptr)
@@ -582,6 +586,7 @@ bool Executor::AllocScratch(std::string* error) {
   take(&s.q8_arena, s.q8_arena_bytes);
   take(&s.head_in, std::size_t{options_.logit_rows} * kHidden);
   take(&s.argmax, options_.logit_rows);
+  take(&s.pos_dev, 1);
   if (options_.dflash_rows != 0) {
     take(&s.dflash_capture, std::size_t{options_.dflash_rows} *
                                 options_.dflash_layers.size() * kHidden);
@@ -592,6 +597,7 @@ bool Executor::AllocScratch(std::string* error) {
 
 std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
   auto s = std::make_unique<Session>();
+  s->id = ++session_counter_;
   s->layers.resize(layers_);
   bool ok = true;
   const std::size_t ctx = options_.max_context;
@@ -740,6 +746,20 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     HeadGemm(*w.v_b, b.ctx, b.v_heads, T, kDsaLatent, 256);
     TokenMajor(b.v_heads, b.vout, T, kDsaHeads, 256, stream_);
     Mark(7);
+  } else if (T == 1) {
+    const int top = static_cast<int>(options_.top_pools);
+    DsaAppendDev(st.cache, b.lat, b.ik, b.gt, w.idx_ape->f32(), b.pos_dev,
+                 stream_);
+    DsaScoresDev(b.iq, b.wp, st.cache.pooled,
+                 static_cast<int>(options_.max_context / kDsaPool), b.scores,
+                 b.pos_dev, stream_);
+    DsaSelectDev(b.scores, top, b.sel, b.pos_dev, stream_);
+    MatvecBatched(w.k_b->type, w.k_b->data, b.q, b.qabs, kDsaLatent, 256,
+                  kDsaHeads, b.matvec, stream_);
+    DsaAttendDev(b.qabs, st.cache.lat, b.sel, top, 1.0F / 16.0F, b.ctx,
+                 b.pos_dev, stream_);
+    MatvecBatched(w.v_b->type, w.v_b->data, b.ctx, b.vout, 256, kDsaLatent,
+                  kDsaHeads, b.matvec, stream_);
   } else {
     for (int t = 0; t < T; ++t) {
       const int pos = static_cast<int>(s.position) + t;
@@ -908,59 +928,107 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
                  hipMemcpyHostToDevice, stream_);
   hipStreamSynchronize(stream_);
 
-  auto mark = [&](int bucket) { Mark(bucket); };
-  profile_mark_ = std::chrono::steady_clock::now();
-  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-    const LayerWeights& w = weights_[layer];
-    HcPre(b.x[cur], w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
-          w.hc_attn_base->f32(), w.attn_norm->f32(), config_.hc_eps, b.y,
-          b.post, b.comb, stream_, T);
-    mark(0);
-    if (w.kda) {
-      KdaBlock(layer, session, T);
-      mark(1);
-    } else {
-      DsaBlock(layer, session, T);
-      mark(2);
-    }
-    HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
-    cur = 1 - cur;
-
-    HcPre(b.x[cur], w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(),
-          w.hc_ffn_base->f32(), w.ffn_norm->f32(), config_.hc_eps, b.y, b.post,
-          b.comb, stream_, T);
-    mark(0);
-    FfnBlock(layer, T);
-    mark(w.dense ? 3 : 4);
-    HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
-    cur = 1 - cur;
-    if (!dflash_taps_.empty()) {
-      const auto tap =
-          std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
-      if (tap != dflash_taps_.end()) {
-        const int rows = std::min<int>(T, options_.dflash_rows);
-        MeanStreams(
-            b.x[cur], T - rows, rows, b.dflash_capture,
-            static_cast<long long>(dflash_taps_.size()) * kHidden,
-            static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
-            stream_);
-        capture_rows_ = static_cast<std::uint32_t>(rows);
-        capture_position_ =
-            session.position + static_cast<std::uint32_t>(T - rows);
-      }
-    }
-    mark(0);
+  if (T == 1) {
+    const int pos = static_cast<int>(session.position);
+    hipMemcpy(b.pos_dev, &pos, sizeof(int), hipMemcpyHostToDevice);
   }
-  last_residual_ =
-      b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
-  if (logit_rows > 0 && options_.head) {
-    const DeviceTensor& norm = *Find("output_norm.weight");
-    const DeviceTensor& out = *Find("output.weight");
-    HeadNorm(b.x[cur] +
-                 static_cast<std::size_t>(T - logit_rows) * kStreams * kHidden,
-             norm.f32(), b.head_in, stream_, logit_rows);
-    Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
-    last_logit_rows_ = logit_rows;
+  const auto run = [&]() {
+    auto mark = [&](int bucket) { Mark(bucket); };
+    profile_mark_ = std::chrono::steady_clock::now();
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      const LayerWeights& w = weights_[layer];
+      HcPre(b.x[cur], w.hc_attn_fn->f32(), w.hc_attn_scale->f32(),
+            w.hc_attn_base->f32(), w.attn_norm->f32(), config_.hc_eps, b.y,
+            b.post, b.comb, stream_, T);
+      mark(0);
+      if (w.kda) {
+        KdaBlock(layer, session, T);
+        mark(1);
+      } else {
+        DsaBlock(layer, session, T);
+        mark(2);
+      }
+      HcPost(b.x[cur], b.block, b.post, b.comb, b.x[1 - cur], stream_, T);
+      cur = 1 - cur;
+
+      HcPre(b.x[cur], w.hc_ffn_fn->f32(), w.hc_ffn_scale->f32(),
+            w.hc_ffn_base->f32(), w.ffn_norm->f32(), config_.hc_eps, b.y,
+            b.post, b.comb, stream_, T);
+      mark(0);
+      FfnBlock(layer, T);
+      mark(w.dense ? 3 : 4);
+      HcPost(b.x[cur], b.ffn_out, b.post, b.comb, b.x[1 - cur], stream_, T);
+      cur = 1 - cur;
+      if (!dflash_taps_.empty()) {
+        const auto tap =
+            std::find(dflash_taps_.begin(), dflash_taps_.end(), layer);
+        if (tap != dflash_taps_.end()) {
+          const int rows = std::min<int>(T, options_.dflash_rows);
+          MeanStreams(
+              b.x[cur], T - rows, rows, b.dflash_capture,
+              static_cast<long long>(dflash_taps_.size()) * kHidden,
+              static_cast<long long>(tap - dflash_taps_.begin()) * kHidden,
+              stream_);
+          capture_rows_ = static_cast<std::uint32_t>(rows);
+          capture_position_ =
+              session.position + static_cast<std::uint32_t>(T - rows);
+        }
+      }
+      mark(0);
+    }
+    last_residual_ =
+        b.x[cur] + static_cast<std::size_t>(T - 1) * kStreams * kHidden;
+    if (logit_rows > 0 && options_.head) {
+      const DeviceTensor& norm = *Find("output_norm.weight");
+      const DeviceTensor& out = *Find("output.weight");
+      HeadNorm(b.x[cur] + static_cast<std::size_t>(T - logit_rows) * kStreams *
+                              kHidden,
+               norm.f32(), b.head_in, stream_, logit_rows);
+      Proj(out, Act{b.head_in, nullptr}, b.logits, logit_rows);
+      last_logit_rows_ = logit_rows;
+    }
+  };
+  const bool graphable = T == 1 && !recording_ && !profile_;
+  if (!graphable || !graph_warm_) {
+    run();
+    graph_warm_ = graph_warm_ || graphable;
+  } else {
+    if (graph_exec_ == nullptr || graph_session_ != session.id ||
+        graph_logit_rows_ != logit_rows) {
+      DropGraph();
+      hipGraph_t graph = nullptr;
+      if (capture_stream_ == nullptr) {
+        hipStreamCreateWithFlags(&capture_stream_, hipStreamNonBlocking);
+      }
+      const hipStream_t launch_stream = stream_;
+      stream_ = capture_stream_;
+      hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal);
+      run();
+      const hipError_t ended = hipStreamEndCapture(stream_, &graph);
+      stream_ = launch_stream;
+      const hipError_t made =
+          ended == hipSuccess
+              ? hipGraphInstantiate(&graph_exec_, graph, nullptr, nullptr, 0)
+              : ended;
+      if (made != hipSuccess) {
+        if (error != nullptr)
+          *error = std::string("HIP graph capture failed: ") +
+                   hipGetErrorString(made);
+        return false;
+      }
+      hipGraphDestroy(graph);
+      graph_session_ = session.id;
+      graph_logit_rows_ = logit_rows;
+    }
+    hipGraphLaunch(graph_exec_, stream_);
+    last_residual_ = b.x[0];
+    if (logit_rows > 0 && options_.head) {
+      last_logit_rows_ = logit_rows;
+    }
+    if (!dflash_taps_.empty()) {
+      capture_rows_ = 1;
+      capture_position_ = session.position;
+    }
   }
   session.position += static_cast<std::uint32_t>(T);
   if (hipStreamSynchronize(stream_) != hipSuccess ||
@@ -970,6 +1038,14 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     return false;
   }
   return true;
+}
+
+void Executor::DropGraph() {
+  if (graph_exec_ != nullptr) {
+    hipGraphExecDestroy(graph_exec_);
+    graph_exec_ = nullptr;
+  }
+  graph_session_ = 0;
 }
 
 void Executor::Mark(int bucket) const {

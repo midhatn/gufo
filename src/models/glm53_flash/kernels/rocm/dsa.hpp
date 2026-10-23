@@ -49,6 +49,20 @@ int DsaAttend(const float* qabs, const float* lat, const int* selected,
               int nselected, int pos, float scale, float* ctx,
               hipStream_t stream);
 
+// Single-token forms that read the position from device memory (`pos`), so a
+// captured graph replays at any position. max_pools bounds the score grid.
+int DsaAppendDev(const DsaCache& cache, const float* lat, const float* ik,
+                 const float* gate, const float* ape, const int* pos,
+                 hipStream_t stream);
+int DsaScoresDev(const float* iq, const float* proj, const float* pooled,
+                 int max_pools, float* scores, const int* pos,
+                 hipStream_t stream);
+int DsaSelectDev(const float* scores, int top_pools, int* selected,
+                 const int* pos, hipStream_t stream);
+int DsaAttendDev(const float* qabs, const float* lat, const int* selected,
+                 int top_pools, float scale, float* ctx, const int* pos,
+                 hipStream_t stream);
+
 // Batched forms for `tokens` consecutive tokens starting at position pos0.
 // Inputs are [token][...]; scores rows are score_stride apart; selections are
 // [token][kDsaTopPools]; qabs and ctx are head-major [64][tokens][512].

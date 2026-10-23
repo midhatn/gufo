@@ -100,7 +100,11 @@ __global__ __launch_bounds__(kThreads) void LayerNormKernel(
 __global__ void DsaAppendKernel(DsaCache cache, const float* __restrict__ lat,
                                 const float* __restrict__ ik,
                                 const float* __restrict__ gate,
-                                const float* __restrict__ ape, int pos) {
+                                const float* __restrict__ ape, int pos,
+                                const int* __restrict__ pos_dev) {
+  if (pos_dev != nullptr) {
+    pos = *pos_dev;
+  }
   const int d = threadIdx.x;
   for (int c = d; c < kDsaLatent; c += blockDim.x) {
     cache.lat[static_cast<std::size_t>(pos) * kDsaLatent + c] = lat[c];
@@ -211,8 +215,14 @@ __global__ void TokenMajorKernel(const float* __restrict__ in,
 __global__ __launch_bounds__(kScoreWaves* kWaveLanes) void DsaScoresKernel(
     const float* __restrict__ iq, const float* __restrict__ proj,
     const float* __restrict__ pooled, int npool, float* __restrict__ scores,
-    int pos0, long long score_stride) {
+    int pos0, long long score_stride, const int* __restrict__ pos_dev) {
   const int token = blockIdx.y;
+  if (pos_dev != nullptr) {
+    npool = (*pos_dev + 1) / kDsaPool;
+  }
+  if (blockIdx.x * kScoreWaves >= npool && pos0 < 0) {
+    return;
+  }
   if (pos0 >= 0) {
     npool = (pos0 + token + 1) / kDsaPool;
     iq += static_cast<std::size_t>(token) * kDsaIndexHeads * kDsaIndexDim;
@@ -280,7 +290,11 @@ __device__ int BlockExclusiveScan(int v, int* scratch, int* exclusive) {
 
 __global__ __launch_bounds__(kThreads) void DsaSelectKernel(
     const float* __restrict__ scores, int npool, int top,
-    int* __restrict__ selected, int pos0, long long score_stride) {
+    int* __restrict__ selected, int pos0, long long score_stride,
+    const int* __restrict__ pos_dev) {
+  if (pos_dev != nullptr) {
+    npool = (*pos_dev + 1) / kDsaPool;
+  }
   if (pos0 >= 0) {
     const int token = blockIdx.x;
     npool = (pos0 + token + 1) / kDsaPool;
@@ -366,8 +380,13 @@ __global__ __launch_bounds__(kThreads) void DsaSelectKernel(
 __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
     const float* __restrict__ qabs, const float* __restrict__ lat,
     const int* __restrict__ selected, int nselected, int pos, float scale,
-    float* __restrict__ ctx, int pos0, int tokens, int top) {
+    float* __restrict__ ctx, int pos0, int tokens, int top,
+    const int* __restrict__ pos_dev) {
   const int token = blockIdx.y;
+  if (pos_dev != nullptr) {
+    pos = *pos_dev;
+    nselected = min((pos + 1) / kDsaPool, top);
+  }
   if (pos0 >= 0) {
     pos = pos0 + token;
     nselected = min((pos + 1) / kDsaPool, top);
@@ -450,7 +469,7 @@ int DsaAppend(const DsaCache& cache, const float* lat, const float* ik,
               const float* gate, const float* ape, int pos,
               hipStream_t stream) {
   DsaAppendKernel<<<1, kDsaIndexDim, 0, stream>>>(cache, lat, ik, gate, ape,
-                                                  pos);
+                                                  pos, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -461,7 +480,7 @@ int DsaScores(const float* iq, const float* proj, const float* pooled,
   }
   DsaScoresKernel<<<(npool + kScoreWaves - 1) / kScoreWaves,
                     kScoreWaves * kWaveLanes, 0, stream>>>(
-      iq, proj, pooled, npool, scores, -1, 0);
+      iq, proj, pooled, npool, scores, -1, 0, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -471,7 +490,7 @@ int DsaSelect(const float* scores, int npool, int top_pools, int* selected,
     return 0;
   }
   DsaSelectKernel<<<1, kThreads, 0, stream>>>(scores, npool, top_pools,
-                                              selected, -1, 0);
+                                              selected, -1, 0, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -479,7 +498,42 @@ int DsaAttend(const float* qabs, const float* lat, const int* selected,
               int nselected, int pos, float scale, float* ctx,
               hipStream_t stream) {
   DsaAttendKernel<<<kDsaHeads, kAttendThreads, 0, stream>>>(
-      qabs, lat, selected, nselected, pos, scale, ctx, -1, 1, 0);
+      qabs, lat, selected, nselected, pos, scale, ctx, -1, 1, 0, nullptr);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int DsaAppendDev(const DsaCache& cache, const float* lat, const float* ik,
+                 const float* gate, const float* ape, const int* pos,
+                 hipStream_t stream) {
+  DsaAppendKernel<<<1, kDsaIndexDim, 0, stream>>>(cache, lat, ik, gate, ape, 0,
+                                                  pos);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int DsaScoresDev(const float* iq, const float* proj, const float* pooled,
+                 int max_pools, float* scores, const int* pos,
+                 hipStream_t stream) {
+  if (max_pools <= 0) {
+    return 0;
+  }
+  DsaScoresKernel<<<(max_pools + kScoreWaves - 1) / kScoreWaves,
+                    kScoreWaves * kWaveLanes, 0, stream>>>(iq, proj, pooled, 0,
+                                                           scores, -1, 0, pos);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int DsaSelectDev(const float* scores, int top_pools, int* selected,
+                 const int* pos, hipStream_t stream) {
+  DsaSelectKernel<<<1, kThreads, 0, stream>>>(scores, 0, top_pools, selected,
+                                              -1, 0, pos);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
+}
+
+int DsaAttendDev(const float* qabs, const float* lat, const int* selected,
+                 int top_pools, float scale, float* ctx, const int* pos,
+                 hipStream_t stream) {
+  DsaAttendKernel<<<kDsaHeads, kAttendThreads, 0, stream>>>(
+      qabs, lat, selected, 0, 0, scale, ctx, -1, 1, top_pools, pos);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -505,7 +559,7 @@ int DsaScoresBatch(const float* iq, const float* proj, const float* pooled,
   }
   DsaScoresKernel<<<dim3((max_pools + kScoreWaves - 1) / kScoreWaves, tokens),
                     kScoreWaves * kWaveLanes, 0, stream>>>(
-      iq, proj, pooled, 0, scores, pos0, score_stride);
+      iq, proj, pooled, 0, scores, pos0, score_stride, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -516,7 +570,7 @@ int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
     return 0;
   }
   DsaSelectKernel<<<tokens, kThreads, 0, stream>>>(
-      scores, 0, top_pools, selected, pos0, score_stride);
+      scores, 0, top_pools, selected, pos0, score_stride, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -524,7 +578,7 @@ int DsaAttendBatch(const float* qabs, const float* lat, const int* selected,
                    int pos0, int tokens, int top_pools, float scale, float* ctx,
                    hipStream_t stream) {
   DsaAttendKernel<<<dim3(kDsaHeads, tokens), kAttendThreads, 0, stream>>>(
-      qabs, lat, selected, 0, 0, scale, ctx, pos0, tokens, top_pools);
+      qabs, lat, selected, 0, 0, scale, ctx, pos0, tokens, top_pools, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
