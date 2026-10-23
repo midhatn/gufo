@@ -163,8 +163,8 @@ Executor::Session::~Session() {
   for (auto& l : layers) {
     for (void* p :
          {static_cast<void*>(l.conv), static_cast<void*>(l.state),
-          static_cast<void*>(l.cache.lat), static_cast<void*>(l.cache.ik),
-          static_cast<void*>(l.cache.gate),
+          static_cast<void*>(l.cache.lat), static_cast<void*>(l.cache.lat_half),
+          static_cast<void*>(l.cache.ik), static_cast<void*>(l.cache.gate),
           static_cast<void*>(l.cache.pooled)}) {
       if (p != nullptr)
         hipFree(p);
@@ -709,6 +709,8 @@ std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
                 error);
     } else {
       ok = Alloc(&st.cache.lat, ctx * kDsaLatent, error) &&
+           Alloc(reinterpret_cast<float**>(&st.cache.lat_half),
+                 ctx * kDsaLatent / 2, error) &&
            Alloc(&st.cache.ik, ctx * kDsaIndexDim, error) &&
            Alloc(&st.cache.gate, ctx * kDsaIndexDim, error) &&
            Alloc(&st.cache.pooled, (ctx / kDsaPool + 1) * kDsaIndexDim, error);
@@ -849,7 +851,7 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     HeadMajor(b.q, b.q_heads, T, kDsaHeads, 256, stream_);
     HeadGemm(*w.k_b, b.q_heads, b.qabs, T, 256, kDsaLatent);
     Mark(7);
-    DsaAttendBatch(b.qabs, st.cache.lat, b.sel, pos0, T, top, 1.0F / 16.0F,
+    DsaAttendBatch(b.qabs, st.cache.lat_half, b.sel, pos0, T, top, 1.0F / 16.0F,
                    b.ctx, stream_);
     Mark(8);
     HeadGemm(*w.v_b, b.ctx, b.v_heads, T, kDsaLatent, 256);

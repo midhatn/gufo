@@ -208,7 +208,8 @@ bool StageTests(const gufo::core::GgufReader& reader) {
     const auto gate = Rand(tokens * kId, 1.0F);
     rocm::DsaCache cache{
         DevZero<float>(tokens * kLat), DevZero<float>(tokens * kId),
-        DevZero<float>(tokens * kId), DevZero<float>((tokens / kPool) * kId)};
+        DevZero<float>(tokens * kId), DevZero<float>((tokens / kPool) * kId),
+        DevZero<std::uint16_t>(tokens * kLat)};
     float* dape = Dev(std::vector<float>(ape, ape + kPool * kId));
     float *dlat = Dev(lat), *dik = Dev(ik), *dgate = Dev(gate);
     int rc = 0;
@@ -387,7 +388,8 @@ bool ChainTest(const gufo::core::GgufReader& reader, int layer_idx) {
   int* sel = DevZero<int>(kTokens);
   rocm::DsaCache cache{
       DevZero<float>(kTokens * kLat), DevZero<float>(kTokens * kId),
-      DevZero<float>(kTokens * kId), DevZero<float>((kTokens / kPool) * kId)};
+      DevZero<float>(kTokens * kId), DevZero<float>((kTokens / kPool) * kId),
+      DevZero<std::uint16_t>(kTokens * kLat)};
 
   // Oracle state.
   std::vector<std::vector<double>> o_lat, o_ik, o_gate, o_pooled;

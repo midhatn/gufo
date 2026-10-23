@@ -3,6 +3,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstdint>
+
 namespace gufo::models::glm53_flash::rocm {
 
 inline constexpr int kDsaHeads = 64;
@@ -23,10 +25,11 @@ int LayerNorm(float* x, const float* w, const float* b, int n, float eps,
 
 // Per-layer device caches, one row per token (pooled: one per complete pool).
 struct DsaCache {
-  float* lat;     // [pos][512]
-  float* ik;      // [pos][128] normalized indexer keys
-  float* gate;    // [pos][128] compressor gate
-  float* pooled;  // [pos / 4][128]
+  float* lat;               // [pos][512]
+  float* ik;                // [pos][128] normalized indexer keys
+  float* gate;              // [pos][128] compressor gate
+  float* pooled;            // [pos / 4][128]
+  std::uint16_t* lat_half;  // [pos][512] F16 copy of lat for the batched attend
 };
 
 // Stores token `pos` and, when it completes a pool, writes the pooled key.
@@ -75,9 +78,9 @@ int DsaScoresBatch(const float* iq, const float* proj, const float* pooled,
 int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
                    int tokens, int top_pools, int* selected,
                    hipStream_t stream);
-int DsaAttendBatch(const float* qabs, const float* lat, const int* selected,
-                   int pos0, int tokens, int top_pools, float scale, float* ctx,
-                   hipStream_t stream);
+int DsaAttendBatch(const float* qabs, const std::uint16_t* lat_half,
+                   const int* selected, int pos0, int tokens, int top_pools,
+                   float scale, float* ctx, hipStream_t stream);
 
 // [token][head][width] <-> [head][token][width] (the per-head GEMM layout).
 int HeadMajor(const float* in, float* out, int tokens, int heads, int width,

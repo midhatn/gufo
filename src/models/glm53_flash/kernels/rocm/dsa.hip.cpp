@@ -108,6 +108,9 @@ __global__ void DsaAppendKernel(DsaCache cache, const float* __restrict__ lat,
   const int d = threadIdx.x;
   for (int c = d; c < kDsaLatent; c += blockDim.x) {
     cache.lat[static_cast<std::size_t>(pos) * kDsaLatent + c] = lat[c];
+    reinterpret_cast<_Float16*>(
+        cache.lat_half)[static_cast<std::size_t>(pos) * kDsaLatent + c] =
+        static_cast<_Float16>(lat[c]);
   }
   cache.ik[static_cast<std::size_t>(pos) * kDsaIndexDim + d] = ik[d];
   cache.gate[static_cast<std::size_t>(pos) * kDsaIndexDim + d] = gate[d];
@@ -145,8 +148,10 @@ __global__ void DsaAppendRowsKernel(DsaCache cache,
   const int token = blockIdx.x;
   const std::size_t pos = static_cast<std::size_t>(pos0) + token;
   for (int c = threadIdx.x; c < kDsaLatent; c += blockDim.x) {
-    cache.lat[pos * kDsaLatent + c] =
-        lat[static_cast<std::size_t>(token) * kDsaLatent + c];
+    const float v = lat[static_cast<std::size_t>(token) * kDsaLatent + c];
+    cache.lat[pos * kDsaLatent + c] = v;
+    reinterpret_cast<_Float16*>(cache.lat_half)[pos * kDsaLatent + c] =
+        static_cast<_Float16>(v);
   }
   cache.ik[pos * kDsaIndexDim + threadIdx.x] =
       ik[static_cast<std::size_t>(token) * kDsaIndexDim + threadIdx.x];
@@ -563,7 +568,7 @@ constexpr int kAttnChanTiles = kDsaLatent / 2 / 16;
 // channels. Selected latent rows are gathered once per chunk of 32 keys into
 // LDS as F16 and serve as both keys and values; softmax is online over chunks.
 __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
-    const float* __restrict__ qf, const float* __restrict__ lat,
+    const float* __restrict__ qf, const _Float16* __restrict__ lat,
     const int* __restrict__ selected, int pos0, int tokens, int top,
     float scale, float* __restrict__ ctx) {
   const int token = blockIdx.x;
@@ -601,23 +606,20 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
   for (int base = 0; base < nvis; base += kAttnKeys) {
     const int n = min(kAttnKeys, nvis - base);
     __syncthreads();
-    for (int idx = tid; idx < kAttnKeys * (kDsaLatent / 4);
+    for (int idx = tid; idx < kAttnKeys * (kDsaLatent / 8);
          idx += kAttnWaves * kWaveLanes) {
-      const int j = idx / (kDsaLatent / 4);
-      const int c4 = idx % (kDsaLatent / 4);
-      float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+      const int j = idx / (kDsaLatent / 8);
+      const int c8 = idx % (kDsaLatent / 8);
+      uint4 v = make_uint4(0, 0, 0, 0);
       if (j < n) {
         const int p = base + j;
         const int row = p < nselected * kDsaPool
                             ? selected[p / kDsaPool] * kDsaPool + (p % kDsaPool)
                             : pos - (p - nselected * kDsaPool);
-        v = *reinterpret_cast<const float4*>(
-            lat + static_cast<std::size_t>(row) * kDsaLatent + c4 * 4);
+        v = *reinterpret_cast<const uint4*>(
+            lat + static_cast<std::size_t>(row) * kDsaLatent + c8 * 8);
       }
-      rows[j][c4 * 4 + 0] = static_cast<_Float16>(v.x);
-      rows[j][c4 * 4 + 1] = static_cast<_Float16>(v.y);
-      rows[j][c4 * 4 + 2] = static_cast<_Float16>(v.z);
-      rows[j][c4 * 4 + 3] = static_cast<_Float16>(v.w);
+      *reinterpret_cast<uint4*>(&rows[j][c8 * 8]) = v;
     }
     __syncthreads();
     {
@@ -834,11 +836,12 @@ int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int DsaAttendBatch(const float* qabs, const float* lat, const int* selected,
-                   int pos0, int tokens, int top_pools, float scale, float* ctx,
-                   hipStream_t stream) {
+int DsaAttendBatch(const float* qabs, const std::uint16_t* lat_half,
+                   const int* selected, int pos0, int tokens, int top_pools,
+                   float scale, float* ctx, hipStream_t stream) {
   DsaAttendWmmaKernel<<<tokens, kAttnWaves * kWaveLanes, 0, stream>>>(
-      qabs, lat, selected, pos0, tokens, top_pools, scale, ctx);
+      qabs, reinterpret_cast<const _Float16*>(lat_half), selected, pos0, tokens,
+      top_pools, scale, ctx);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
