@@ -460,7 +460,11 @@ void ReferenceModel::AttnBlock(std::uint32_t layer, Session& session, bool dsa,
     }
     score[pp] = static_cast<float>(acc);
   }
-  const std::uint32_t n_top = std::min(npool, kTopPool);
+  std::uint32_t top_pools = kTopPool;
+  if (const char* cap = std::getenv("GUFO_GLM53_REF_TOPPOOLS")) {
+    top_pools = static_cast<std::uint32_t>(std::atoi(cap));
+  }
+  const std::uint32_t n_top = std::min(npool, top_pools);
   std::vector<std::uint32_t> order(npool);
   std::iota(order.begin(), order.end(), 0U);
   std::stable_sort(

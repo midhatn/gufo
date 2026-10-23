@@ -169,4 +169,8 @@ if(ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77
     ENVIRONMENT "GUFO_GLM53_GOLDENS=$ENV{GUFO_GLM53_GOLDENS}"
     COST 1200)
+
+  add_executable(glm53_executor_long_test executor_long_test.cpp)
+  target_link_libraries(glm53_executor_long_test PRIVATE
+    gufo_glm53_flash_engine gufo_glm53_flash)
 endif()
