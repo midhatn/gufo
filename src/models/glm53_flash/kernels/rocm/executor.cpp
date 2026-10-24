@@ -38,7 +38,7 @@ constexpr int kStreams = kHcStreams;
 constexpr int kDenseFf = 12288;
 constexpr int kExpertFf = 2048;
 constexpr int kQkvSlices = 3 * kKdaInner / 1024;
-constexpr int kNpuPasses = 2;
+
 constexpr int kShexpSlices = 2 * kExpertFf / 1024;
 constexpr int kQLora = 1536;
 // Routed expert tile classes: experts with big buckets take wider token tiles
@@ -381,8 +381,6 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
     cfg.k = kHidden;
     std::string npu_error;
     ex->npu_ = qfn::NpuGemm::Create(cfg, &npu_error);
-    if (const char* p = std::getenv("GUFO_GLM53_NPU_PASSES"))
-      ex->npu_passes_ = std::atoi(p) == 1 ? 1 : 2;
     if (ex->npu_ == nullptr)
       std::fprintf(stderr, "NPU off: %s\n", npu_error.c_str());
   }
@@ -501,12 +499,10 @@ bool Executor::SetupNpu(std::string*) {
     return drop("chunk is not the NPU row count", "");
   std::string npu_error;
   for (int bank = 0; bank < 2; ++bank) {
-    for (int pass = 0; pass < kNpuPasses; ++pass) {
-      npu_a_[bank][pass] = npu_->NewBuffer(npu_->ABytes(), &npu_error);
-      if (npu_a_[bank][pass] < 0)
-        return drop("buffers", npu_error);
-    }
-    for (int i = 0; i < kNpuPasses * kQkvSlices; ++i) {
+    npu_a_[bank][0] = npu_->NewBuffer(npu_->ABytes(), &npu_error);
+    if (npu_a_[bank][0] < 0)
+      return drop("buffers", npu_error);
+    for (int i = 0; i < kQkvSlices; ++i) {
       const int id = npu_->NewBuffer(npu_->CBytes(), &npu_error);
       if (id < 0)
         return drop("buffers", npu_error);
@@ -893,7 +889,7 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
   arena_used_ = 0;
   const Act y = Prep(b.y, T, kHidden);
   if (qkv_bank_ >= 0) {
-    NpuQkvFinish(qkv_bank_, T);
+    NpuQkvFinish(qkv_bank_);
   } else {
     Proj(*w.attn_q, y, b.kq, T);
     Proj(*w.attn_k, y, b.kk, T);
@@ -911,8 +907,13 @@ void Executor::KdaBlock(std::uint32_t layer, Session& s, int T) const {
     hipMemcpyAsync(s.kda_log[layer].raw_v, b.kv, bytes, hipMemcpyDeviceToDevice,
                    stream_);
   }
-  KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
-          w.conv_v->f32(), stream_, T);
+  if (qkv_bank_ >= 0) {
+    KdaConvStreams(npu_tab_[qkv_bank_], w.conv_q->f32(), w.conv_k->f32(),
+                   w.conv_v->f32(), st.conv, b.kq, b.kk, b.kv, T, stream_);
+  } else {
+    KdaConv(b.kq, b.kk, b.kv, st.conv, w.conv_q->f32(), w.conv_k->f32(),
+            w.conv_v->f32(), stream_, T);
+  }
   Proj(*w.ssm_f_a, y, b.fa, T);
   Proj(*w.ssm_f_b, Prep(b.fa, T, kKdaHeadDim), b.fproj, T);
   Proj(*w.ssm_beta, y, b.braw, T);
@@ -1108,9 +1109,9 @@ void Executor::NpuShexpFinish() const {
   const Scratch& b = *scratch_;
   const int bank = shexp_bank_;
   npu_->Wait(stream_, npu_sh_ticket_[bank]);
-  NpuDecodeFused(npu_sh_tab_[bank], npu_sh_tab_[bank], b.sg, b.su, b.su,
+  NpuDecodeFused(npu_sh_tab_[bank], b.sg, b.su, b.su,
                  static_cast<int>(npu_->tokens()), kShexpSlices,
-                 kShexpSlices / 2, kExpertFf, false, stream_);
+                 kShexpSlices / 2, kExpertFf, stream_);
 }
 
 void Executor::FfnBlock(std::uint32_t layer, int T) const {
@@ -1435,24 +1436,17 @@ bool Executor::Evaluate(Session& session, std::int32_t token,
 
 void Executor::NpuQkvQueue(int bank, int T) {
   const Scratch& b = *scratch_;
-  const std::vector<int>& ids = npu_qkv_[current_layer_];
-  for (int pass = 0; pass < npu_passes_; ++pass) {
-    const int a = npu_a_[bank][pass];
-    qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
-                              static_cast<std::uint32_t>(T), kHidden, 0,
-                              kHidden, npu_->Device(a), stream_, pass == 1);
-    npu_->Submit(stream_, a, ids.data(),
-                 npu_c_[bank].data() + pass * kQkvSlices, kQkvSlices);
-  }
+  const int a = npu_a_[bank][0];
+  qfn::NpuEncodeActivations(static_cast<const __half*>(b.x_half), kHidden,
+                            static_cast<std::uint32_t>(T), kHidden, 0, kHidden,
+                            npu_->Device(a), stream_, false);
+  npu_->Submit(stream_, a, npu_qkv_[current_layer_].data(), npu_c_[bank].data(),
+               kQkvSlices);
   npu_ticket_[bank] = npu_->Ticket();
 }
 
-void Executor::NpuQkvFinish(int bank, int T) const {
-  const Scratch& b = *scratch_;
+void Executor::NpuQkvFinish(int bank) const {
   npu_->Wait(stream_, npu_ticket_[bank]);
-  NpuDecodeFused(npu_tab_[bank], npu_tab_[bank] + kQkvSlices, b.kq, b.kk, b.kv,
-                 T, kQkvSlices, kQkvSlices / 3, kKdaInner, npu_passes_ == 2,
-                 stream_);
 }
 
 void Executor::SwapBank() {
