@@ -24,11 +24,16 @@ int HcPre(const float* x, const float* fn, const float* scale,
           float* post, float* comb, float* scratch, hipStream_t stream,
           int tokens = 1, std::uint16_t* y_half = nullptr);
 
-// The same with the residual streams held as F16 (raw bits).
+// The same with the residual streams held as F16 (raw bits). fn_hi / fn_lo,
+// when given, are fn * kHcMixFnScale as an F16 hi / lo split and route the
+// mixes through the matrix cores.
+inline constexpr float kHcMixFnScale = 256.0F;
 int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens = 1, std::uint16_t* y_half = nullptr);
+          int tokens = 1, std::uint16_t* y_half = nullptr,
+          const std::uint16_t* fn_hi = nullptr,
+          const std::uint16_t* fn_lo = nullptr);
 
 // next[d] = block * post[d] + sum_s x[s] * comb[d + 4 * s]. next != x.
 int HcPost(const float* x, const float* block, const float* post,

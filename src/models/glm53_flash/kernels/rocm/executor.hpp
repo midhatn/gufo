@@ -218,6 +218,8 @@ private:
   std::vector<int> npu_c_[2];
   std::uint64_t npu_ticket_[2]{};
   int qkv_bank_{-1};
+  std::unordered_map<const float*, std::pair<std::uint16_t*, std::uint16_t*>>
+      hc_fn_split_;
   std::vector<std::uint16_t*> router_hi_;
   std::vector<std::uint16_t*> router_lo_;
   bool res_half_{false};

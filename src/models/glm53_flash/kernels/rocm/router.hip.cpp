@@ -16,11 +16,12 @@ using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 __global__ void SplitF16Kernel(const float* __restrict__ in,
                                _Float16* __restrict__ hi,
-                               _Float16* __restrict__ lo, long long n) {
+                               _Float16* __restrict__ lo, long long n,
+                               float scale) {
   for (long long i =
            static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += static_cast<long long>(gridDim.x) * blockDim.x) {
-    const float f = in[i];
+    const float f = in[i] * scale;
     const _Float16 h = static_cast<_Float16>(f);
     hi[i] = h;
     lo[i] = static_cast<_Float16>(f - static_cast<float>(h));
@@ -87,9 +88,10 @@ __global__ __launch_bounds__(kTokenWaves* kWaveLanes) void RouterGemmKernel(
 }  // namespace
 
 int SplitF16(const float* in, std::uint16_t* hi, std::uint16_t* lo, long long n,
-             hipStream_t stream) {
+             hipStream_t stream, float scale) {
   SplitF16Kernel<<<2048, 256, 0, stream>>>(in, reinterpret_cast<_Float16*>(hi),
-                                           reinterpret_cast<_Float16*>(lo), n);
+                                           reinterpret_cast<_Float16*>(lo), n,
+                                           scale);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

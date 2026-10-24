@@ -191,6 +191,10 @@ Executor::~Executor() {
     hipStreamDestroy(capture_stream_);
   if (staging_ != nullptr)
     hipHostFree(staging_);
+  for (auto& [key, pair] : hc_fn_split_) {
+    hipFree(pair.first);
+    hipFree(pair.second);
+  }
   for (std::uint16_t* p : router_hi_)
     if (p != nullptr)
       hipFree(p);
@@ -482,6 +486,25 @@ bool Executor::SetupRouter(std::string* error) {
     router_lo_[layer] = static_cast<std::uint16_t*>(lo);
     SplitF16(w.router->f32(), router_hi_[layer], router_lo_[layer],
              static_cast<long long>(count), nullptr);
+  }
+  const std::size_t fn_count = std::size_t{kHcMixes} * kStreams * kHidden;
+  for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    const LayerWeights& w = weights_[layer];
+    for (const DeviceTensor* fn : {w.hc_attn_fn, w.hc_ffn_fn}) {
+      void* hi = nullptr;
+      void* lo = nullptr;
+      if (hipMalloc(&hi, fn_count * 2) != hipSuccess ||
+          hipMalloc(&lo, fn_count * 2) != hipSuccess) {
+        if (error != nullptr)
+          *error = "hc split allocation failed";
+        return false;
+      }
+      SplitF16(fn->f32(), static_cast<std::uint16_t*>(hi),
+               static_cast<std::uint16_t*>(lo),
+               static_cast<long long>(fn_count), nullptr, kHcMixFnScale);
+      hc_fn_split_[fn->f32()] = {static_cast<std::uint16_t*>(hi),
+                                 static_cast<std::uint16_t*>(lo)};
+    }
   }
   return hipDeviceSynchronize() == hipSuccess;
 }
@@ -1392,9 +1415,12 @@ void Executor::HcPreStep(const void* x, const DeviceTensor& fn,
                          const float* norm_w, int T) const {
   const Scratch& b = *scratch_;
   if (res_half_) {
+    const auto split = hc_fn_split_.find(fn.f32());
     HcPre(static_cast<const std::uint16_t*>(x), fn.f32(), scale, base, norm_w,
           config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T,
-          static_cast<std::uint16_t*>(b.x_half));
+          static_cast<std::uint16_t*>(b.x_half),
+          split != hc_fn_split_.end() ? split->second.first : nullptr,
+          split != hc_fn_split_.end() ? split->second.second : nullptr);
   } else {
     HcPre(static_cast<const float*>(x), fn.f32(), scale, base, norm_w,
           config_.hc_eps, b.y, b.post, b.comb, b.hc_mixes, stream_, T);

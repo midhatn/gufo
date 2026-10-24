@@ -81,6 +81,67 @@ __global__ __launch_bounds__(kThreads) void HcMixKernel(
   }
 }
 
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+constexpr int kMixWaves = 4;
+constexpr float kMixFnScale = 256.0F;
+
+// HcMixKernel over F16 residual rows on the matrix cores: 16 tokens per wave,
+// the 24 mix rows of fn as an F16 hi / lo split (about 2^-22 relative to the
+// F32 product), and the row sum of squares from the same loads.
+__global__ __launch_bounds__(kMixWaves * 32) void HcMixWmmaKernel(
+    const _Float16* __restrict__ x, const _Float16* __restrict__ fn_hi,
+    const _Float16* __restrict__ fn_lo, float* __restrict__ scratch_out,
+    int tokens) {
+  const int lane = threadIdx.x % 32;
+  const int wave = threadIdx.x / 32;
+  const int col = lane & 15;
+  const int row_hi = lane >> 4;
+  const int token0 = (blockIdx.x * kMixWaves + wave) * 16;
+  const int token = min(token0 + col, tokens - 1);
+  const _Float16* xr = x + static_cast<std::size_t>(token) * kStreamsFlat;
+  const int n1 = min(16 + col, kHcMixes - 1);
+  const _Float16* h0 = fn_hi + static_cast<std::size_t>(col) * kStreamsFlat;
+  const _Float16* l0 = fn_lo + static_cast<std::size_t>(col) * kStreamsFlat;
+  const _Float16* h1 = fn_hi + static_cast<std::size_t>(n1) * kStreamsFlat;
+  const _Float16* l1 = fn_lo + static_cast<std::size_t>(n1) * kStreamsFlat;
+  v8f acc0 = v8f{};
+  v8f acc1 = v8f{};
+  float sq = 0.0F;
+  for (int k = 0; k < kStreamsFlat; k += 16) {
+    const v16h a = *reinterpret_cast<const v16h*>(xr + k);
+    const v16h bh0 = *reinterpret_cast<const v16h*>(h0 + k);
+    const v16h bl0 = *reinterpret_cast<const v16h*>(l0 + k);
+    const v16h bh1 = *reinterpret_cast<const v16h*>(h1 + k);
+    const v16h bl1 = *reinterpret_cast<const v16h*>(l1 + k);
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      const float f = static_cast<float>(a[e]);
+      sq += f * f;
+    }
+    acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bh0, acc0);
+    acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bl0, acc0);
+    acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bh1, acc1);
+    acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bl1, acc1);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int row = token0 + 2 * i + row_hi;
+    if (row < tokens) {
+      float* out = scratch_out + static_cast<std::size_t>(row) * kPreStride;
+      out[col] = acc0[i] * (1.0F / kMixFnScale);
+      if (16 + col < kHcMixes) {
+        out[16 + col] = acc1[i] * (1.0F / kMixFnScale);
+      }
+    }
+  }
+  if (row_hi == 0 && token0 + col < tokens) {
+    scratch_out[static_cast<std::size_t>(token0 + col) * kPreStride +
+                kHcMixes] = sq;
+  }
+}
+
 // One wave per token: the post / comb / pre mixing weights. Lane i < 16 holds
 // comb[i] (dst i % 4, src i / 4); the row softmax and the Sinkhorn sums are
 // lane exchanges within groups of four.
@@ -291,8 +352,19 @@ template<typename X>
 int HcPreImpl(const X* x, const float* fn, const float* scale,
               const float* base, const float* norm_w, float hc_eps, float* y,
               float* post, float* comb, float* scratch, hipStream_t stream,
-              int tokens, _Float16* y_half) {
-  HcMixKernel<X><<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
+              int tokens, _Float16* y_half, const _Float16* fn_hi,
+              const _Float16* fn_lo) {
+  if constexpr (sizeof(X) == 2) {
+    if (fn_hi != nullptr && tokens >= 32) {
+      HcMixWmmaKernel<<<(tokens + 16 * kMixWaves - 1) / (16 * kMixWaves),
+                        kMixWaves * 32, 0, stream>>>(x, fn_hi, fn_lo, scratch,
+                                                     tokens);
+    } else {
+      HcMixKernel<X><<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
+    }
+  } else {
+    HcMixKernel<X><<<tokens, kThreads, 0, stream>>>(x, fn, scratch);
+  }
   HcSinkKernel<<<tokens, 32, 0, stream>>>(scratch, scale, base, hc_eps, post,
                                           comb, tokens);
   HcApplyKernel<X>
@@ -341,16 +413,20 @@ int HcPre(const float* x, const float* fn, const float* scale,
           float* post, float* comb, float* scratch, hipStream_t stream,
           int tokens, std::uint16_t* y_half) {
   return HcPreImpl(x, fn, scale, base, norm_w, hc_eps, y, post, comb, scratch,
-                   stream, tokens, reinterpret_cast<_Float16*>(y_half));
+                   stream, tokens, reinterpret_cast<_Float16*>(y_half), nullptr,
+                   nullptr);
 }
 
 int HcPre(const std::uint16_t* x, const float* fn, const float* scale,
           const float* base, const float* norm_w, float hc_eps, float* y,
           float* post, float* comb, float* scratch, hipStream_t stream,
-          int tokens, std::uint16_t* y_half) {
+          int tokens, std::uint16_t* y_half, const std::uint16_t* fn_hi,
+          const std::uint16_t* fn_lo) {
   return HcPreImpl(reinterpret_cast<const _Float16*>(x), fn, scale, base,
                    norm_w, hc_eps, y, post, comb, scratch, stream, tokens,
-                   reinterpret_cast<_Float16*>(y_half));
+                   reinterpret_cast<_Float16*>(y_half),
+                   reinterpret_cast<const _Float16*>(fn_hi),
+                   reinterpret_cast<const _Float16*>(fn_lo));
 }
 
 int HcPost(const float* x, const float* block, const float* post,
