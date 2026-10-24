@@ -3,6 +3,13 @@
 # GUFO_GLM53_FLASH_MODEL so hosted CI stays green.
 set(GUFO_GLM53_FLASH_MODEL "$ENV{GUFO_GLM53_FLASH_MODEL}" CACHE FILEPATH
   "GLM-5.3-Flash GGUF shard 1 for external-model tests")
+add_executable(glm53_chat_template_test chat_template_test.cpp)
+target_link_libraries(glm53_chat_template_test PRIVATE gufo_glm53_flash)
+target_compile_definitions(glm53_chat_template_test PRIVATE
+  GUFO_GLM53_CHAT_CASES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_cases.json")
+add_test(NAME glm53.chat_template COMMAND glm53_chat_template_test)
+set_tests_properties(glm53.chat_template PROPERTIES LABELS "cpu;glm53;tokenization")
+
 add_executable(glm53_layout_test
   layout_test.cpp
   ${PROJECT_SOURCE_DIR}/src/models/glm53_flash/runtime/config.cpp

@@ -1,8 +1,11 @@
 #ifndef GUFO_MODELS_GLM53_FLASH_CHAT_TEMPLATE_HPP_
 #define GUFO_MODELS_GLM53_FLASH_CHAT_TEMPLATE_HPP_
 
+#include <span>
 #include <string>
 #include <string_view>
+
+#include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::models::glm53_flash {
 
@@ -18,6 +21,22 @@ inline constexpr std::string_view kThinkOpen = "<think>";
 [[nodiscard]] std::string RenderPrompt(std::string_view system,
                                        std::string_view user,
                                        std::string_view reasoning_effort);
+
+struct ChatRenderOptions {
+  /// "low" and "high" are honored; anything else renders as "Max".
+  std::string_view reasoning_effort{"max"};
+  /// False closes the reasoning block (`<think></think>`) after the prompt.
+  bool thinking{true};
+  bool add_generation_prompt{true};
+};
+
+// Mirrors the GGUF Jinja template for a whole conversation: system, user,
+// assistant (reasoning and tool calls) and tool turns, and the tool list.
+// Developer messages render as system messages.
+[[nodiscard]] std::string RenderChat(
+    std::span<const tokenization::ChatMessage> messages,
+    std::span<const tokenization::ChatTool> tools,
+    const ChatRenderOptions& options = {});
 
 }  // namespace gufo::models::glm53_flash
 
