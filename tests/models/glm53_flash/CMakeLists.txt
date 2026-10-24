@@ -216,6 +216,17 @@ if(ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77
     COST 120)
 
+  add_executable(glm53_engine_test engine_test.cpp)
+  target_link_libraries(glm53_engine_test PRIVATE gufo_glm53_flash_engine
+    gufo_glm53_flash)
+  add_test(NAME glm53.engine
+    COMMAND glm53_engine_test "${GUFO_GLM53_FLASH_MODEL}"
+      "$ENV{GUFO_GLM53_DFLASH_MODEL}")
+  set_tests_properties(glm53.engine PROPERTIES
+    LABELS "gpu;glm53;engine;external-model"
+    SKIP_RETURN_CODE 77
+    COST 600)
+
   add_executable(glm53_spec_bench EXCLUDE_FROM_ALL spec_bench.cpp)
   target_link_libraries(glm53_spec_bench PRIVATE gufo_glm53_flash_engine
     gufo_glm53_flash)
