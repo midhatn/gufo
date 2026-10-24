@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/reasoning.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -34,6 +35,11 @@ struct ChatRenderOptions {
   bool thinking{true};
   bool add_generation_prompt{true};
 };
+
+// Maps the provider-neutral reasoning controls onto the template's low, high
+// and max efforts and its open or closed reasoning block.
+[[nodiscard]] ChatRenderOptions RenderOptionsFor(
+    const ReasoningOptions& reasoning);
 
 // Mirrors the GGUF Jinja template for a whole conversation: system, user,
 // assistant (reasoning and tool calls) and tool turns, and the tool list.

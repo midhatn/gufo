@@ -3262,25 +3262,7 @@ const GlmTextRunnerState& RequireGlmState(const TextRunnerState& state) {
 
 models::glm53_flash::ChatRenderOptions GlmRenderOptions(
     const ChatRequest& request) {
-  models::glm53_flash::ChatRenderOptions options;
-  options.thinking = request.reasoning.enabled.value_or(true);
-  if (request.reasoning.effort) {
-    switch (*request.reasoning.effort) {
-      case ReasoningEffort::kMinimal:
-      case ReasoningEffort::kLow:
-        options.reasoning_effort = "low";
-        break;
-      case ReasoningEffort::kMedium:
-      case ReasoningEffort::kHigh:
-        options.reasoning_effort = "high";
-        break;
-      case ReasoningEffort::kXHigh:
-      case ReasoningEffort::kMax:
-        options.reasoning_effort = "max";
-        break;
-    }
-  }
-  return options;
+  return models::glm53_flash::RenderOptionsFor(request.reasoning);
 }
 
 class GlmTextRunner final : public HipTextModelRunner {

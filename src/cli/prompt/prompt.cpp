@@ -31,6 +31,7 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/glm53_flash/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -394,6 +395,178 @@ void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
 
 #if defined(ENGINE_ENABLE_HIP)
 constexpr std::uint32_t kDefaultContext = 4096;
+
+#if defined(ENGINE_ENABLE_HIP)
+std::shared_ptr<models::glm53_flash::Model> LoadGlmModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  const bool dflash = opt.speculative_backend == "dflash2";
+  if (!opt.speculative_backend.empty() && !dflash) {
+    std::cerr << "GLM-5.3 supports only --speculative dflash2\n";
+    return nullptr;
+  }
+  if (dflash && (opt.dflash_model_path.empty() || opt.min_draft_tokens != 1 ||
+                 opt.draft_tokens == 0 ||
+                 opt.draft_tokens > models::glm53_flash::kMaxDraftTokens)) {
+    std::cerr << "GLM-5.3 DFlash2 requires --dflash-model, one to seven draft "
+                 "tokens and --min-draft-tokens 1\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !models::glm53_flash::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported GLM-5.3 chat template: " << error << '\n';
+    return nullptr;
+  }
+  auto model = models::glm53_flash::Model::Load(
+      opt.model_path,
+      {.max_context = kDefaultContext,
+       .dflash_model_path = dflash ? opt.dflash_model_path : "",
+       .max_draft_tokens = opt.draft_tokens},
+      &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "GLM-5.3 load failed: " << error << '\n';
+  return model;
+}
+
+int GenerateGlmResponse(const PromptOptions& opt,
+                        const models::glm53_flash::Model& model,
+                        models::glm53_flash::Session& session,
+                        std::span<const std::int32_t> prompt,
+                        std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
+      opt.max_tokens > session.ContextSize() - prompt.size()) {
+    std::cerr << "GLM-5.3 prompt and output exceed the " << kDefaultContext
+              << "-token CLI context\n";
+    return 1;
+  }
+  std::string error;
+  if (!session.Sync(prompt, &error)) {
+    std::cerr << "GLM-5.3 prefill failed: " << error << '\n';
+    return 1;
+  }
+  session.ResetDraftPolicy();
+  const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+  sampling::SamplerState sampler(opt.sampling, history);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  const auto before = session.Statistics();
+  while (generated.size() < opt.max_tokens) {
+    models::glm53_flash::Session::DecodeResult decoded;
+    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
+                            &decoded, &error)) {
+      std::cerr << "GLM-5.3 decode failed: " << error << '\n';
+      return 1;
+    }
+    for (const auto token : decoded.tokens) {
+      const auto piece = model.TokenText(token);
+      std::cout << piece << std::flush;
+      if (reply)
+        reply->append(piece);
+      generated.push_back(static_cast<tokenization::TokenId>(token));
+    }
+    if (decoded.stop)
+      break;
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    const auto after = session.Statistics();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    if (after.drafted > before.drafted) {
+      std::cerr << "Drafts: " << after.accepted - before.accepted << "/"
+                << after.drafted - before.drafted << " accepted in "
+                << after.cycles - before.cycles << " steps\n";
+    }
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
+int RunGlmPrompt(const PromptOptions& opt, const core::GgufReader& reader,
+                 std::chrono::steady_clock::time_point load_start) {
+  auto model = LoadGlmModel(opt, reader, load_start);
+  if (!model)
+    return 1;
+  std::string error;
+  auto session = model->CreateSession(
+      opt.speculative_backend.empty() ? gufo::core::SessionMode::kAutoregressive
+                                      : gufo::core::SessionMode::kSpeculative,
+      kDefaultContext, &error);
+  if (!session) {
+    std::cerr << "GLM-5.3 session failed: " << error << '\n';
+    return 1;
+  }
+  std::string text = opt.prompt_text;
+  if (opt.use_chat_template) {
+    std::vector<tokenization::ChatMessage> messages;
+    if (!opt.system_prompt.empty()) {
+      messages.push_back(
+          {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
+    }
+    messages.push_back(
+        {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
+    text = models::glm53_flash::RenderChat(
+        messages, {},
+        models::glm53_flash::RenderOptionsFor(PromptReasoningOptions(opt)));
+  }
+  const auto prompt = model->Tokenize(text);
+  return GenerateGlmResponse(opt, *model, *session, prompt);
+}
+
+int RunGlmChat(const PromptOptions& opt, const core::GgufReader& reader,
+               std::chrono::steady_clock::time_point load_start) {
+  if (!opt.use_chat_template) {
+    std::cerr << "GLM-5.3 interactive chat requires chat framing; use prompt "
+                 "--raw for raw text\n";
+    return 1;
+  }
+  auto model = LoadGlmModel(opt, reader, load_start);
+  if (!model)
+    return 1;
+  std::string error;
+  auto session = model->CreateSession(
+      opt.speculative_backend.empty() ? gufo::core::SessionMode::kAutoregressive
+                                      : gufo::core::SessionMode::kSpeculative,
+      kDefaultContext, &error);
+  if (!session) {
+    std::cerr << "GLM-5.3 session failed: " << error << '\n';
+    return 1;
+  }
+  const auto render_options =
+      models::glm53_flash::RenderOptionsFor(PromptReasoningOptions(opt));
+  std::vector<tokenization::ChatMessage> history;
+  if (!opt.system_prompt.empty()) {
+    history.push_back(
+        {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
+  }
+  std::cout << "=== Gufo Interactive Chat (GLM-5.3 Flash) ===\n"
+            << "Type 'exit' or Ctrl+D to quit.\n\n";
+  for (std::string input;;) {
+    std::cout << ">>> User: " << std::flush;
+    if (!std::getline(std::cin, input) || input == "exit" || input == "quit")
+      break;
+    if (input.empty())
+      continue;
+    history.push_back({tokenization::ChatRole::kUser, input, "", ""});
+    const auto tokens = model->Tokenize(
+        models::glm53_flash::RenderChat(history, {}, render_options));
+    std::cout << "<<< Assistant: ";
+    std::string reply;
+    if (GenerateGlmResponse(opt, *model, *session, tokens, &reply) != 0)
+      return 1;
+    // The reply carries its reasoning block; the template splits it again.
+    history.push_back(
+        {tokenization::ChatRole::kAssistant, std::move(reply), "", ""});
+    std::cout << '\n';
+  }
+  return 0;
+}
+#endif
 
 std::shared_ptr<models::deepseek_v4_flash::Model> LoadDeepSeekModel(
     const PromptOptions& opt, const core::GgufReader& reader,
@@ -1103,6 +1276,15 @@ int RunPrompt(std::span<const char* const> args) {
 #endif
 
   if (IsGlm53Flash(*reader)) {
+#if defined(ENGINE_ENABLE_HIP)
+    if (!opt.force_cpu) {
+      if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+        std::cerr << "GLM-5.3 does not support image input\n";
+        return 2;
+      }
+      return RunGlmPrompt(opt, *reader, model_load_start);
+    }
+#endif
     return RunGlm53Prompt(opt, *reader, model_load_start);
   }
 
@@ -1314,6 +1496,13 @@ int RunChat(std::span<const char* const> args) {
   ResolvePromptSampling(*reader, &opt);
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (IsGlm53Flash(*reader) && !opt.force_cpu) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "GLM-5.3 does not support image input\n";
+      return 2;
+    }
+    return RunGlmChat(opt, *reader, model_load_start);
+  }
   if (IsDeepSeekV4Flash(*reader)) {
     if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
       std::cerr << "DeepSeek does not support image input\n";

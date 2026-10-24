@@ -184,6 +184,28 @@ void AppendToolBlock(std::string& out,
 
 }  // namespace
 
+ChatRenderOptions RenderOptionsFor(const ReasoningOptions& reasoning) {
+  ChatRenderOptions options;
+  options.thinking = reasoning.enabled.value_or(true);
+  if (reasoning.effort) {
+    switch (*reasoning.effort) {
+      case ReasoningEffort::kMinimal:
+      case ReasoningEffort::kLow:
+        options.reasoning_effort = "low";
+        break;
+      case ReasoningEffort::kMedium:
+      case ReasoningEffort::kHigh:
+        options.reasoning_effort = "high";
+        break;
+      case ReasoningEffort::kXHigh:
+      case ReasoningEffort::kMax:
+        options.reasoning_effort = "max";
+        break;
+    }
+  }
+  return options;
+}
+
 bool ValidateGgufTemplate(const core::GgufReader& reader,
                           std::string* error_msg) {
   // SHA-256 of the glm5next artifact's tokenizer.chat_template.
