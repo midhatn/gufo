@@ -1356,9 +1356,14 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
     const int pos = static_cast<int>(session.position);
     hipMemcpy(b.pos_dev, &pos, sizeof(int), hipMemcpyHostToDevice);
   }
+  bool cancelled = false;
   const auto run = [&]() {
     profile_mark_ = std::chrono::steady_clock::now();
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      if (T > 1 && Cancelled()) {
+        cancelled = true;
+        return;
+      }
       RunLayer(layer, session, T, cur, false, FfnRows(layer, T, logit_rows));
     }
     FinishHead(b.x[cur], T, logit_rows);
@@ -1404,6 +1409,12 @@ bool Executor::Forward(Session& session, const std::int32_t* tokens, int T,
       capture_rows_ = 1;
       capture_position_ = session.position;
     }
+  }
+  if (cancelled) {
+    hipStreamSynchronize(stream_);
+    if (error != nullptr)
+      *error = "cancelled";
+    return false;
   }
   session.position += static_cast<std::uint32_t>(T);
   if (hipStreamSynchronize(stream_) != hipSuccess ||
@@ -1541,6 +1552,12 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
   SwapBank();
   profile_mark_ = std::chrono::steady_clock::now();
   for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+    if (Cancelled()) {
+      hipStreamSynchronize(stream_);
+      if (error != nullptr)
+        *error = "cancelled";
+      return false;
+    }
     for (int bank = 0; bank < 2; ++bank) {
       if (bank == 1)
         SwapBank();
@@ -1576,7 +1593,8 @@ bool Executor::ForwardPair(Session& session, const std::int32_t* tokens,
 }
 
 bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
-                       std::string* error, std::size_t chunk_size) {
+                       std::string* error, std::size_t chunk_size,
+                       const ForwardHook& after_forward) {
   if (tokens.empty()) {
     if (error != nullptr)
       *error = "empty prompt";
@@ -1592,7 +1610,8 @@ bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
     if (pairs && tokens.size() - at >= 2 * chunk) {
       const bool last = at + 2 * chunk == tokens.size();
       if (!ForwardPair(session, tokens.data() + at, static_cast<int>(2 * chunk),
-                       last ? 1 : 0, error)) {
+                       last ? 1 : 0, error) ||
+          (after_forward && !after_forward(error))) {
         return false;
       }
       at += 2 * chunk;
@@ -1601,7 +1620,8 @@ bool Executor::Prefill(Session& session, std::span<const std::int32_t> tokens,
     const std::size_t n = std::min(chunk, tokens.size() - at);
     const bool last = at + n == tokens.size();
     if (!Forward(session, tokens.data() + at, static_cast<int>(n), last ? 1 : 0,
-                 error)) {
+                 error) ||
+        (after_forward && !after_forward(error))) {
       return false;
     }
     at += n;
@@ -1752,6 +1772,166 @@ std::vector<float> Executor::Residual(const Session&) {
   hipMemcpy(out.data(), last_residual_, out.size() * sizeof(float),
             hipMemcpyDeviceToHost);
   return out;
+}
+
+bool Executor::ReadLogitRows(std::uint32_t first, std::uint32_t count,
+                             float* destination) {
+  if (count == 0 ||
+      first + count > static_cast<std::uint32_t>(last_logit_rows_)) {
+    return false;
+  }
+  return hipMemcpy(destination,
+                   scratch_->logits +
+                       static_cast<std::size_t>(first) * config_.vocab_size,
+                   static_cast<std::size_t>(count) * config_.vocab_size *
+                       sizeof(float),
+                   hipMemcpyDeviceToHost) == hipSuccess;
+}
+
+void Executor::ResetSession(Session& session) {
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    LayerState& st = session.layers[l];
+    if (st.conv != nullptr) {
+      hipMemset(st.conv, 0, 3 * 3 * kKdaInner * sizeof(float));
+      hipMemset(st.state, 0,
+                static_cast<std::size_t>(kKdaHeads) * kKdaHeadDim *
+                    kKdaHeadDim * sizeof(float));
+    }
+  }
+  session.position = 0;
+  session.saved_position = 0;
+  hipDeviceSynchronize();
+}
+
+namespace {
+
+constexpr std::size_t kKdaConvBytes = 3 * 3 * kKdaInner * sizeof(float);
+constexpr std::size_t kKdaStateBytes = static_cast<std::size_t>(kKdaHeads) *
+                                       kKdaHeadDim * kKdaHeadDim *
+                                       sizeof(float);
+constexpr std::size_t kLatRowBytes = kDsaLatent * sizeof(std::uint16_t);
+constexpr std::size_t kIndexRowBytes = kDsaIndexDim * sizeof(float);
+
+}  // namespace
+
+std::uint64_t Executor::SnapshotBytes(const Session& session) const {
+  const std::uint64_t pos = session.position;
+  std::uint64_t total = 0;
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    if (weights_[l].kda) {
+      total += kKdaConvBytes + kKdaStateBytes;
+    } else {
+      total += pos * kLatRowBytes + (pos / kDsaPool) * kIndexRowBytes +
+               2 * (pos % kDsaPool) * kIndexRowBytes;
+    }
+  }
+  return total;
+}
+
+bool Executor::SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
+                            std::string* error) {
+  if (out.size() != SnapshotBytes(session)) {
+    if (error != nullptr)
+      *error = "snapshot buffer has the wrong size";
+    return false;
+  }
+  const std::size_t pos = session.position;
+  const std::size_t tail = pos % kDsaPool;
+  std::uint8_t* at = out.data();
+  const auto copy = [&](const void* device, std::size_t bytes) {
+    if (bytes == 0)
+      return true;
+    if (Cancelled()) {
+      if (error != nullptr)
+        *error = "cancelled";
+      return false;
+    }
+    if (hipMemcpy(at, device, bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+      if (error != nullptr)
+        *error = "snapshot copy failed";
+      return false;
+    }
+    at += bytes;
+    return true;
+  };
+  hipStreamSynchronize(stream_);
+  for (std::uint32_t l = 0; l < layers_; ++l) {
+    const LayerState& st = session.layers[l];
+    if (weights_[l].kda) {
+      if (!copy(st.conv, kKdaConvBytes) || !copy(st.state, kKdaStateBytes))
+        return false;
+      continue;
+    }
+    if (!copy(st.cache.lat_half, pos * kLatRowBytes) ||
+        !copy(st.cache.pooled, (pos / kDsaPool) * kIndexRowBytes))
+      return false;
+    for (std::size_t i = 0; i < tail; ++i) {
+      const std::size_t slot = (pos - tail + i) % st.cache.ring;
+      if (!copy(st.cache.ik + slot * kDsaIndexDim, kIndexRowBytes))
+        return false;
+    }
+    for (std::size_t i = 0; i < tail; ++i) {
+      const std::size_t slot = (pos - tail + i) % st.cache.ring;
+      if (!copy(st.cache.gate + slot * kDsaIndexDim, kIndexRowBytes))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool Executor::RestoreSnapshot(Session& session, std::uint32_t position,
+                               std::span<const std::uint8_t> in,
+                               std::string* error) {
+  session.position = position;
+  if (in.size() != SnapshotBytes(session) || position > options_.max_context) {
+    session.position = 0;
+    if (error != nullptr)
+      *error = "snapshot does not fit this session";
+    return false;
+  }
+  const std::size_t pos = position;
+  const std::size_t tail = pos % kDsaPool;
+  const std::uint8_t* at = in.data();
+  const auto copy = [&](void* device, std::size_t bytes) {
+    if (bytes == 0)
+      return true;
+    if (Cancelled()) {
+      if (error != nullptr)
+        *error = "cancelled";
+      return false;
+    }
+    if (hipMemcpy(device, at, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+      if (error != nullptr)
+        *error = "snapshot restore failed";
+      return false;
+    }
+    at += bytes;
+    return true;
+  };
+  bool ok = true;
+  for (std::uint32_t l = 0; ok && l < layers_; ++l) {
+    LayerState& st = session.layers[l];
+    if (weights_[l].kda) {
+      ok = copy(st.conv, kKdaConvBytes) && copy(st.state, kKdaStateBytes);
+      continue;
+    }
+    ok = copy(st.cache.lat_half, pos * kLatRowBytes) &&
+         copy(st.cache.pooled, (pos / kDsaPool) * kIndexRowBytes);
+    for (std::size_t i = 0; ok && i < tail; ++i) {
+      const std::size_t slot = (pos - tail + i) % st.cache.ring;
+      ok = copy(st.cache.ik + slot * kDsaIndexDim, kIndexRowBytes);
+    }
+    for (std::size_t i = 0; ok && i < tail; ++i) {
+      const std::size_t slot = (pos - tail + i) % st.cache.ring;
+      ok = copy(st.cache.gate + slot * kDsaIndexDim, kIndexRowBytes);
+    }
+  }
+  if (!ok) {
+    session.position = 0;
+    return false;
+  }
+  session.saved_position = 0;
+  return true;
 }
 
 }  // namespace gufo::models::glm53_flash::rocm

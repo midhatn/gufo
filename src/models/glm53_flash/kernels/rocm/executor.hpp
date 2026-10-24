@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -135,8 +136,34 @@ public:
   // Runs a prompt in chunks of prefill_chunk tokens; logits (via Logits) are
   // those of the final token.
   // `chunk` (0 = prefill_chunk) may be smaller than the configured capacity.
+  // `after_forward` runs once each forward (a bank pair counts as one) has
+  // finished, while its drafter captures are still valid.
+  using ForwardHook = std::function<bool(std::string*)>;
   bool Prefill(Session& session, std::span<const std::int32_t> tokens,
-               std::string* error, std::size_t chunk = 0);
+               std::string* error, std::size_t chunk = 0,
+               const ForwardHook& after_forward = {});
+
+  // `count` rows of the previous forward's logits starting at row `first`
+  // (of the rows it kept), [count][vocab].
+  bool ReadLogitRows(std::uint32_t first, std::uint32_t count,
+                     float* destination);
+
+  // Zeroes the recurrent state and rewinds the session to position 0.
+  void ResetSession(Session& session);
+
+  // Exact byte form of a session's state at its current position: the KDA
+  // recurrent state and every DSA row below the position.
+  [[nodiscard]] std::uint64_t SnapshotBytes(const Session& session) const;
+  bool SaveSnapshot(const Session& session, std::span<std::uint8_t> out,
+                    std::string* error);
+  bool RestoreSnapshot(Session& session, std::uint32_t position,
+                       std::span<const std::uint8_t> in, std::string* error);
+
+  // Polled between layers; a true result abandons the forward, leaving the
+  // session unusable until restored or reset.
+  void SetCancellationCheck(std::function<bool()> check) {
+    cancel_ = std::move(check);
+  }
 
   // Host copies; valid after Evaluate returns.
   std::vector<float> Logits(const Session& session);
@@ -241,6 +268,8 @@ private:
   std::uint32_t capture_position_{0};
   DeviceTensor token_embd_dev_{};
   bool recording_{false};
+  std::function<bool()> cancel_;
+  [[nodiscard]] bool Cancelled() const { return cancel_ && cancel_(); }
   bool profile_{false};
   mutable std::size_t arena_used_{0};
   mutable double profile_seconds_[10]{};
