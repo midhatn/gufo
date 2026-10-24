@@ -159,7 +159,7 @@ bool Speculator::Generate(rocm::Executor::Session& session,
       return false;
     }
     const std::uint32_t wanted = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(std::ceil(accepted_ema)) + 2, 2, max_draft);
+        static_cast<std::uint32_t>(std::ceil(accepted_ema)) + 1, 2, max_draft);
     const std::uint32_t k = std::min<std::uint32_t>(
         wanted, static_cast<std::uint32_t>(draft.size()));
     std::vector<std::int32_t> chain(k + 1);

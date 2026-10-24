@@ -982,7 +982,7 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
   Proj(*w.idx_gate, y, b.gt, T);
   Proj(*w.idx_proj, y, b.wp, T);
   Mark(5);
-  if (T >= kWideBatch) {
+  if (T >= 3) {
     const int pos0 = static_cast<int>(s.position);
     const int top = static_cast<int>(options_.top_pools);
     DsaAppendBatch(st.cache, b.lat, b.ik, b.gt, w.idx_ape->f32(), pos0, T,
