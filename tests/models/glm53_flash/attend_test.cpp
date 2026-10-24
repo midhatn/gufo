@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "src/models/glm53_flash/kernels/rocm/dsa.hpp"
-#include "src/models/glm53_flash/kernels/rocm/router.hpp"
+#include "src/models/glm53_flash/kernels/rocm/moe.hpp"
 
 namespace rocm = gufo::models::glm53_flash::rocm;
 
@@ -74,14 +74,13 @@ int main() {
   hipMemcpy(d_q, q.data(), q.size() * 4, hipMemcpyHostToDevice);
   hipMemcpy(d_sel, sel.data(), sel.size() * 4, hipMemcpyHostToDevice);
 
-  std::uint16_t* d_split = nullptr;
+  std::uint16_t* d_half = nullptr;
   const std::size_t elems = q.size();
-  hipMalloc(&d_split, 2 * elems * 2);
+  hipMalloc(&d_half, elems * 2);
   const auto run = [&] {
-    rocm::SplitF16(d_q, d_split, d_split + elems, static_cast<long long>(elems),
-                   nullptr);
-    return rocm::DsaAttendBatch(d_split, d_split + elems, d_lat, d_sel, pos0,
-                                tokens, kTop, 1.0F / 16.0F, d_ctx, nullptr);
+    rocm::ToHalf(d_q, d_half, static_cast<long long>(elems), nullptr);
+    return rocm::DsaAttendBatch(d_half, d_lat, d_sel, pos0, tokens, kTop,
+                                1.0F / 16.0F, d_ctx, nullptr);
   };
   run();
   hipDeviceSynchronize();

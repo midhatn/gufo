@@ -78,10 +78,9 @@ int DsaScoresBatch(const float* iq, const float* proj, const float* pooled,
 int DsaSelectBatch(const float* scores, long long score_stride, int pos0,
                    int tokens, int top_pools, int* selected,
                    hipStream_t stream);
-int DsaAttendBatch(const std::uint16_t* q_hi, const std::uint16_t* q_lo,
-                   const std::uint16_t* lat_half, const int* selected, int pos0,
-                   int tokens, int top_pools, float scale,
-                   std::uint16_t* ctx_half, hipStream_t stream);
+int DsaAttendBatch(const std::uint16_t* q, const std::uint16_t* lat_half,
+                   const int* selected, int pos0, int tokens, int top_pools,
+                   float scale, std::uint16_t* ctx_half, hipStream_t stream);
 
 // [token][head][width] <-> [head][token][width] (the per-head GEMM layout).
 int HeadMajor(const float* in, std::uint16_t* out, int tokens, int heads,
