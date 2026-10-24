@@ -32,6 +32,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/glm53_flash/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -1149,6 +1150,279 @@ int RunQwen38FlashNextBenchmark(
   return 0;
 }
 
+bool IsGlm53Flash(const core::GgufReader& reader) {
+  const auto architecture = reader.GetMetadataString("general.architecture");
+  return architecture == "glm5next" || architecture == "glm5-next";
+}
+
+int RunGlm53Benchmark(const BenchOptions& options,
+                      const std::shared_ptr<const core::GgufReader>& reader,
+                      std::chrono::steady_clock::time_point model_load_start) {
+  namespace glm = models::glm53_flash;
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for GLM-5.3\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  if (std::max({max_depth, max_prompt, max_generation,
+                options.validate_prefill_tokens}) >
+      std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: benchmark workload exceeds the context range\n";
+    return 1;
+  }
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1});
+  const bool dflash = options.speculative_backend == "dflash2";
+  if (!options.speculative_backend.empty() && !dflash) {
+    std::cerr << "Error: GLM-5.3 supports --speculative dflash2 or off\n";
+    return 1;
+  }
+  if (dflash && options.dflash_model_path.empty()) {
+    std::cerr << "Error: --speculative dflash2 requires --dflash-model\n";
+    return 1;
+  }
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: GLM-5.3 bench supports C1; use the serving "
+                 "benchmark for concurrent requests\n";
+    return 1;
+  }
+  if (dflash && options.min_draft_tokens != 1) {
+    std::cerr << "Error: GLM-5.3 drafting requires --min-draft-tokens 1\n";
+    return 1;
+  }
+  if (required_context > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: GLM-5.3 context is out of range\n";
+    return 1;
+  }
+
+  std::string error;
+  auto model = glm::Model::Load(
+      options.model_path,
+      glm::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .dflash_model_path = dflash ? options.dflash_model_path : "",
+          .max_draft_tokens = std::clamp<std::uint32_t>(options.draft_tokens, 1,
+                                                        glm::kMaxDraftTokens),
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating GLM-5.3 model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  // Repeat a fixed token pattern for reproducible timing.
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = model->Tokenize(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ");
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      tokens[i] = pattern[i % pattern.size()];
+    }
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    // Batched prefill against one-token-at-a-time evaluation of the same
+    // prefix; both run on the GPU, so this checks the batched kernels.
+    auto sequential = model->CreateSession(
+        options.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
+        static_cast<std::uint32_t>(required_context), &error);
+    auto batched = model->CreateSession(
+        options.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
+        static_cast<std::uint32_t>(required_context), &error);
+    const auto prefix =
+        std::span(tokens).first(options.validate_prefill_tokens);
+    if (!sequential || !batched || !sequential->Sync(prefix.first(1), &error) ||
+        !batched->Sync(prefix, &error)) {
+      std::cerr << "GLM-5.3 prefill validation failed: " << error << '\n';
+      return 1;
+    }
+    for (const std::int32_t token : prefix.subspan(1)) {
+      if (!sequential->Evaluate(token, &error)) {
+        std::cerr << "GLM-5.3 sequential reference failed: " << error << '\n';
+        return 1;
+      }
+    }
+    const auto reference = sequential->Logits();
+    const auto candidate = batched->Logits();
+    const auto comparison = testing::CompareLogits(reference, candidate);
+    const std::size_t rank =
+        1 + std::count_if(candidate.begin(), candidate.end(), [&](float value) {
+          return value > candidate[comparison.reference_argmax];
+        });
+    std::cout << "[Prefill Validation] tokens=" << prefix.size()
+              << " finite=" << comparison.finite
+              << " scalar_winner_rank=" << rank
+              << " rmse=" << comparison.root_mean_square_error
+              << " cosine=" << comparison.cosine_similarity
+              << " max_error=" << comparison.max_abs_diff << '\n';
+    if (!comparison.finite || rank > 3 ||
+        comparison.root_mean_square_error > 1.12F ||
+        comparison.cosine_similarity < 0.979F ||
+        comparison.max_abs_diff > 5.0F) {
+      return 1;
+    }
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  const auto model_name = model->ModelName();
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << model_name << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      // A full aligned prefix already warms the same chunk shapes and GEMM
+      // plans. Other shapes still need an untimed pass before measurement.
+      const auto chunk = model->PrefillCapacity();
+      const bool warm_prefix = chunk > 0 && depth >= chunk &&
+                               depth % chunk == 0 && prompt_length > 0 &&
+                               prompt_length % chunk == 0;
+      for (std::size_t repetition = warm_prefix ? 1 : 0;
+           repetition <= options.repetitions; ++repetition) {
+        auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            (depth > 0 &&
+             !session->Sync(std::span(tokens).first(depth), &error))) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Sync(std::span(tokens).first(depth + prompt_length),
+                           &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        if (repetition > 0) {
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+        }
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            !session->Sync(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        std::vector<std::int32_t> generated;
+        const std::vector<sampling::TokenId> history(
+            tokens.begin(), tokens.begin() + prefix_length);
+        sampling::SamplerState sampler(options.sampling, history);
+        const auto start = std::chrono::steady_clock::now();
+        while (generated.size() < generation_length) {
+          glm::Session::DecodeResult decoded;
+          if (!session->DecodeStep(generation_length - generated.size(),
+                                   sampler, &decoded, &error, false) ||
+              decoded.tokens.empty()) {
+            std::cerr << "Error running GLM-5.3 decode: " << error << '\n';
+            return 1;
+          }
+          generated.insert(generated.end(), decoded.tokens.begin(),
+                           decoded.tokens.end());
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+        if (options.verbose) {
+          const auto stats = session->Statistics();
+          std::cerr << "GLM-5.3 tg depth=" << depth
+                    << " cycles=" << stats.cycles
+                    << " drafted=" << stats.drafted
+                    << " accepted=" << stats.accepted << " widths=";
+          for (std::size_t w = 0; w < std::size(stats.widths); ++w) {
+            if (stats.widths[w] != 0)
+              std::cerr << w << ':' << stats.widths[w] << ' ';
+          }
+          std::cerr << "output_sha256="
+                    << crypto::Sha256Hex(
+                           std::span(reinterpret_cast<const std::uint8_t*>(
+                                         generated.data()),
+                                     generated.size() * sizeof(std::int32_t)))
+                    << " text="
+                    << model->Decode(std::span(generated).first(
+                           std::min<std::size_t>(generated.size(), 48)))
+                    << '\n';
+        }
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 #endif
 
 }  // namespace
@@ -1278,6 +1552,9 @@ int RunBench(std::span<const char* const> args) {
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
   }
+  if (IsGlm53Flash(*reader)) {
+    return RunGlm53Benchmark(opt, reader, model_load_start);
+  }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {
     std::cerr << "Error: concurrent model benchmarks currently support DS4 "
@@ -1285,7 +1562,8 @@ int RunBench(std::span<const char* const> args) {
     return 1;
   }
   if (!opt.sampling.can_use_unmodified_argmax()) {
-    std::cerr << "Error: sampled model benchmarks support DS4 and Flash-Next; "
+    std::cerr << "Error: sampled model benchmarks support DS4, GLM-5.3 and "
+                 "Flash-Next; "
                  "use the serving benchmark for Qwen\n";
     return 1;
   }

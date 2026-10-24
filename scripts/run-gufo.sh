@@ -5,6 +5,7 @@
 #   flash-next  Qwen3.8 Flash-Next UD-IQ4_XS, DFlash2 draft (or MTP sidecar), two-bank NPU prefill
 #   27b         Qwen3.8-27B, DFlash2 and/or MTP
 #   35b         Qwen3.6-35B-A3B, embedded MTP head and/or DFlash2
+#   glm         GLM-5.3-Flash AJ-IQ2_XXS, DFlash2 draft, two-bank NPU prefill
 #
 # Required: GUFO_MODEL = the GGUF (for flash-next the first shard, ...-00001-of-00003.gguf)
 # Optional: GUFO_MTP (flash-next: shared Q8_0 sidecar; 27b: MTP GGUF; 35b: "embedded" by default),
@@ -25,7 +26,8 @@ case "$KIND" in
   flash-next) SERVED_NAME="Qwen3.8 Flash Next"; DEFAULT_CONTEXT=131072 ;;
   27b) SERVED_NAME="Qwen3.8 27B"; DEFAULT_CONTEXT=262144 ;;
   35b) SERVED_NAME="Qwen3.6 35B-A3B"; DEFAULT_CONTEXT=262144 ;;
-  *) echo "GUFO_KIND must be flash-next, 27b or 35b (got: $KIND)" >&2; exit 1 ;;
+  glm) SERVED_NAME="GLM-5.3 Flash"; DEFAULT_CONTEXT=131072 ;;
+  *) echo "GUFO_KIND must be flash-next, 27b, 35b or glm (got: $KIND)" >&2; exit 1 ;;
 esac
 GUFO_BIN=${GUFO_BIN:-}
 if [ -z "$GUFO_BIN" ]; then
@@ -40,6 +42,8 @@ fi
 
 PORT=${PORT:-8900}
 JOBS=${JOBS:-2}
+# One executor serves every GLM session, so more than one job only queues.
+[ "$KIND" = glm ] && JOBS=${JOBS_GLM:-1}
 CONTEXT=${GUFO_CONTEXT:-$DEFAULT_CONTEXT}
 MTP=${GUFO_MTP:-}
 DFLASH=${GUFO_DFLASH:-}
@@ -54,7 +58,7 @@ NPU_ENV=()
 # Block-sparse attention keeps 27b / 35b prefill and decode nearly flat with depth
 # (approximate; GUFO_SPARSE=0 restores exact dense attention).
 SPARSE_ENV=()
-if [ "$KIND" != flash-next ] && [ "${GUFO_SPARSE:-1}" != 0 ]; then
+if [ "$KIND" != flash-next ] && [ "$KIND" != glm ] && [ "${GUFO_SPARSE:-1}" != 0 ]; then
   SPARSE_ENV=(GUFO_QWEN_SPARSE_ATTN=1)
 fi
 if [ "${GUFO_NPU:-1}" != 0 ] && [ -e /dev/accel/accel0 ] && [ -d "$GUFO_DIR/tools/npu" ]; then
@@ -85,7 +89,13 @@ mkdir -p "$CACHE_DIR" "$(dirname "$LOG")"
 [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 104857600 ] && mv -f "$LOG" "$LOG.1"
 
 SPEC=()
-if [ "$KIND" = flash-next ]; then
+if [ "$KIND" = glm ]; then
+  if [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
+    SPEC=(--speculative dflash2 --dflash-model "$DFLASH")
+  else
+    echo "WARNING: no DFlash2 draft (set GUFO_DFLASH): running without the drafter." >&2
+  fi
+elif [ "$KIND" = flash-next ]; then
   if [ "${GUFO_FN_SPEC:-dflash2}" = dflash2 ] && [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
     SPEC=(--speculative dflash2 --dflash-model "$DFLASH")
   elif [ -n "$MTP" ] && [ -f "$MTP" ]; then

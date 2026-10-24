@@ -3354,7 +3354,7 @@ public:
                 .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = true,
+                .multi_token_decode = use_draft_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0,
                 .prefix_reuse = true,
@@ -3425,6 +3425,27 @@ public:
       return std::nullopt;
     }
     return std::vector<TextRunnerToken>(tokens.begin(), tokens.end());
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    if (prepared) {
+      // The generation prefix (`<|assistant|><think>`) is not what the next
+      // turn replays for this reply, so the reusable frontier ends where a
+      // further user message would diverge from it.
+      auto continuation = request;
+      continuation.messages.emplace_back(tokenization::ChatRole::kUser, "");
+      const auto continued = RenderAndTokenize(continuation);
+      if (continued) {
+        prepared->cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+                          continued->begin(), continued->end())
+                .first -
+            prepared->tokens.begin());
+      }
+    }
+    return prepared;
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(

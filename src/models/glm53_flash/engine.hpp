@@ -210,6 +210,7 @@ private:
   std::vector<float> logits_;
   std::vector<float> verify_logits_;
   qwen38_flash_next::LookupIndex lookup_;
+  bool speculative_{false};
   float accepted_ema_{static_cast<float>(kMaxDraftTokens)};
   std::uint32_t plain_steps_{0};
   SpeculativeStats stats_;

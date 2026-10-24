@@ -447,6 +447,13 @@ int GenerateGlmResponse(const PromptOptions& opt,
     return 1;
   }
   session.ResetDraftPolicy();
+  if (opt.verbose) {
+    std::cout << "[Engine]: GLM-5.3 ROCm (gfx1151)\n"
+              << "Model: " << model.ModelName() << '\n'
+              << "Prompt tokens: " << prompt.size() << '\n'
+              << "Max tokens: " << opt.max_tokens << '\n'
+              << "--- Generation Output ---\n";
+  }
   const std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
   sampling::SamplerState sampler(opt.sampling, history);
   std::vector<tokenization::TokenId> generated;
@@ -475,13 +482,21 @@ int GenerateGlmResponse(const PromptOptions& opt,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
     const auto after = session.Statistics();
-    std::cerr << "Generated " << generated.size() << " tokens ("
-              << generated.size() / seconds << " tok/s)\n";
-    if (after.drafted > before.drafted) {
-      std::cerr << "Drafts: " << after.accepted - before.accepted << "/"
-                << after.drafted - before.drafted << " accepted in "
-                << after.cycles - before.cycles << " steps\n";
+    const auto drafted = after.drafted - before.drafted;
+    if (opt.speculative_backend == "dflash2") {
+      std::cerr << "[Speculative]: acceptance="
+                << (drafted ? static_cast<double>(after.accepted -
+                                                  before.accepted) /
+                                  static_cast<double>(drafted)
+                            : 0.0)
+                << " drafted=" << drafted
+                << " accepted=" << after.accepted - before.accepted
+                << " verification_steps=" << after.cycles - before.cycles
+                << " history_steps="
+                << after.history_cycles - before.history_cycles << '\n';
     }
+    std::cout << "Generated " << generated.size() << " tokens on ROCm in "
+              << seconds << "s (" << generated.size() / seconds << " tok/s)\n";
     PrintTokenTrace(generated);
   }
   return 0;

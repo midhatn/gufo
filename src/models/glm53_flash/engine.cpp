@@ -248,7 +248,8 @@ std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
   }
   auto session = std::unique_ptr<Session>(
       new Session(shared_from_this(), std::move(native)));
-  if (mode == core::SessionMode::kSpeculative && dflash_model_ != nullptr &&
+  session->speculative_ = mode == core::SessionMode::kSpeculative;
+  if (session->speculative_ && dflash_model_ != nullptr &&
       !session->InitDflash(error_msg)) {
     return nullptr;
   }
@@ -540,7 +541,7 @@ bool Session::DecodeImpl(std::size_t max_tokens,
   bool history = false;
   bool drafted_by_model = false;
 
-  if (cap > 1) {
+  if (cap > 1 && speculative_) {
     // The history index includes the anchor, which every outcome commits.
     SyncLookup();
     lookup_.Append(anchor);

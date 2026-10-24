@@ -4,6 +4,8 @@
 // cold prompt, and seeded sampled decoding with drafts replays exactly.
 #include "src/models/glm53_flash/engine.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -164,6 +166,43 @@ bool SeededReplay(glm::Model& model) {
 
 }  // namespace
 
+double FreeGiB() {
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  hipMemGetInfo(&free_bytes, &total_bytes);
+  return static_cast<double>(free_bytes) / (1 << 30);
+}
+
+// Prints what a session costs next to the resident model, in GiB.
+void SessionFootprint(glm::Model& model) {
+  std::string error;
+  const double base = FreeGiB();
+  auto autoregressive = model.CreateSession(
+      gufo::core::SessionMode::kAutoregressive, model.MaxContext(), &error);
+  const double after_ar = FreeGiB();
+  auto speculative = model.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                         model.MaxContext(), &error);
+  const double after_spec = FreeGiB();
+  const auto prompt = MakePrompt(model, 200);
+  if (speculative && speculative->Sync(prompt, &error)) {
+    gufo::sampling::SamplerState sampler;
+    glm::Session::DecodeResult step;
+    for (int i = 0; i < 6; ++i)
+      (void)speculative->DecodeStep(8, sampler, &step, &error, false);
+  }
+  const double after_steps = FreeGiB();
+  std::printf(
+      "footprint: autoregressive %.2f, speculative %.2f, +after decode %.2f "
+      "GiB (estimate %.2f / %.2f)\n",
+      base - after_ar, after_ar - after_spec, after_spec - after_steps,
+      model.SessionBytes(gufo::core::SessionMode::kAutoregressive,
+                         model.MaxContext()) /
+          double(1 << 30),
+      model.SessionBytes(gufo::core::SessionMode::kSpeculative,
+                         model.MaxContext()) /
+          double(1 << 30));
+}
+
 int main(int argc, char** argv) {
   if (argc < 2 || argv[1][0] == '\0') {
     return kSkip;
@@ -179,6 +218,7 @@ int main(int argc, char** argv) {
     std::printf("load: %s\n", error.c_str());
     return kSkip;
   }
+  SessionFootprint(*model);
   bool ok = ControlTokens(*model);
   ok &= RoundTrip(*model, 301);
   ok &= RoundTrip(*model, 4103);
