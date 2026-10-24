@@ -41,8 +41,14 @@ constexpr int kQkvSlices = 3 * kKdaInner / 1024;
 constexpr int kNpuPasses = 2;
 constexpr int kShexpSlices = 2 * kExpertFf / 1024;
 constexpr int kQLora = 1536;
-constexpr std::uint32_t kPairTileRows = 128;
-constexpr std::uint32_t kDownTileRows = 64;
+// Routed expert tile classes: experts with big buckets take wider token tiles
+// (fewer weight decodes); 64-row paired gate/up tiles are not supported.
+constexpr std::uint32_t kGateWideMin = 96;
+constexpr std::uint32_t kGateWideRows = 256;
+constexpr std::uint32_t kGateNarrowRows = 128;
+constexpr std::uint32_t kDownWideMin = 129;
+constexpr std::uint32_t kDownWideRows = 192;
+constexpr std::uint32_t kDownNarrowRows = 128;
 constexpr std::uint32_t kPadRows = 16;
 // Batches at least this wide use the W8A8 GEMMs.
 constexpr int kWideBatch = 32;
@@ -1027,22 +1033,29 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
   hipMemcpyAsync(b.host_counts, b.counts, kMoeExperts * sizeof(std::uint32_t),
                  hipMemcpyDeviceToHost, stream_);
   hipStreamSynchronize(stream_);
-  const std::uint32_t pair_rows = kPairTileRows;
-  const std::uint32_t down_rows = kDownTileRows;
   std::int32_t* host_pair = b.host_tiles;
   std::int32_t* host_down = b.host_tiles + b.tile_capacity;
   std::uint32_t pair_tiles = 0;
   std::uint32_t down_tiles = 0;
-  for (int e = 0; e < kMoeExperts; ++e) {
-    const std::uint32_t padded =
-        (b.host_counts[e] + kPadRows - 1) / kPadRows * kPadRows;
-    for (std::uint32_t j = 0; j < (padded + pair_rows - 1) / pair_rows; ++j) {
-      host_pair[pair_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+  const auto add = [&](std::int32_t* list, std::uint32_t& n, std::uint32_t lo,
+                       std::uint32_t hi, std::uint32_t rows) {
+    for (int e = 0; e < kMoeExperts; ++e) {
+      const std::uint32_t count = b.host_counts[e];
+      if (count < lo || count >= hi)
+        continue;
+      const std::uint32_t padded = (count + kPadRows - 1) / kPadRows * kPadRows;
+      for (std::uint32_t j = 0; j < (padded + rows - 1) / rows; ++j) {
+        list[n++] = static_cast<std::int32_t>(e | (j << 16));
+      }
     }
-    for (std::uint32_t j = 0; j < (padded + down_rows - 1) / down_rows; ++j) {
-      host_down[down_tiles++] = static_cast<std::int32_t>(e | (j << 16));
-    }
-  }
+  };
+  constexpr std::uint32_t kAll = ~0U;
+  add(host_pair, pair_tiles, kGateWideMin, kAll, kGateWideRows);
+  const std::uint32_t gate_wide_tiles = pair_tiles;
+  add(host_pair, pair_tiles, 0, kGateWideMin, kGateNarrowRows);
+  add(host_down, down_tiles, kDownWideMin, kAll, kDownWideRows);
+  const std::uint32_t down_wide_tiles = down_tiles;
+  add(host_down, down_tiles, 0, kDownWideMin, kDownNarrowRows);
   hipMemcpyAsync(b.tiles_pair, host_pair, pair_tiles * sizeof(std::int32_t),
                  hipMemcpyHostToDevice, stream_);
   hipMemcpyAsync(b.tiles_down, host_down, down_tiles * sizeof(std::int32_t),
@@ -1053,16 +1066,30 @@ void Executor::RoutedExpertsF16(const LayerWeights& w, int T) const {
     return code == kTypeIQ2_S ? qfn::WeightType::kIQ2_S
                               : qfn::WeightType::kIQ2_XXS;
   };
-  qfn::RoutedGatedF16Gemm(
-      w.exp_gate->data, w.exp_up->data, weight_type(w.exp_gate->type),
-      static_cast<const __half*>(b.x_half), b.tiles_pair, pair_tiles, pair_rows,
-      b.bounds, b.rows_token, b.rows_slot, static_cast<__half*>(b.act_half),
-      kExpertFf, kHidden, stream_);
-  qfn::RoutedF16Gemm(w.exp_down->data, weight_type(w.exp_down->type),
-                     static_cast<const __half*>(b.act_half), b.tiles_down,
-                     down_tiles, down_rows, b.bounds, b.rows_slot, b.rows_slot,
-                     nullptr, nullptr, static_cast<__half*>(b.parts_half),
-                     kHidden, kExpertFf, stream_);
+  const auto gate_pair = [&](std::uint32_t offset, std::uint32_t count,
+                             std::uint32_t rows) {
+    if (count == 0)
+      return;
+    qfn::RoutedGatedF16Gemm(
+        w.exp_gate->data, w.exp_up->data, weight_type(w.exp_gate->type),
+        static_cast<const __half*>(b.x_half), b.tiles_pair + offset, count,
+        rows, b.bounds, b.rows_token, b.rows_slot,
+        static_cast<__half*>(b.act_half), kExpertFf, kHidden, stream_);
+  };
+  gate_pair(0, gate_wide_tiles, kGateWideRows);
+  gate_pair(gate_wide_tiles, pair_tiles - gate_wide_tiles, kGateNarrowRows);
+  const auto down = [&](std::uint32_t offset, std::uint32_t count,
+                        std::uint32_t rows) {
+    if (count == 0)
+      return;
+    qfn::RoutedF16Gemm(
+        w.exp_down->data, weight_type(w.exp_down->type),
+        static_cast<const __half*>(b.act_half), b.tiles_down + offset, count,
+        rows, b.bounds, b.rows_slot, b.rows_slot, nullptr, nullptr,
+        static_cast<__half*>(b.parts_half), kHidden, kExpertFf, stream_);
+  };
+  down(0, down_wide_tiles, kDownWideRows);
+  down(down_wide_tiles, down_tiles - down_wide_tiles, kDownNarrowRows);
   (void)slots;
 }
 

@@ -115,6 +115,27 @@ int main(int argc, char** argv) {
     return d / std::sqrt(xx * yy);
   };
   const bool have_head = executor->layers() >= 45;
+  if (const char* path = std::getenv("GUFO_GLM53_DUMP")) {
+    if (FILE* f = std::fopen(path, "wb")) {
+      std::fwrite(b.data(), sizeof(float), b.size(), f);
+      std::fclose(f);
+    }
+  }
+  if (const char* path = std::getenv("GUFO_GLM53_CMP")) {
+    std::vector<float> other(b.size());
+    if (FILE* f = std::fopen(path, "rb")) {
+      if (std::fread(other.data(), sizeof(float), other.size(), f) ==
+          other.size()) {
+        std::printf(
+            "vs file %s: logits cos %.5f top1 %s\n", path, cosine_fn(b, other),
+            std::max_element(b.begin(), b.end()) - b.begin() ==
+                    std::max_element(other.begin(), other.end()) - other.begin()
+                ? "same"
+                : "DIFFERENT");
+      }
+      std::fclose(f);
+    }
+  }
   if (const char* v = std::getenv("GUFO_GLM53_REF_CHUNK")) {
     auto ref = executor->CreateSession(&error);
     if (!executor->Prefill(*ref, tokens, &error, std::atoi(v)))

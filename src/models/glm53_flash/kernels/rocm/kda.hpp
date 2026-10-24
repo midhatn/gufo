@@ -34,6 +34,12 @@ int KdaRecur(const float* q, const float* k, const float* v, const float* decay,
              const float* beta, float* state, float* o, hipStream_t stream,
              int tokens = 1);
 
+// KdaRecur for prefill batches: the same recurrence evaluated 16 tokens at a
+// time with matrix products against the carried state.
+int KdaRecurChunked(const float* q, const float* k, const float* v,
+                    const float* decay, const float* beta, float* state,
+                    float* o, hipStream_t stream, int tokens);
+
 // In place per head: o = RMSNorm(o) * norm_w * sigmoid(g).
 int KdaOut(float* o, const float* norm_w, const float* g, hipStream_t stream,
            int tokens = 1);
