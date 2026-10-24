@@ -41,6 +41,13 @@ int MatvecBatched(int type_code, const void* w, const float* x, float* out,
 int MatvecExperts(int type_code, const void* w, const float* x, float* out,
                   int m, int k, int n_experts, int n_used, const int* ids,
                   bool x_per_expert, void* scratch, hipStream_t stream);
+// MatvecExperts for up to eight tokens in one launch: ids is [token][n_used],
+// x is [token][k] (or [token][n_used][k] when x_per_expert) and out is
+// [token][n_used][m].
+int MatvecExpertsTokens(int type_code, const void* w, const float* x,
+                        float* out, int m, int k, int n_experts, int n_used,
+                        int n_tokens, const int* ids, bool x_per_expert,
+                        void* scratch, hipStream_t stream);
 
 // Dense GEMM for any n: out[col * m + row], x is [n][k]. Up to 8 columns use
 // the mmvq path, larger batches the mmq GEMM (K a multiple of 256; narrower K

@@ -52,6 +52,7 @@ constexpr std::uint32_t kDownNarrowRows = 128;
 constexpr std::uint32_t kPadRows = 16;
 // Batches at least this wide use the W8A8 GEMMs.
 constexpr int kWideBatch = 32;
+constexpr int kMaxExpertTokens = 8;
 constexpr int kFfnScratch = std::max(kDenseFf, kMoeUsed* kExpertFf);
 constexpr int kMlaQ = kDsaHeads * 256;
 constexpr float kRmsEps = 1e-5F;
@@ -1164,16 +1165,17 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
   const bool shexp_npu = shexp_bank_ >= 0 && T > 1 &&
                          T == static_cast<int>(npu_->tokens()) &&
                          layer < npu_sh_.size() && !npu_sh_[layer].empty();
-  if (T == 1) {
-    MatvecExperts(w.exp_gate->type, w.exp_gate->data, b.y, b.gate, kExpertFf,
-                  kHidden, kMoeExperts, kMoeUsed, b.ids, false, b.matvec,
-                  stream_);
-    MatvecExperts(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf, kHidden,
-                  kMoeExperts, kMoeUsed, b.ids, false, b.matvec, stream_);
-    SwigluClamp(b.gate, b.up, b.act, kMoeUsed * kExpertFf, stream_);
-    MatvecExperts(w.exp_down->type, w.exp_down->data, b.act, b.parts, kHidden,
-                  kExpertFf, kMoeExperts, kMoeUsed, b.ids, true, b.matvec,
-                  stream_);
+  if (T <= kMaxExpertTokens) {
+    MatvecExpertsTokens(w.exp_gate->type, w.exp_gate->data, b.y, b.gate,
+                        kExpertFf, kHidden, kMoeExperts, kMoeUsed, T, b.ids,
+                        false, b.matvec, stream_);
+    MatvecExpertsTokens(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf,
+                        kHidden, kMoeExperts, kMoeUsed, T, b.ids, false,
+                        b.matvec, stream_);
+    SwigluClamp(b.gate, b.up, b.act, T * kMoeUsed * kExpertFf, stream_);
+    MatvecExpertsTokens(w.exp_down->type, w.exp_down->data, b.act, b.parts,
+                        kHidden, kExpertFf, kMoeExperts, kMoeUsed, T, b.ids,
+                        true, b.matvec, stream_);
   } else {
     if (!res_half_)
       ToHalf(b.y, b.x_half, static_cast<long long>(T) * kHidden, stream_);
@@ -1189,7 +1191,7 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
   }
   SwigluClamp(b.sg, b.su, b.sact, T * kExpertFf, stream_);
   Proj(*w.sh_down, Prep(b.sact, T, kExpertFf), b.shared, T);
-  if (T == 1) {
+  if (T <= kMaxExpertTokens) {
     MoeCombine(b.parts, b.wts, b.shared, b.ffn_out, stream_, T);
   } else if (!res_half_) {
     MoeCombineF16(b.parts_half, b.wts, b.shared, b.ffn_out, stream_, T);
