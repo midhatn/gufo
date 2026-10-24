@@ -104,6 +104,35 @@ bool Speculator::InjectCapture(std::string* error) {
   return true;
 }
 
+namespace {
+
+constexpr std::uint32_t kNgramOrder = 3;
+constexpr std::uint32_t kNgramMinDraft = 2;
+constexpr float kPlainBelow = 0.8F;
+constexpr std::uint32_t kProbeEvery = 6;
+
+// Tokens that followed the latest earlier occurrence of the history's last
+// kNgramOrder tokens, at most `limit` of them.
+std::vector<std::int32_t> LookupNgram(std::span<const std::int32_t> history,
+                                      std::uint32_t limit) {
+  const std::size_t n = history.size();
+  if (n <= kNgramOrder) {
+    return {};
+  }
+  const auto* tail = history.data() + n - kNgramOrder;
+  for (std::size_t at = n - kNgramOrder; at-- > 0;) {
+    if (!std::equal(tail, tail + kNgramOrder, history.data() + at)) {
+      continue;
+    }
+    const std::size_t first = at + kNgramOrder;
+    const std::size_t count = std::min<std::size_t>(limit, n - first);
+    return {history.begin() + first, history.begin() + first + count};
+  }
+  return {};
+}
+
+}  // namespace
+
 bool Speculator::Generate(rocm::Executor::Session& session,
                           std::span<const std::int32_t> prompt,
                           std::size_t max_new,
@@ -132,9 +161,11 @@ bool Speculator::Generate(rocm::Executor::Session& session,
   }
   std::int32_t anchor = executor_->ArgmaxRows(1)[0];
   std::size_t emitted = 0;
+  std::vector<std::int32_t> history(prompt.begin(), prompt.end());
   const auto emit = [&](std::int32_t token) {
     ++emitted;
     ++stats_.emitted;
+    history.push_back(token);
     return on_token(token) && !is_stop(token);
   };
   if (!emit(anchor) || emitted >= max_new) {
@@ -146,30 +177,42 @@ bool Speculator::Generate(rocm::Executor::Session& session,
   // chat-like text rarely accepts more than a few drafts: track the recent
   // accepted count and verify only a little beyond it.
   float accepted_ema = static_cast<float>(max_draft);
+  std::uint32_t plain_steps = 0;
   while (emitted < max_new) {
     const std::uint32_t position = session.position;  // the anchor's position
     if (position + max_draft + 1 >= max_context_) {
       break;
     }
-    const auto draft = drafter_->ForwardBlock(
-        static_cast<tokenization::TokenId>(anchor), position, max_draft);
-    if (draft.empty()) {
-      if (error != nullptr)
-        *error = "drafter returned no tokens";
-      return false;
+    std::vector<std::int32_t> chain{anchor};
+    bool drafted_by_model = false;
+    const auto lookup = LookupNgram(history, max_draft);
+    if (lookup.size() >= kNgramMinDraft) {
+      chain.insert(chain.end(), lookup.begin(), lookup.end());
+    } else if (accepted_ema < kPlainBelow && ++plain_steps % kProbeEvery != 0) {
+      // The drafter has been missing: a plain step costs less than a
+      // verification block that is mostly rejected.
+    } else {
+      const auto draft = drafter_->ForwardBlock(
+          static_cast<tokenization::TokenId>(anchor), position, max_draft);
+      if (draft.empty()) {
+        if (error != nullptr)
+          *error = "drafter returned no tokens";
+        return false;
+      }
+      const std::uint32_t wanted = std::clamp<std::uint32_t>(
+          static_cast<std::uint32_t>(std::ceil(accepted_ema)) + 1, 2,
+          max_draft);
+      const std::uint32_t take = std::min<std::uint32_t>(
+          wanted, static_cast<std::uint32_t>(draft.size()));
+      for (std::uint32_t i = 0; i < take; ++i) {
+        chain.push_back(static_cast<std::int32_t>(draft[i]));
+      }
+      drafted_by_model = true;
     }
-    const std::uint32_t wanted = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(std::ceil(accepted_ema)) + 1, 2, max_draft);
-    const std::uint32_t k = std::min<std::uint32_t>(
-        wanted, static_cast<std::uint32_t>(draft.size()));
-    std::vector<std::int32_t> chain(k + 1);
-    chain[0] = anchor;
-    for (std::uint32_t i = 0; i < k; ++i) {
-      chain[i + 1] = static_cast<std::int32_t>(draft[i]);
-    }
+    const std::uint32_t k = static_cast<std::uint32_t>(chain.size()) - 1;
 
-    executor_->SetRecording(true);
-    const bool ok = executor_->SaveState(session, error) &&
+    executor_->SetRecording(k > 0);
+    const bool ok = (k == 0 || executor_->SaveState(session, error)) &&
                     executor_->Step(session, chain, k + 1, error);
     executor_->SetRecording(false);
     if (!ok) {
@@ -183,7 +226,9 @@ bool Speculator::Generate(rocm::Executor::Session& session,
     ++stats_.steps;
     stats_.drafted += k;
     stats_.accepted += accepted;
-    accepted_ema = 0.7F * accepted_ema + 0.3F * static_cast<float>(accepted);
+    if (drafted_by_model) {
+      accepted_ema = 0.7F * accepted_ema + 0.3F * static_cast<float>(accepted);
+    }
     ++stats_.accepted_histogram[std::min<std::uint32_t>(accepted, 15)];
 
     if (accepted < k) {
