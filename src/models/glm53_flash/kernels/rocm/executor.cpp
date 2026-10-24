@@ -1187,7 +1187,7 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
   Proj(*w.sh_down, Prep(b.sact, T, kExpertFf), b.shared, T);
   if (T == 1) {
     MoeCombine(b.parts, b.wts, b.shared, b.ffn_out, stream_, T);
-  } else {
+  } else if (!res_half_) {
     MoeCombineF16(b.parts_half, b.wts, b.shared, b.ffn_out, stream_, T);
   }
 }
@@ -1267,8 +1267,15 @@ void Executor::RunLayer(std::uint32_t layer, Session& session, int T, int& cur,
     Mark(0);
     FfnBlock(layer, ffn_rows);
     Mark(w.dense ? 3 : 4);
-    HcPostStep(ResidualAt(b.x[cur], first), b.ffn_out,
-               ResidualAt(b.x[1 - cur], first), ffn_rows);
+    if (res_half_ && !w.dense && ffn_rows > 1) {
+      HcPostMoe(static_cast<const std::uint16_t*>(ResidualAt(b.x[cur], first)),
+                b.parts_half, b.wts, b.shared, b.post, b.comb,
+                static_cast<std::uint16_t*>(ResidualAt(b.x[1 - cur], first)),
+                stream_, ffn_rows);
+    } else {
+      HcPostStep(ResidualAt(b.x[cur], first), b.ffn_out,
+                 ResidualAt(b.x[1 - cur], first), ffn_rows);
+    }
     cur = 1 - cur;
   }
   if (!dflash_taps_.empty()) {

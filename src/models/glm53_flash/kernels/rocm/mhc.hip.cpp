@@ -261,6 +261,47 @@ __global__ void HcPostKernel(const X* __restrict__ x,
   }
 }
 
+constexpr int kMoeUsedExperts = 8;
+
+// HcPostKernel whose block input is the routed experts' F16 rows weighted and
+// summed together with the shared expert (MoeCombineF16 without the F32 rows).
+template<typename X>
+__global__ void HcPostMoeKernel(const X* __restrict__ x,
+                                const _Float16* __restrict__ parts,
+                                const float* __restrict__ weights,
+                                const float* __restrict__ shared,
+                                const float* __restrict__ post,
+                                const float* __restrict__ comb,
+                                X* __restrict__ next) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= kHcHidden) {
+    return;
+  }
+  const int token = blockIdx.y;
+  x += static_cast<std::size_t>(token) * kStreamsFlat;
+  next += static_cast<std::size_t>(token) * kStreamsFlat;
+  parts += static_cast<std::size_t>(token) * kMoeUsedExperts * kHcHidden;
+  weights += token * kMoeUsedExperts;
+  post += token * kHcStreams;
+  comb += token * kHcStreams * kHcStreams;
+  float b = 0.0F;
+  for (int e = 0; e < kMoeUsedExperts; ++e) {
+    b += weights[e] * static_cast<float>(parts[e * kHcHidden + i]);
+  }
+  b += shared[static_cast<std::size_t>(token) * kHcHidden + i];
+  float xs[kHcStreams];
+  for (int s = 0; s < kHcStreams; ++s) {
+    xs[s] = static_cast<float>(x[s * kHcHidden + i]);
+  }
+  for (int d = 0; d < kHcStreams; ++d) {
+    float acc = b * post[d];
+    for (int s = 0; s < kHcStreams; ++s) {
+      acc += xs[s] * comb[d + kHcStreams * s];
+    }
+    next[d * kHcHidden + i] = static_cast<X>(acc);
+  }
+}
+
 template<typename X>
 __global__ __launch_bounds__(kThreads) void HeadNormKernel(
     const X* __restrict__ x, const float* __restrict__ w,
@@ -464,6 +505,18 @@ int MeanStreams(const std::uint16_t* x, int first_row, int rows, float* dst,
                 hipStream_t stream) {
   return MeanStreamsImpl(reinterpret_cast<const _Float16*>(x), first_row, rows,
                          dst, dst_stride, tap_offset, stream);
+}
+
+int HcPostMoe(const std::uint16_t* x, const void* parts, const float* weights,
+              const float* shared, const float* post, const float* comb,
+              std::uint16_t* next, hipStream_t stream, int tokens) {
+  constexpr int kBlock = 256;
+  HcPostMoeKernel<_Float16>
+      <<<dim3((kHcHidden + kBlock - 1) / kBlock, tokens), kBlock, 0, stream>>>(
+          reinterpret_cast<const _Float16*>(x),
+          static_cast<const _Float16*>(parts), weights, shared, post, comb,
+          reinterpret_cast<_Float16*>(next));
+  return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
 int HalfToFloat(const std::uint16_t* in, float* out, int n,

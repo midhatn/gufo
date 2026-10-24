@@ -42,6 +42,11 @@ int HcPost(const float* x, const float* block, const float* post,
 int HcPost(const std::uint16_t* x, const float* block, const float* post,
            const float* comb, std::uint16_t* next, hipStream_t stream,
            int tokens = 1);
+// HcPost with block = sum_e weights[e] * parts[e] + shared (parts: [token][8]
+// [4096] F16 rows).
+int HcPostMoe(const std::uint16_t* x, const void* parts, const float* weights,
+              const float* shared, const float* post, const float* comb,
+              std::uint16_t* next, hipStream_t stream, int tokens);
 int HeadNorm(const std::uint16_t* x, const float* w, float* out,
              hipStream_t stream, int rows = 1);
 int MeanStreams(const std::uint16_t* x, int first_row, int rows, float* dst,
