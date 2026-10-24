@@ -371,6 +371,21 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
+  // GLM's control and user-defined tokens outside the shared families:
+  // llama.cpp matches them in prompt text, so the chat template's framing and
+  // tool-call tags are single tokens.
+  if (const auto pre = reader.GetMetadataString("tokenizer.ggml.pre");
+      pre && (*pre == "glm4" || *pre == "glm5")) {
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      const auto& t = tokens[i];
+      if (t == "[gMASK]" || t == "[sMASK]" || t == "[MASK]" || t == "<sop>" ||
+          t == "<eop>" || t == "<arg_key>" || t == "</arg_key>" ||
+          t == "<arg_value>" || t == "</arg_value>" || t == "/nothink") {
+        special_tokens[t] = static_cast<TokenId>(i);
+      }
+    }
+  }
+
   auto tokenizer =
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {

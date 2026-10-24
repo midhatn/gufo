@@ -50,6 +50,24 @@ bool SameLogits(const glm::Session& a, const glm::Session& b) {
          std::memcmp(x.data(), y.data(), x.size_bytes()) == 0;
 }
 
+// Control tokens in prompt text are single tokens, as in llama.cpp.
+bool ControlTokens(const glm::Model& model) {
+  const auto framing = model.Tokenize(
+      "[gMASK]<sop><|user|>x<|assistant|><think></think><tool_call>f"
+      "<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>");
+  const auto count = [&](std::int32_t id) {
+    return std::count(framing.begin(), framing.end(), id);
+  };
+  const bool ok =
+      framing.size() >= 2 && framing[0] == 154822 && framing[1] == 154824 &&
+      count(154827) == 1 && count(154828) == 1 && count(154841) == 1 &&
+      count(154842) == 1 && count(154843) == 1 && count(154847) == 1 &&
+      count(154848) == 1 && count(154849) == 1 && count(154850) == 1 &&
+      count(154844) == 1;
+  std::printf("control tokens: %s\n", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 bool RoundTrip(glm::Model& model, std::size_t n) {
   std::string error;
   const auto prompt = MakePrompt(model, n);
@@ -161,7 +179,8 @@ int main(int argc, char** argv) {
     std::printf("load: %s\n", error.c_str());
     return kSkip;
   }
-  bool ok = RoundTrip(*model, 301);
+  bool ok = ControlTokens(*model);
+  ok &= RoundTrip(*model, 301);
   ok &= RoundTrip(*model, 4103);
   ok &= PrefixExtension(*model);
   if (model->HasDflash()) {
