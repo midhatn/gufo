@@ -273,7 +273,8 @@ target_compile_definitions(gufo PRIVATE
   GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
 if (ENGINE_ENABLE_HIP)
-  target_link_libraries(gufo PRIVATE gufo_deepseek_v4_flash)
+  target_link_libraries(gufo PRIVATE gufo_deepseek_v4_flash
+    gufo_glm53_flash_engine)
 endif()
 target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
 

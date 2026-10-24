@@ -6,6 +6,7 @@
 #include <optional>
 #include <vector>
 
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -182,6 +183,27 @@ void AppendToolBlock(std::string& out,
 }
 
 }  // namespace
+
+bool ValidateGgufTemplate(const core::GgufReader& reader,
+                          std::string* error_msg) {
+  // SHA-256 of the glm5next artifact's tokenizer.chat_template.
+  constexpr std::string_view kTemplateSha256 =
+      "a4fddbbf0b432101a296c17094f8bc5a2b0d30713b5b5cd92f86be78511aa724";
+  const auto text = reader.GetMetadataString("tokenizer.chat_template");
+  if (!text) {
+    if (error_msg != nullptr)
+      *error_msg = "GGUF has no chat template";
+    return false;
+  }
+  const auto hash = crypto::Sha256Hex(
+      {reinterpret_cast<const std::uint8_t*>(text->data()), text->size()});
+  if (hash != kTemplateSha256) {
+    if (error_msg != nullptr)
+      *error_msg = "template sha256 " + hash + " is not the compiled one";
+    return false;
+  }
+  return true;
+}
 
 std::string RenderChat(std::span<const tokenization::ChatMessage> messages,
                        std::span<const tokenization::ChatTool> tools,

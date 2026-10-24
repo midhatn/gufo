@@ -69,8 +69,12 @@ public:
   [[nodiscard]] std::int32_t EosToken() const noexcept { return eos_token_; }
   [[nodiscard]] bool IsStopToken(std::int32_t token) const noexcept;
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
-  /// Tokens one scheduled prefill step takes.
+  /// Tokens one scheduled prefill step takes: a pair of NPU banks.
   [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
+  /// Draft tokens one decode step may verify beyond the sampled one.
+  [[nodiscard]] std::uint32_t MaxDraftTokens() const noexcept {
+    return options_.max_draft_tokens;
+  }
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }

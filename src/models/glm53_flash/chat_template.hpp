@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::models::glm53_flash {
@@ -21,6 +22,10 @@ inline constexpr std::string_view kThinkOpen = "<think>";
 [[nodiscard]] std::string RenderPrompt(std::string_view system,
                                        std::string_view user,
                                        std::string_view reasoning_effort);
+
+// True when the artifact carries the Jinja template RenderChat mirrors.
+[[nodiscard]] bool ValidateGgufTemplate(const core::GgufReader& reader,
+                                        std::string* error_msg);
 
 struct ChatRenderOptions {
   /// "low" and "high" are honored; anything else renders as "Max".

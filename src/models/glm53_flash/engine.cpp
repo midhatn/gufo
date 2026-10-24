@@ -284,7 +284,7 @@ std::uint32_t Model::VocabSize() const noexcept {
 }
 
 std::uint32_t Model::PrefillCapacity() const noexcept {
-  return executor_->PrefillChunk();
+  return std::min(2 * executor_->PrefillChunk(), options_.max_context);
 }
 
 std::string Model::ModelName() const {
