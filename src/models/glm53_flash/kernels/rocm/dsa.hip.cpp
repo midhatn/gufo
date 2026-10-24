@@ -109,13 +109,13 @@ __global__ void DsaAppendKernel(DsaCache cache, const float* __restrict__ lat,
   }
   const int d = threadIdx.x;
   for (int c = d; c < kDsaLatent; c += blockDim.x) {
-    cache.lat[static_cast<std::size_t>(pos) * kDsaLatent + c] = lat[c];
     reinterpret_cast<_Float16*>(
         cache.lat_half)[static_cast<std::size_t>(pos) * kDsaLatent + c] =
         static_cast<_Float16>(lat[c]);
   }
-  cache.ik[static_cast<std::size_t>(pos) * kDsaIndexDim + d] = ik[d];
-  cache.gate[static_cast<std::size_t>(pos) * kDsaIndexDim + d] = gate[d];
+  const std::size_t slot = static_cast<std::size_t>(pos % cache.ring);
+  cache.ik[slot * kDsaIndexDim + d] = ik[d];
+  cache.gate[slot * kDsaIndexDim + d] = gate[d];
   if (((pos + 1) % kDsaPool) != 0) {
     return;
   }
@@ -124,7 +124,9 @@ __global__ void DsaAppendKernel(DsaCache cache, const float* __restrict__ lat,
   float x4[kDsaPool];
   float mx = -1e30F;
   for (int s = 0; s < kDsaPool; ++s) {
-    x4[s] = cache.gate[static_cast<std::size_t>(base + s) * kDsaIndexDim + d] +
+    x4[s] = cache.gate[static_cast<std::size_t>((base + s) % cache.ring) *
+                           kDsaIndexDim +
+                       d] +
             ape[d + kDsaIndexDim * s];
     mx = fmaxf(mx, x4[s]);
   }
@@ -136,7 +138,9 @@ __global__ void DsaAppendKernel(DsaCache cache, const float* __restrict__ lat,
   float acc = 0.0F;
   for (int s = 0; s < kDsaPool; ++s) {
     acc += (x4[s] / sum) *
-           cache.ik[static_cast<std::size_t>(base + s) * kDsaIndexDim + d];
+           cache.ik[static_cast<std::size_t>((base + s) % cache.ring) *
+                        kDsaIndexDim +
+                    d];
   }
   cache.pooled[static_cast<std::size_t>(base / kDsaPool) * kDsaIndexDim + d] =
       acc;
@@ -151,13 +155,13 @@ __global__ void DsaAppendRowsKernel(DsaCache cache,
   const std::size_t pos = static_cast<std::size_t>(pos0) + token;
   for (int c = threadIdx.x; c < kDsaLatent; c += blockDim.x) {
     const float v = lat[static_cast<std::size_t>(token) * kDsaLatent + c];
-    cache.lat[pos * kDsaLatent + c] = v;
     reinterpret_cast<_Float16*>(cache.lat_half)[pos * kDsaLatent + c] =
         static_cast<_Float16>(v);
   }
-  cache.ik[pos * kDsaIndexDim + threadIdx.x] =
+  const std::size_t slot = pos % cache.ring;
+  cache.ik[slot * kDsaIndexDim + threadIdx.x] =
       ik[static_cast<std::size_t>(token) * kDsaIndexDim + threadIdx.x];
-  cache.gate[pos * kDsaIndexDim + threadIdx.x] =
+  cache.gate[slot * kDsaIndexDim + threadIdx.x] =
       gate[static_cast<std::size_t>(token) * kDsaIndexDim + threadIdx.x];
 }
 
@@ -170,7 +174,9 @@ __global__ void DsaPoolKernel(DsaCache cache, const float* __restrict__ ape,
   float x4[kDsaPool];
   float mx = -1e30F;
   for (int s = 0; s < kDsaPool; ++s) {
-    x4[s] = cache.gate[static_cast<std::size_t>(base + s) * kDsaIndexDim + d] +
+    x4[s] = cache.gate[static_cast<std::size_t>((base + s) % cache.ring) *
+                           kDsaIndexDim +
+                       d] +
             ape[d + kDsaIndexDim * s];
     mx = fmaxf(mx, x4[s]);
   }
@@ -182,7 +188,9 @@ __global__ void DsaPoolKernel(DsaCache cache, const float* __restrict__ ape,
   float acc = 0.0F;
   for (int s = 0; s < kDsaPool; ++s) {
     acc += (x4[s] / sum) *
-           cache.ik[static_cast<std::size_t>(base + s) * kDsaIndexDim + d];
+           cache.ik[static_cast<std::size_t>((base + s) % cache.ring) *
+                        kDsaIndexDim +
+                    d];
   }
   cache.pooled[static_cast<std::size_t>(pool) * kDsaIndexDim + d] = acc;
 }
@@ -299,7 +307,6 @@ __launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
   const int pool = (blockIdx.x * kScoreWmmaWaves + wave) * 16 + col;
 
   __shared__ _Float16 qh[kScoreTokens][kScoreHeadGroup][kScoreQPad];
-  __shared__ _Float16 ql[kScoreTokens][kScoreHeadGroup][kScoreQPad];
   __shared__ float wt[kScoreTokens][kDsaIndexHeads];
   for (int idx = tid; idx < kScoreTokens * kDsaIndexHeads;
        idx += kScoreWmmaWaves * kWaveLanes) {
@@ -314,7 +321,6 @@ __launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
   }
 
   v16h bh[kDsaIndexDim / 16];
-  v16h bl[kDsaIndexDim / 16];
 #pragma unroll
   for (int step = 0; step < kDsaIndexDim / 16; ++step) {
 #pragma unroll
@@ -324,9 +330,7 @@ __launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
               ? pooled[static_cast<std::size_t>(pool) * kDsaIndexDim +
                        step * 16 + e]
               : 0.0F;
-      const _Float16 hi = static_cast<_Float16>(f);
-      bh[step][e] = hi;
-      bl[step][e] = static_cast<_Float16>(f - static_cast<float>(hi));
+      bh[step][e] = static_cast<_Float16>(f);
     }
   }
   v8f total = v8f{};
@@ -344,9 +348,7 @@ __launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
                                    kDsaIndexDim +
                                d]
                           : 0.0F;
-      const _Float16 hi = static_cast<_Float16>(f);
-      qh[t][hh][d] = hi;
-      ql[t][hh][d] = static_cast<_Float16>(f - static_cast<float>(hi));
+      qh[t][hh][d] = static_cast<_Float16>(f);
     }
     __syncthreads();
     for (int hh = 0; hh < kScoreHeadGroup; ++hh) {
@@ -354,11 +356,7 @@ __launch_bounds__(kScoreWmmaWaves* kWaveLanes) void DsaScoresWmmaKernel(
 #pragma unroll
       for (int step = 0; step < kDsaIndexDim / 16; ++step) {
         const v16h a = *reinterpret_cast<const v16h*>(&qh[col][hh][step * 16]);
-        const v16h a_lo =
-            *reinterpret_cast<const v16h*>(&ql[col][hh][step * 16]);
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bh[step], acc);
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bl[step], acc);
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, bh[step], acc);
       }
       for (int i = 0; i < 8; ++i) {
         total[i] += fmaxf(acc[i], 0.0F) *
@@ -488,7 +486,7 @@ __global__ __launch_bounds__(kThreads) void DsaSelectKernel(
 }
 
 __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
-    const float* __restrict__ qabs, const float* __restrict__ lat,
+    const float* __restrict__ qabs, const _Float16* __restrict__ lat,
     const int* __restrict__ selected, int nselected, int pos, float scale,
     float* __restrict__ ctx, int pos0, int tokens, int top,
     const int* __restrict__ pos_dev) {
@@ -526,10 +524,10 @@ __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
   __syncthreads();
 
   for (int j = wave; j < nvis; j += kAttendWaves) {
-    const float* row = lat + static_cast<std::size_t>(where[j]) * kDsaLatent;
+    const _Float16* row = lat + static_cast<std::size_t>(where[j]) * kDsaLatent;
     float dot = 0.0F;
     for (int c = lane; c < kDsaLatent; c += kWaveLanes) {
-      dot += q[c] * row[c];
+      dot += q[c] * static_cast<float>(row[c]);
     }
     dot = WaveSum(dot) * scale;
     if (lane == 0) {
@@ -555,7 +553,8 @@ __global__ __launch_bounds__(kAttendThreads) void DsaAttendKernel(
     float acc = 0.0F;
     for (int j = 0; j < nvis; ++j) {
       acc += prob[j] * inv *
-             lat[static_cast<std::size_t>(where[j]) * kDsaLatent + c];
+             static_cast<float>(
+                 lat[static_cast<std::size_t>(where[j]) * kDsaLatent + c]);
     }
     ctx[slab + c] = acc;
   }
@@ -773,11 +772,12 @@ int DsaSelect(const float* scores, int npool, int top_pools, int* selected,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int DsaAttend(const float* qabs, const float* lat, const int* selected,
+int DsaAttend(const float* qabs, const std::uint16_t* lat, const int* selected,
               int nselected, int pos, float scale, float* ctx,
               hipStream_t stream) {
   DsaAttendKernel<<<kDsaHeads, kAttendThreads, 0, stream>>>(
-      qabs, lat, selected, nselected, pos, scale, ctx, -1, 1, 0, nullptr);
+      qabs, reinterpret_cast<const _Float16*>(lat), selected, nselected, pos,
+      scale, ctx, -1, 1, 0, nullptr);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
@@ -808,11 +808,12 @@ int DsaSelectDev(const float* scores, int top_pools, int* selected,
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
-int DsaAttendDev(const float* qabs, const float* lat, const int* selected,
-                 int top_pools, float scale, float* ctx, const int* pos,
-                 hipStream_t stream) {
+int DsaAttendDev(const float* qabs, const std::uint16_t* lat,
+                 const int* selected, int top_pools, float scale, float* ctx,
+                 const int* pos, hipStream_t stream) {
   DsaAttendKernel<<<kDsaHeads, kAttendThreads, 0, stream>>>(
-      qabs, lat, selected, 0, 0, scale, ctx, -1, 1, top_pools, pos);
+      qabs, reinterpret_cast<const _Float16*>(lat), selected, 0, 0, scale, ctx,
+      -1, 1, top_pools, pos);
   return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 

@@ -175,8 +175,8 @@ Executor::Session::~Session() {
   for (auto& l : layers) {
     for (void* p :
          {static_cast<void*>(l.conv), static_cast<void*>(l.state),
-          static_cast<void*>(l.cache.lat), static_cast<void*>(l.cache.lat_half),
-          static_cast<void*>(l.cache.ik), static_cast<void*>(l.cache.gate),
+          static_cast<void*>(l.cache.lat_half), static_cast<void*>(l.cache.ik),
+          static_cast<void*>(l.cache.gate),
           static_cast<void*>(l.cache.pooled)}) {
       if (p != nullptr)
         hipFree(p);
@@ -849,11 +849,17 @@ std::unique_ptr<Executor::Session> Executor::CreateSession(std::string* error) {
                 static_cast<std::size_t>(kKdaHeads) * kKdaHeadDim * kKdaHeadDim,
                 error);
     } else {
-      ok = Alloc(&st.cache.lat, ctx * kDsaLatent, error) &&
-           Alloc(reinterpret_cast<float**>(&st.cache.lat_half),
+      st.cache.ring = static_cast<int>(options_.prefill_chunk) + kDsaPool;
+      ok = Alloc(reinterpret_cast<float**>(&st.cache.lat_half),
                  ctx * kDsaLatent / 2, error) &&
-           Alloc(&st.cache.ik, ctx * kDsaIndexDim, error) &&
-           Alloc(&st.cache.gate, ctx * kDsaIndexDim, error) &&
+           Alloc(&st.cache.ik,
+                 std::size_t{static_cast<std::size_t>(st.cache.ring)} *
+                     kDsaIndexDim,
+                 error) &&
+           Alloc(&st.cache.gate,
+                 std::size_t{static_cast<std::size_t>(st.cache.ring)} *
+                     kDsaIndexDim,
+                 error) &&
            Alloc(&st.cache.pooled, (ctx / kDsaPool + 1) * kDsaIndexDim, error);
     }
   }
@@ -1012,7 +1018,7 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     DsaSelectDev(b.scores, top, b.sel, b.pos_dev, stream_);
     MatvecBatched(w.k_b->type, w.k_b->data, b.q, b.qabs, kDsaLatent, 256,
                   kDsaHeads, b.matvec, stream_);
-    DsaAttendDev(b.qabs, st.cache.lat, b.sel, top, 1.0F / 16.0F, b.ctx,
+    DsaAttendDev(b.qabs, st.cache.lat_half, b.sel, top, 1.0F / 16.0F, b.ctx,
                  b.pos_dev, stream_);
     MatvecBatched(w.v_b->type, w.v_b->data, b.ctx, b.vout, 256, kDsaLatent,
                   kDsaHeads, b.matvec, stream_);
@@ -1034,8 +1040,8 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
       MatvecBatched(w.k_b->type, w.k_b->data,
                     b.q + static_cast<std::size_t>(t) * kMlaQ, b.qabs,
                     kDsaLatent, 256, kDsaHeads, b.matvec, stream_);
-      DsaAttend(b.qabs, st.cache.lat, b.sel, nsel, pos, 1.0F / 16.0F, b.ctx,
-                stream_);
+      DsaAttend(b.qabs, st.cache.lat_half, b.sel, nsel, pos, 1.0F / 16.0F,
+                b.ctx, stream_);
       MatvecBatched(w.v_b->type, w.v_b->data, b.ctx,
                     b.vout + static_cast<std::size_t>(t) * kMlaQ, 256,
                     kDsaLatent, kDsaHeads, b.matvec, stream_);

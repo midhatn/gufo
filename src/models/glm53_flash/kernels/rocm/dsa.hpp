@@ -25,11 +25,11 @@ int LayerNorm(float* x, const float* w, const float* b, int n, float eps,
 
 // Per-layer device caches, one row per token (pooled: one per complete pool).
 struct DsaCache {
-  float* lat;               // [pos][512]
-  float* ik;                // [pos][128] normalized indexer keys
-  float* gate;              // [pos][128] compressor gate
+  std::uint16_t* lat_half;  // [pos][512] F16 latents
+  float* ik;                // [pos % ring][128] normalized indexer keys
+  float* gate;              // [pos % ring][128] compressor gate
   float* pooled;            // [pos / 4][128]
-  std::uint16_t* lat_half;  // [pos][512] F16 copy of lat for the batched attend
+  int ring;                 // ik/gate slots: at least the longest append + 3
 };
 
 // Stores token `pos` and, when it completes a pool, writes the pooled key.
@@ -48,7 +48,7 @@ int DsaSelect(const float* scores, int npool, int top_pools, int* selected,
 
 // Absorbed-MLA attention over the selected pools plus the unpooled tail of
 // token `pos`. qabs and ctx are [64][512]; scale multiplies the scores.
-int DsaAttend(const float* qabs, const float* lat, const int* selected,
+int DsaAttend(const float* qabs, const std::uint16_t* lat, const int* selected,
               int nselected, int pos, float scale, float* ctx,
               hipStream_t stream);
 
@@ -62,9 +62,9 @@ int DsaScoresDev(const float* iq, const float* proj, const float* pooled,
                  hipStream_t stream);
 int DsaSelectDev(const float* scores, int top_pools, int* selected,
                  const int* pos, hipStream_t stream);
-int DsaAttendDev(const float* qabs, const float* lat, const int* selected,
-                 int top_pools, float scale, float* ctx, const int* pos,
-                 hipStream_t stream);
+int DsaAttendDev(const float* qabs, const std::uint16_t* lat,
+                 const int* selected, int top_pools, float scale, float* ctx,
+                 const int* pos, hipStream_t stream);
 
 // Batched forms for `tokens` consecutive tokens starting at position pos0.
 // Inputs are [token][...]; scores rows are score_stride apart; selections are

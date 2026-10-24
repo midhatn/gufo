@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,8 @@ int main(int argc, char** argv) {
   namespace rocm = gufo::models::glm53_flash::rocm;
   rocm::ExecutorOptions options;
   options.max_context = static_cast<std::uint32_t>(tokens.size()) + 8;
+  if (const char* v = std::getenv("GUFO_GLM53_MAXCTX"))
+    options.max_context = std::atoi(v);
   if (const char* v = std::getenv("GUFO_GLM53_TEST_LAYERS"))
     options.layers = std::atoi(v);
   if (const char* v = std::getenv("GUFO_GLM53_TOPPOOLS"))
@@ -62,7 +65,7 @@ int main(int argc, char** argv) {
   }
 
   const bool skip_seq = std::getenv("GUFO_GLM53_SKIP_SEQ") != nullptr;
-  auto seq = executor->CreateSession(&error);
+  auto seq = skip_seq ? nullptr : executor->CreateSession(&error);
   auto start = std::chrono::steady_clock::now();
   for (const auto token : tokens) {
     if (skip_seq)
@@ -75,9 +78,29 @@ int main(int argc, char** argv) {
   const double t_seq = Seconds(start);
   std::printf("sequential stages:\n");
   executor->PrintProfile();
-  const auto a = executor->Logits(*seq);
-  const auto ra = executor->Residual(*seq);
+  const auto a = seq ? executor->Logits(*seq) : std::vector<float>{};
+  const auto ra = seq ? executor->Residual(*seq) : std::vector<float>{};
 
+  if (const char* v = std::getenv("GUFO_GLM53_TAIL")) {
+    const std::size_t tail = std::atoi(v);
+    auto deep = executor->CreateSession(&error);
+    const std::span<const std::int32_t> all(tokens);
+    if (!executor->Prefill(*deep, all.first(tokens.size() - tail), &error)) {
+      std::printf("prefill failed: %s\n", error.c_str());
+      return 1;
+    }
+    executor->PrintProfile();
+    const auto t = std::chrono::steady_clock::now();
+    if (!executor->Prefill(*deep, all.last(tail), &error)) {
+      std::printf("prefill failed: %s\n", error.c_str());
+      return 1;
+    }
+    const double s = Seconds(t);
+    executor->PrintProfile();
+    std::printf("depth %zu tail %zu: %.2f s (%.1f tok/s)\n",
+                tokens.size() - tail, tail, s, tail / s);
+    return 0;
+  }
   auto bat = executor->CreateSession(&error);
   start = std::chrono::steady_clock::now();
   std::size_t split = 0;

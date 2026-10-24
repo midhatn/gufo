@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <string>
@@ -47,6 +49,23 @@ T* Dev(const std::vector<T>& v) {
   T* d = nullptr;
   hipMalloc(&d, v.size() * sizeof(T));
   hipMemcpy(d, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice);
+  return d;
+}
+
+float RoundHalf(float f) {
+  return static_cast<float>(static_cast<_Float16>(f));
+}
+
+std::uint16_t* DevHalf(const std::vector<float>& v) {
+  std::vector<std::uint16_t> bits(v.size());
+  for (std::size_t i = 0; i < v.size(); ++i) {
+    const _Float16 h = static_cast<_Float16>(v[i]);
+    std::memcpy(&bits[i], &h, sizeof(std::uint16_t));
+  }
+  std::uint16_t* d = nullptr;
+  hipMalloc(&d, bits.size() * sizeof(std::uint16_t));
+  hipMemcpy(d, bits.data(), bits.size() * sizeof(std::uint16_t),
+            hipMemcpyHostToDevice);
   return d;
 }
 
@@ -148,7 +167,9 @@ bool StageTests(const gufo::core::GgufReader& reader) {
     const int pos = n - 1;
     const int tail = (pos + 1) % kPool;
     const int npool = (pos + 1) / kPool;
-    const auto lat = Rand(static_cast<std::size_t>(n) * kLat, 1.0F);
+    auto lat = Rand(static_cast<std::size_t>(n) * kLat, 1.0F);
+    for (auto& x : lat)
+      x = RoundHalf(x);
     const auto qabs = Rand(kHeads * kLat, 0.3F);
     std::vector<int> pools(npool);
     std::iota(pools.begin(), pools.end(), 0);
@@ -182,7 +203,8 @@ bool StageTests(const gufo::core::GgufReader& reader) {
           ref[h * kLat + c] +=
               sc[j] / den * lat[static_cast<std::size_t>(vis[j]) * kLat + c];
     }
-    float *dlat = Dev(lat), *dq = Dev(qabs);
+    std::uint16_t* dlat = DevHalf(lat);
+    float* dq = Dev(qabs);
     int* dsel = Dev(pools);
     float* dctx = DevZero<float>(kHeads * kLat);
     const int rc = rocm::DsaAttend(dq, dlat, dsel, rocm::kDsaTopPools, pos,
@@ -206,10 +228,9 @@ bool StageTests(const gufo::core::GgufReader& reader) {
     const auto lat = Rand(tokens * kLat, 1.0F);
     const auto ik = Rand(tokens * kId, 1.0F);
     const auto gate = Rand(tokens * kId, 1.0F);
-    rocm::DsaCache cache{
-        DevZero<float>(tokens * kLat), DevZero<float>(tokens * kId),
-        DevZero<float>(tokens * kId), DevZero<float>((tokens / kPool) * kId),
-        DevZero<std::uint16_t>(tokens * kLat)};
+    rocm::DsaCache cache{DevZero<std::uint16_t>(tokens * kLat),
+                         DevZero<float>(8 * kId), DevZero<float>(8 * kId),
+                         DevZero<float>((tokens / kPool) * kId), 8};
     float* dape = Dev(std::vector<float>(ape, ape + kPool * kId));
     float *dlat = Dev(lat), *dik = Dev(ik), *dgate = Dev(gate);
     int rc = 0;
@@ -386,10 +407,9 @@ bool ChainTest(const gufo::core::GgufReader& reader, int layer_idx) {
         *ctx = DevZero<float>(kHeads * kLat),
         *vout = DevZero<float>(kHeads * kQk), *block = DevZero<float>(kHidden);
   int* sel = DevZero<int>(kTokens);
-  rocm::DsaCache cache{
-      DevZero<float>(kTokens * kLat), DevZero<float>(kTokens * kId),
-      DevZero<float>(kTokens * kId), DevZero<float>((kTokens / kPool) * kId),
-      DevZero<std::uint16_t>(kTokens * kLat)};
+  rocm::DsaCache cache{DevZero<std::uint16_t>(kTokens * kLat),
+                       DevZero<float>(8 * kId), DevZero<float>(8 * kId),
+                       DevZero<float>((kTokens / kPool) * kId), 8};
 
   // Oracle state.
   std::vector<std::vector<double>> o_lat, o_ik, o_gate, o_pooled;
@@ -423,7 +443,7 @@ bool ChainTest(const gufo::core::GgufReader& reader, int layer_idx) {
     rc |= rocm::MatvecBatched(L.kb.code, d_kb, q, qabs, kLat, kQk, kHeads,
                               scratch, nullptr);
     const int nsel = std::min(npool, kTop);
-    rc |= rocm::DsaAttend(qabs, cache.lat, sel, nsel, pos,
+    rc |= rocm::DsaAttend(qabs, cache.lat_half, sel, nsel, pos,
                           1.0F / std::sqrt(float(kQk)), ctx, nullptr);
     rc |= rocm::MatvecBatched(L.vb.code, d_vb, ctx, vout, kQk, kLat, kHeads,
                               scratch, nullptr);
@@ -452,6 +472,8 @@ bool ChainTest(const gufo::core::GgufReader& reader, int layer_idx) {
         ikd[i] = (ikd[i] - mu) * inv * L.knw[i] + L.knb[i];
     }
     const auto gd = MatVec(L.gate, xd);
+    for (auto& x : latd)
+      x = RoundHalf(static_cast<float>(x));
     o_lat.push_back(latd);
     o_ik.push_back(ikd);
     o_gate.push_back(gd);
