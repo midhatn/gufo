@@ -211,7 +211,7 @@ __global__ __launch_bounds__(kExpertThreads) void ExpertsDotKernel(
     }
   };
   load(0, cur, cur_tail, cur_d);
-#pragma unroll
+#pragma unroll 1
   for (int it = 0; it < kExpertRowIters; ++it) {
     uint4 nxt[4];
     uint2 nxt_tail[2];
