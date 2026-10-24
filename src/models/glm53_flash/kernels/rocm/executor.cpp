@@ -434,13 +434,13 @@ std::unique_ptr<Executor> Executor::Create(const std::string& path,
       return nullptr;
     }
     for (const auto tap : options.dflash_layers) {
-      if (tap >= ex->layers_) {
+      if (tap == 0 || tap > ex->layers_) {
         if (error != nullptr)
           *error = "drafter tap layer exceeds the loaded trunk";
         return nullptr;
       }
+      ex->dflash_taps_.push_back(tap - 1);
     }
-    ex->dflash_taps_ = options.dflash_layers;
   }
   if (!ex->Upload("token_embd.weight", error))
     return nullptr;

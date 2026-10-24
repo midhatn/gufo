@@ -30,8 +30,9 @@ struct ExecutorOptions {
   std::uint32_t prefill_chunk{256};
   // Skip the output head (embedding to residual only).
   bool head{true};
-  // Drafter feature taps: after each listed layer the stream mean of the last
-  // `dflash_rows` rows of a forward pass is kept in DflashCapture().
+  // Drafter feature taps: the input of each listed layer (the output of the
+  // layer before it), stream-averaged, for the last `dflash_rows` rows of a
+  // forward pass is kept in DflashCapture().
   std::vector<std::uint32_t> dflash_layers;
   std::uint32_t dflash_rows{0};
   // Largest number of trailing rows whose logits one forward can return.
