@@ -688,12 +688,16 @@ __global__ __launch_bounds__(kAttnWaves* kWaveLanes) void DsaAttendWmmaKernel(
     fetch(base + kAttnKeys);
     for (int g = 0; g < kAttnGroups; ++g) {
       float a_scale[8];
+      bool rescale = false;
       for (int i = 0; i < 8; ++i) {
         a_scale[i] = alpha[g * 16 + 2 * i + row_hi];
+        rescale |= a_scale[i] != 1.0F;
       }
-      for (int t = 0; t < kAttnWaveTiles; ++t) {
-        for (int i = 0; i < 8; ++i) {
-          acc[g * kAttnWaveTiles + t][i] *= a_scale[i];
+      if (__any(rescale)) {
+        for (int t = 0; t < kAttnWaveTiles; ++t) {
+          for (int i = 0; i < 8; ++i) {
+            acc[g * kAttnWaveTiles + t][i] *= a_scale[i];
+          }
         }
       }
     }
