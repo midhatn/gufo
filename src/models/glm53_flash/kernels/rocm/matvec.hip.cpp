@@ -47,12 +47,11 @@ __global__ void MatvecF32Kernel(const float* __restrict__ w,
 // Routed-expert matvec for a handful of tokens. One lane owns a whole
 // 256-weight block of a row (16-byte loads, no re-read of the activation per
 // row): the quantized activation row of the slot's token sits in LDS,
-// interleaved so the lanes of a row read consecutive words, and each wave walks
-// rows two or four at a time. Dot products are the same dp4a sums as the mmvq
+// interleaved so the lanes of a row read consecutive words, and each wave
+// covers two or four rows. Dot products are the same dp4a sums as the mmvq
 // tier.
 constexpr int kExpertThreads = 256;
 constexpr int kExpertWaves = kExpertThreads / 32;
-constexpr int kExpertRowIters = 4;
 
 using Unaligned16 = uint4 __attribute__((aligned(2)));
 using Unaligned8 = uint2 __attribute__((aligned(2)));
@@ -68,7 +67,7 @@ __device__ __forceinline__ int ApplySignNibble(uint32_t g, uint32_t nib) {
 template<int KB>
 struct ExpertRows {
   static constexpr int kPerWave = 32 / KB;
-  static constexpr int kPerBlock = kExpertWaves * kPerWave * kExpertRowIters;
+  static constexpr int kPerBlock = kExpertWaves * kPerWave;
 };
 
 template<int KB>
@@ -188,56 +187,32 @@ __global__ __launch_bounds__(kExpertThreads) void ExpertsDotKernel(
   const int wave = threadIdx.x >> 5;
   const int b = lane % KB;
   const int sub_row = lane / KB;
-  const int row0 = blockIdx.x * Rows::kPerBlock +
-                   wave * Rows::kPerWave * kExpertRowIters + sub_row;
-  const uint8_t* base =
+  const int row =
+      blockIdx.x * Rows::kPerBlock + wave * Rows::kPerWave + sub_row;
+  const uint8_t* p =
       w + static_cast<size_t>(expert < 0 ? 0 : expert) * expert_bytes +
+      static_cast<size_t>(row < m ? row : m - 1) * row_bytes +
       static_cast<size_t>(b) * kBlockBytes;
-  uint4 cur[4];
-  uint2 cur_tail[2];
-  uint16_t cur_d = 0;
-  const auto load = [&](int it, uint4(&q)[4], uint2(&tail)[2], uint16_t& dh) {
-    const int row = row0 + it * Rows::kPerWave;
-    const uint8_t* p =
-        base + static_cast<size_t>(row < m ? row : m - 1) * row_bytes;
-    dh = *reinterpret_cast<const uint16_t*>(p);
+  const float d =
+      __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(p)));
+  uint4 q[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      q[i] = *reinterpret_cast<const Unaligned16*>(p + 2 + 16 * i);
-    }
-    if constexpr (kS) {
-      tail[0] = *reinterpret_cast<const Unaligned8*>(p + 66);
-      tail[1] = *reinterpret_cast<const Unaligned8*>(p + 74);
-    }
-  };
-  load(0, cur, cur_tail, cur_d);
-#pragma unroll 1
-  for (int it = 0; it < kExpertRowIters; ++it) {
-    uint4 nxt[4];
-    uint2 nxt_tail[2];
-    uint16_t nxt_d = 0;
-    if (it + 1 < kExpertRowIters) {
-      load(it + 1, nxt, nxt_tail, nxt_d);
-    }
-    const float d = __half2float(__ushort_as_half(cur_d));
-    float v = kS ? Iq2sBlockDot<KB>(cur, cur_tail, d, yq, yd, b)
-                 : Iq2xxsBlockDot<KB>(cur, d, yq, yd, b);
+  for (int i = 0; i < 4; ++i) {
+    q[i] = *reinterpret_cast<const Unaligned16*>(p + 2 + 16 * i);
+  }
+  uint2 tail[2] = {};
+  if constexpr (kS) {
+    tail[0] = *reinterpret_cast<const Unaligned8*>(p + 66);
+    tail[1] = *reinterpret_cast<const Unaligned8*>(p + 74);
+  }
+  float v = kS ? Iq2sBlockDot<KB>(q, tail, d, yq, yd, b)
+               : Iq2xxsBlockDot<KB>(q, d, yq, yd, b);
 #pragma unroll
-    for (int off = KB / 2; off > 0; off >>= 1) {
-      v += __shfl_xor(v, off, 32);
-    }
-    const int row = row0 + it * Rows::kPerWave;
-    if (b == 0 && row < m) {
-      out[static_cast<size_t>(slot) * m + row] = expert < 0 ? 0.0F : v;
-    }
-    if (it + 1 < kExpertRowIters) {
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        cur[i] = nxt[i];
-      cur_tail[0] = nxt_tail[0];
-      cur_tail[1] = nxt_tail[1];
-      cur_d = nxt_d;
-    }
+  for (int off = KB / 2; off > 0; off >>= 1) {
+    v += __shfl_xor(v, off, 32);
+  }
+  if (b == 0 && row < m) {
+    out[static_cast<size_t>(slot) * m + row] = expert < 0 ? 0.0F : v;
   }
 }
 

@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
   if (!gate || !down)
     return 1;
   bool ok = true;
-  for (const int tokens : {2, 4, 7, 8}) {
+  for (const int tokens : {1, 2, 4, 7, 8}) {
     ok &= Bench(*gate, tokens, false, "gate");
     ok &= Bench(*down, tokens, true, "down");
   }
