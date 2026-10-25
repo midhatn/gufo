@@ -1,5 +1,6 @@
 #include "src/cli/prompt/prompt.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -20,14 +21,18 @@
 #include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/flint/chat_template.hpp"
+#include "src/models/flint/reference.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen38_flash_next/lookup_draft.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/flint/gpu/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
@@ -134,6 +139,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
     speculative_explicit = true;
     if (value == "off") {
       opt.speculative_backend.clear();
+      opt.speculative_off = true;
     } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
       opt.speculative_backend = value;
     } else {
@@ -250,6 +256,16 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
 
+bool IsFlint(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "flint";
+}
+
+// Forward declarations.
+int RunFlintPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                      std::chrono::steady_clock::time_point load_start);
+int RunFlintPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                      std::chrono::steady_clock::time_point load_start);
+
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
     return ReasoningEffort::kMinimal;
@@ -291,12 +307,316 @@ ReasoningOptions PromptReasoningOptions(const PromptOptions& options) {
   return reasoning;
 }
 
+std::vector<tokenization::TokenId> FlintStopTokens(
+    const core::GgufReader& reader) {
+  std::vector<tokenization::TokenId> stop_tokens;
+  if (const auto eos =
+          reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
+    stop_tokens.push_back(*eos);
+  }
+  for (const char* key :
+       {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"}) {
+    if (const auto id = reader.GetMetadataUint32(key)) {
+      stop_tokens.push_back(*id);
+    }
+  }
+  if (const auto* meta = reader.FindMetadata("tokenizer.ggml.eog_token_ids")) {
+    if (const auto* ids =
+            std::get_if<std::vector<std::int64_t>>(&meta->value)) {
+      for (const auto id : *ids) {
+        stop_tokens.push_back(static_cast<tokenization::TokenId>(id));
+      }
+    } else if (const auto* ids =
+                   std::get_if<std::vector<std::uint64_t>>(&meta->value)) {
+      for (const auto id : *ids) {
+        stop_tokens.push_back(static_cast<tokenization::TokenId>(id));
+      }
+    }
+  }
+  return stop_tokens;
+}
+
+int RunFlintPrompt(const PromptOptions& opt, const core::GgufReader& reader,
+                   std::chrono::steady_clock::time_point load_start) {
+#ifdef ENGINE_ENABLE_HIP
+  if (opt.force_cpu) {
+    return RunFlintPromptCPU(opt, reader, load_start);
+  }
+  return RunFlintPromptGPU(opt, reader, load_start);
+#else
+  return RunFlintPromptCPU(opt, reader, load_start);
+#endif
+}
+
+// ── Flint CPU reference ─────────────────────────────────────────────
+
+int RunFlintPromptCPU(const PromptOptions& opt, const core::GgufReader& reader,
+                      std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Flint tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::flint::ReferenceModel::Open(opt.model_path, &err);
+  if (!model) {
+    std::cerr << "Flint load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::flint::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::flint::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                        chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Flint prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  auto session = model->CreateSession();
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<float>* logits = nullptr;
+  for (const auto token : prompt) {
+    logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const auto token = sampler.Sample(*logits);
+    if (is_stop(token)) {
+      break;
+    }
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens) {
+      logits = &model->Evaluate(*session, static_cast<std::int32_t>(token));
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Flint CPU reference] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s, generated=" << generated
+              << " tok in " << seconds(prefill_end, end) << " s\n";
+  }
+  return 0;
+}
+
+#ifdef ENGINE_ENABLE_HIP
+
+int RunFlintPromptGPU(const PromptOptions& opt, const core::GgufReader& reader,
+                      std::chrono::steady_clock::time_point load_start) {
+  std::string err;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(reader, &err);
+  if (!tokenizer) {
+    std::cerr << "Flint tokenizer failed: " << err << '\n';
+    return 1;
+  }
+  auto model = models::flint::gpu::Model::Load(opt.model_path, {}, &err);
+  if (!model) {
+    std::cerr << "Flint GPU load failed: " << err << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start, true);
+
+  const auto reasoning = PromptReasoningOptions(opt);
+  models::flint::ChatTemplateOptions chat_options;
+  chat_options.enable_thinking = reasoning.enabled.value_or(false);
+  const std::string rendered =
+      opt.use_chat_template
+          ? models::flint::RenderPrompt(opt.system_prompt, opt.prompt_text,
+                                        chat_options)
+          : opt.prompt_text;
+  tokenization::TokenizerOptions encode_options;
+  encode_options.parse_special_tokens = true;
+  const auto prompt = tokenizer->Encode(rendered, encode_options);
+  if (prompt.empty()) {
+    std::cerr << "Flint prompt produced no tokens\n";
+    return 1;
+  }
+
+  const auto session = model->CreateSession(
+      static_cast<std::uint32_t>(prompt.size() + opt.max_tokens + 1 +
+                                 models::flint::gpu::Session::kMaxVerifyRows),
+      &err);
+  if (!session) {
+    std::cerr << "Flint GPU session creation failed: " << err << '\n';
+    return 1;
+  }
+  const auto stop_tokens = FlintStopTokens(reader);
+  const auto is_stop = [&](tokenization::TokenId token) {
+    return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+           stop_tokens.end();
+  };
+
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  const auto start = std::chrono::steady_clock::now();
+  if (!session->Append(input, &err)) {
+    std::cerr << "Flint GPU prefill failed: " << err << '\n';
+    return 1;
+  }
+  const auto prefill_end = std::chrono::steady_clock::now();
+
+  // Lossless speculation: tokens that followed an earlier copy of the current
+  // tail are verified in one pass; a wrong guess costs only the wider pass.
+  constexpr std::uint32_t kLookupMinMatch = 6;
+  constexpr std::uint32_t kConfidentMatch = 12;
+  constexpr double kAcceptSmoothing = 0.3;
+  // Measured cost of a verify pass of 1..5 rows relative to one row.
+  constexpr double kVerifyCost[] = {1.0, 1.14, 1.28, 1.40, 1.58};
+  double accept_rate[2] = {0.6, 0.85};
+  const bool speculate = !opt.speculative_off;
+  const std::uint32_t max_draft =
+      std::min<std::uint32_t>(std::max<std::uint32_t>(opt.draft_tokens, 1),
+                              models::flint::gpu::Session::kMaxVerifyRows - 1);
+  models::qwen38_flash_next::LookupIndex lookup;
+  for (const auto token : prompt)
+    lookup.Append(static_cast<std::int32_t>(token));
+
+  std::size_t generated = 0;
+  std::size_t drafted = 0;
+  std::size_t accepted_drafts = 0;
+  std::chrono::duration<double> forward_time{};
+  auto token = sampler.Sample(session->Logits());
+  bool stopped = false;
+  while (!stopped && generated < opt.max_tokens) {
+    if (is_stop(token))
+      break;
+    sampler.Accept(token);
+    std::cout << tokenizer->DecodeToken(token) << std::flush;
+    lookup.Append(static_cast<std::int32_t>(token));
+    ++generated;
+    if (generated >= opt.max_tokens)
+      break;
+
+    std::vector<std::int32_t> feed{static_cast<std::int32_t>(token)};
+    std::size_t bucket = 0;
+    if (speculate) {
+      std::uint32_t matched = 0;
+      const auto draft = lookup.Draft(kLookupMinMatch, max_draft, &matched);
+      bucket = matched >= kConfidentMatch ? 1 : 0;
+      // Longest draft prefix with the best expected tokens per unit cost.
+      double best = 1.0;
+      std::size_t take = 0;
+      double reach = 1.0;
+      double expected = 1.0;
+      for (std::size_t k = 1; k <= draft.size(); ++k) {
+        reach *= accept_rate[bucket];
+        expected += reach;
+        const double value = expected / kVerifyCost[k];
+        if (value > best) {
+          best = value;
+          take = k;
+        }
+      }
+      feed.insert(feed.end(), draft.begin(), draft.begin() + take);
+    }
+    const std::uint32_t base = session->Position();
+    const auto step = std::chrono::steady_clock::now();
+    const bool ok = feed.size() == 1 ? session->Append(feed, &err)
+                                     : session->AppendAll(feed, &err);
+    forward_time += std::chrono::steady_clock::now() - step;
+    if (!ok) {
+      std::cerr << "\nFlint GPU decode failed: " << err << '\n';
+      return 1;
+    }
+    drafted += feed.size() - 1;
+
+    // Row i holds the distribution after feed[i]; draft token feed[i + 1] is
+    // tested against it, and the first miss yields the replacement token.
+    std::uint32_t kept = 0;
+    for (std::uint32_t row = 0;; ++row) {
+      const auto logits = session->Logits(row);
+      if (row + 1 >= feed.size()) {
+        token = sampler.Sample(logits);
+        break;
+      }
+      const auto guess = static_cast<tokenization::TokenId>(feed[row + 1]);
+      tokenization::TokenId next;
+      bool hit;
+      if (opt.sampling.uses_random_sampling()) {
+        const double p = sampler.Distribution(logits).probability(guess);
+        hit = sampler.Uniform() < p;
+        if (!hit) {
+          const float one = 1.0F;
+          next = sampler.SampleResidual(logits, {&guess, 1}, {&one, 1});
+        }
+      } else {
+        next = sampler.Sample(logits);
+        hit = next == guess;
+      }
+      if (!hit) {
+        token = next;
+        break;
+      }
+      ++kept;
+      ++accepted_drafts;
+      if (is_stop(guess)) {
+        stopped = true;
+        break;
+      }
+      sampler.Accept(guess);
+      std::cout << tokenizer->DecodeToken(guess) << std::flush;
+      lookup.Append(feed[row + 1]);
+      if (++generated >= opt.max_tokens) {
+        stopped = true;
+        break;
+      }
+    }
+    session->Rewind(base + 1 + kept);
+    if (feed.size() > 1) {
+      const double seen = static_cast<double>(kept) / (feed.size() - 1);
+      accept_rate[bucket] = (1.0 - kAcceptSmoothing) * accept_rate[bucket] +
+                            kAcceptSmoothing * seen;
+    }
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const auto seconds = [](auto a, auto b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+    const auto end = std::chrono::steady_clock::now();
+    std::cerr << "[Flint GPU] prompt=" << prompt.size() << " tok in "
+              << seconds(start, prefill_end) << " s, generated=" << generated
+              << " tok in " << seconds(prefill_end, end) << " s ("
+              << forward_time.count() << " s in forward, drafted " << drafted
+              << ", accepted " << accepted_drafts << ")\n";
+  }
+  return 0;
+}
+
+#endif
+
 void ResolvePromptSampling(const core::GgufReader& reader, PromptOptions* opt) {
   sampling::TextModelPreset preset = sampling::TextModelPreset::kUnspecified;
   const auto artifact_architecture =
       reader.GetMetadataString("general.architecture");
   if (artifact_architecture == "deepseek4") {
     preset = sampling::TextModelPreset::kDeepSeekV4Flash;
+  } else if (artifact_architecture == "flint") {
+    preset = sampling::TextModelPreset::kFlint;
   } else if (artifact_architecture == "qwen4exp") {
     preset = sampling::TextModelPreset::kQwen38;
   } else if (const auto config = reader.ExtractModelConfig()) {
@@ -1016,6 +1336,14 @@ int RunPrompt(std::span<const char* const> args) {
     return 1;
   }
 #endif
+
+  if (IsFlint(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Flint does not support image input\n";
+      return 2;
+    }
+    return RunFlintPrompt(opt, *reader, model_load_start);
+  }
 
   std::string rendered_prompt = opt.prompt_text;
   std::vector<tokenization::ContentSpan> content_spans;

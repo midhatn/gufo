@@ -24,6 +24,8 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/flint/gpu/engine.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -871,6 +873,171 @@ bool IsQwen38FlashNext(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "qwen4exp";
 }
 
+bool IsFlint(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "flint";
+}
+
+int RunFlintBenchmark(const BenchOptions& options,
+                      const std::shared_ptr<const core::GgufReader>& reader,
+                      std::chrono::steady_clock::time_point model_load_start) {
+  namespace flint = models::flint::gpu;
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Flint bench supports C1 only\n";
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1}) +
+      flint::Session::kMaxVerifyRows;
+
+  std::string error;
+  auto tokenizer = tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
+  if (!tokenizer) {
+    std::cerr << "Flint tokenizer failed: " << error << '\n';
+    return 1;
+  }
+  auto model = flint::Model::Load(options.model_path, {}, &error);
+  if (!model) {
+    std::cerr << "Error creating Flint model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  // The same repeated pattern the other benchmarks use.
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = tokenizer->Encode(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ",
+        tokenization::TokenizerOptions{});
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = static_cast<std::int32_t>(pattern[i % pattern.size()]);
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << "Flint" << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            (depth > 0 &&
+             !session->Append(std::span(tokens).first(depth), &error))) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Append(std::span(tokens).subspan(depth, prompt_length),
+                             &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        if (repetition > 0)
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            !session->Append(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        const std::vector<sampling::TokenId> history(
+            tokens.begin(), tokens.begin() + prefix_length);
+        sampling::SamplerState sampler(options.sampling, history);
+        // One untimed step so the decode graph is captured before timing.
+        auto next = sampler.Sample(session->Logits());
+        for (int warm = 0; warm < 2; ++warm) {
+          sampler.Accept(next);
+          const std::int32_t token = static_cast<std::int32_t>(next);
+          if (!session->Append(std::span(&token, 1), &error)) {
+            std::cerr << "Error running Flint decode: " << error << '\n';
+            return 1;
+          }
+          next = sampler.Sample(session->Logits());
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < generation_length; ++i) {
+          sampler.Accept(next);
+          const std::int32_t token = static_cast<std::int32_t>(next);
+          if (!session->Append(std::span(&token, 1), &error)) {
+            std::cerr << "Error running Flint decode: " << error << '\n';
+            return 1;
+          }
+          next = sampler.Sample(session->Logits());
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  return 0;
+}
+
 int RunQwen38FlashNextBenchmark(
     const BenchOptions& options,
     const std::shared_ptr<const core::GgufReader>& reader,
@@ -1277,6 +1444,9 @@ int RunBench(std::span<const char* const> args) {
   }
   if (IsQwen38FlashNext(*reader)) {
     return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
+  }
+  if (IsFlint(*reader)) {
+    return RunFlintBenchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

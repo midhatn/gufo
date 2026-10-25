@@ -34,6 +34,7 @@ struct PromptOptions {
   bool verbose = false;
   bool force_cpu = false;
   std::string speculative_backend;
+  bool speculative_off = false;
   std::string mtp_model_path;
   std::string dflash_model_path;
   std::string draft_policy;

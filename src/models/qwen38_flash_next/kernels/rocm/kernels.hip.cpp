@@ -5358,7 +5358,8 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
     const float* __restrict__ swiglu_gate, float* __restrict__ out,
     __half* __restrict__ out_half, std::size_t m, std::size_t k,
     const void* __restrict__ w_up,
-    const std::uint32_t* __restrict__ iq3s_grid = nullptr) {
+    const std::uint32_t* __restrict__ iq3s_grid = nullptr,
+    float out_scale = 1.0F) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
   static_assert(!kPair || BM == 128);
   static_assert(BN % 16 == 0 && BN / 16 <= 16);
@@ -5901,7 +5902,7 @@ __launch_bounds__(256) __global__ void RoutedF16GEMMKernel(
               asm volatile("" : "+v"(product));
               float value = product * SigmoidF(base[idx + v]);
               asm volatile("" : "+v"(value));
-              values[v] = __float2half(value);
+              values[v] = __float2half(value * out_scale);
             }
             const auto offset = static_cast<std::size_t>(dst) * m + r_block + r;
             if (m % 2 == 0 && r_block + r + 1 < m_i) {
@@ -6981,7 +6982,8 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
                           std::uint32_t n_tiles, const std::int32_t* pad_bounds,
                           const std::int32_t* rows_in,
                           const std::int32_t* rows_out, __half* out,
-                          std::size_t m, std::size_t k, hipStream_t stream) {
+                          std::size_t m, std::size_t k, hipStream_t stream,
+                          float out_scale) {
   if (m == 0 || k == 0 || k % 256 != 0 || n_tiles == 0 || out == nullptr) {
     return false;
   }
@@ -6991,13 +6993,19 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, BN, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
-          rows_out, nullptr, nullptr, out, m, k, up);
+          rows_out, nullptr, nullptr, out, m, k, up, nullptr, out_scale);
       return true;
     case WeightType::kQ5_K:
       hipLaunchKernelGGL(
           (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, BN, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
-          rows_out, nullptr, nullptr, out, m, k, up);
+          rows_out, nullptr, nullptr, out, m, k, up, nullptr, out_scale);
+      return true;
+    case WeightType::kIQ4_XS:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kIQ4_XS, 128, BN, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out, m, k, up, nullptr, out_scale);
       return true;
     case WeightType::kIQ3_S:
       if constexpr (BN >= 128) {
@@ -7007,7 +7015,7 @@ bool LaunchRoutedGatedF16(const void* gate, const void* up, WeightType type,
         hipLaunchKernelGGL(
             (RoutedF16GEMMKernel<WeightType::kIQ3_S, 128, BN, 2, true>), grid,
             dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
-            rows_out, nullptr, nullptr, out, m, k, up, grid_table);
+            rows_out, nullptr, nullptr, out, m, k, up, grid_table, out_scale);
         return true;
       }
       return false;
@@ -7022,20 +7030,22 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* pad_bounds,
                         const std::int32_t* rows_in,
                         const std::int32_t* rows_out, __half* out,
-                        std::size_t m, std::size_t k, hipStream_t stream) {
+                        std::size_t m, std::size_t k, hipStream_t stream,
+                        float out_scale) {
   if (tile_rows == 256) {
     return LaunchRoutedGatedF16<256>(gate, up, type, x, tiles, n_tiles,
                                      pad_bounds, rows_in, rows_out, out, m, k,
-                                     stream);
+                                     stream, out_scale);
   }
   if (tile_rows == 128) {
     return LaunchRoutedGatedF16<128>(gate, up, type, x, tiles, n_tiles,
                                      pad_bounds, rows_in, rows_out, out, m, k,
-                                     stream);
+                                     stream, out_scale);
   }
   return tile_rows == 64 &&
          LaunchRoutedGatedF16<64>(gate, up, type, x, tiles, n_tiles, pad_bounds,
-                                  rows_in, rows_out, out, m, k, stream);
+                                  rows_in, rows_out, out, m, k, stream,
+                                  out_scale);
 }
 
 // Keep the separate four-tap convolution's F32 rounding order when its
@@ -8095,6 +8105,14 @@ bool LaunchDenseF16Gemm(const void* w, const __half* x, float* out,
     } else if (batch >= 1024 && (m == 16384 || m == 13312) && k == 2560) {
       // Eight row groups reuse each weight fragment across all token tiles
       // and keep fewer weight fragments live. K accumulation is unchanged.
+      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 1, false,
+                                             false, false, kHalf, false>),
+                         grid, dim3(kThreads), 0, stream, w, x, out, batch, m,
+                         k, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         AttentionProjectionOutput{}, 0, input_stride);
+    } else if (batch >= 1024 && (m == 1024 || m == 2048)) {
+      // Narrow 2048/1024-row projections: eight row waves share each
+      // activation fragment.
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1, 1, false,
                                              false, false, kHalf, false>),
                          grid, dim3(kThreads), 0, stream, w, x, out, batch, m,

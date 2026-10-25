@@ -31,12 +31,15 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/generator.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/flint/chat_template.hpp"
+#include "src/models/flint/gpu/engine.hpp"
 #include "src/models/qwen/hip/auto_draft.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -3185,6 +3188,421 @@ private:
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
+
+constexpr std::string_view kFlintStateAbi = "flint-rocm-session-v1";
+
+using FlintModel = models::flint::gpu::Model;
+using FlintSession = models::flint::gpu::Session;
+
+std::vector<std::uint8_t> FlintCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Flint disk cache requires an artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=flint\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=flint-glm-compiled-v1\n"
+           << "state_abi=" << kFlintStateAbi << '\n'
+           << "payload_layout=flint-rocm-session-snapshot-v"
+           << FlintSession::kSnapshotPayloadVersion << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+std::vector<std::int32_t> FlintEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const auto token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("Flint token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class FlintTextRunnerState final : public TextRunnerState {
+public:
+  FlintTextRunnerState(const std::shared_ptr<FlintModel>& model,
+                       std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context + FlintSession::kMaxVerifyRows,
+                                    &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Flint session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] FlintSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<FlintSession> session_;
+  std::size_t position_{0};
+};
+
+class FlintTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  FlintTextRunnerSnapshot(std::shared_ptr<FlintModel> model,
+                          std::vector<std::uint8_t> bytes, std::size_t position)
+      : model(std::move(model)), bytes(std::move(bytes)), position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return bytes.size();
+  }
+
+  std::shared_ptr<FlintModel> model;
+  std::vector<std::uint8_t> bytes;
+  std::size_t position;
+};
+
+FlintTextRunnerState& RequireFlintState(TextRunnerState& state) {
+  auto* flint = dynamic_cast<FlintTextRunnerState*>(&state);
+  if (flint == nullptr)
+    throw std::logic_error("text runner state is not Flint");
+  return *flint;
+}
+
+const FlintTextRunnerState& RequireFlintState(const TextRunnerState& state) {
+  const auto* flint = dynamic_cast<const FlintTextRunnerState*>(&state);
+  if (flint == nullptr)
+    throw std::logic_error("text runner state is not Flint");
+  return *flint;
+}
+
+class FlintTextRunner final : public HipTextModelRunner {
+public:
+  static constexpr std::size_t kPrefillChunk = 8192;
+  static constexpr std::size_t kWarmupTokens = 9000;
+
+  FlintTextRunner(std::shared_ptr<FlintModel> model,
+                  std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+                  std::vector<std::int32_t> stop_tokens,
+                  std::uint32_t max_context,
+                  std::string artifact_fingerprint = {})
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        stop_tokens_(std::move(stop_tokens)),
+        max_context_(max_context) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity =
+              FlintCompatibilityIdentity(artifact_fingerprint, max_context_),
+          .payload_version = FlintSession::kSnapshotPayloadVersion,
+      };
+    }
+    Warmup();
+  }
+
+  void Warmup() const {
+    const char* disabled = std::getenv("GUFO_WARMUP");
+    if (disabled != nullptr && disabled[0] == '0')
+      return;
+    try {
+      const std::size_t room = max_context_ > 128 ? max_context_ - 128 : 0;
+      const std::size_t length = std::min<std::size_t>(kWarmupTokens, room);
+      if (length < 1024)
+        return;
+      const auto started = std::chrono::steady_clock::now();
+      std::string error;
+      auto session = model_->CreateSession(
+          static_cast<std::uint32_t>(length + 16), &error);
+      if (session == nullptr) {
+        Logger::Warn("loader", "event=warmup_skipped reason=" + error);
+        return;
+      }
+      const auto unit = tokenizer_->Encode(
+          "The quick brown fox jumps over the lazy dog while the engine warms "
+          "its kernels. ");
+      if (unit.empty())
+        return;
+      std::vector<std::int32_t> prompt;
+      prompt.reserve(length);
+      for (std::size_t i = 0; i < length; ++i)
+        prompt.push_back(static_cast<std::int32_t>(unit[i % unit.size()]));
+      if (!session->Append(prompt, &error)) {
+        Logger::Warn("loader", "event=warmup_failed reason=" + error);
+        return;
+      }
+      for (int step = 0; step < 4; ++step) {
+        const std::int32_t next = 1;
+        if (!session->Append({&next, 1}, &error))
+          break;
+      }
+      const auto elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+      Logger::Info("loader",
+                   "event=warmup_completed tokens=" + std::to_string(length) +
+                       " elapsed_s=" + std::to_string(elapsed));
+    } catch (const std::exception& failure) {
+      Logger::Warn("loader",
+                   std::string("event=warmup_failed reason=") + failure.what());
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = "Flint",
+        .state_abi = std::string(kFlintStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = true,
+                .fork = true,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .prefix_reuse = true,
+                .prefill_grid_tokens = 4096,
+            },
+        .persistence = persistence_,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      capacity = free_bytes;
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes =
+            model_->SessionBytes(max_context_ + FlintSession::kMaxVerifyRows),
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        tokenizer_->GetVocabSize(), [this](std::uint32_t id) {
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer_->DecodeTokenCopy(id), IsStop(id)};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    if (!request.tools.empty() &&
+        request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      throw std::invalid_argument("Flint does not support tools yet");
+    }
+    std::vector<models::flint::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      if (!message.images.empty())
+        throw std::invalid_argument("Flint does not support image input");
+      messages.push_back({std::string(tokenization::ToString(message.role)),
+                          message.content + message.framing_suffix,
+                          message.thought});
+      if (message.role == tokenization::ChatRole::kDeveloper)
+        messages.back().role = "developer";
+    }
+    tokenization::TokenizerOptions options;
+    options.parse_special_tokens = true;
+    return tokenizer_->Encode(models::flint::RenderPrompt(messages), options);
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<FlintTextRunnerState>(model_, max_context_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    if (RequireFlintState(state).position() != prefix.size())
+      throw std::logic_error("Flint reused prefix does not match checkpoint");
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& flint = RequireFlintState(state);
+    if (offset != flint.position())
+      throw std::logic_error("Flint prefill offset does not match state");
+    if (offset >= prompt.size())
+      throw std::logic_error("Flint prefill has no remaining input");
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, kPrefillChunk});
+    const auto chunk = FlintEngineTokens(prompt.subspan(offset, consumed));
+    std::string error;
+    if (!flint.session().Append(chunk, &error)) {
+      flint.Invalidate();
+      throw std::runtime_error("Flint prefill failed: " + error);
+    }
+    flint.set_position(offset + consumed);
+    return {.consumed_tokens = consumed,
+            .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& flint = RequireFlintState(state);
+    if (flint.position() >= max_context_)
+      return {.stop = true, .piece = {}};
+    const auto logits = flint.session().Logits();
+    if (logits.empty())
+      throw std::runtime_error("Flint token selection has no logits");
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (flint.stop_at_eos() && IsStop(token))
+      return {.stop = true, .token = 0, .piece = {}};
+    return {.stop = false,
+            .token = static_cast<TextRunnerToken>(token),
+            .piece = std::string(tokenizer_->DecodeToken(token))};
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& flint = RequireFlintState(state);
+    const std::int32_t input = FlintEngineTokens({&token, 1}).front();
+    std::string error;
+    if (!flint.session().Append({&input, 1}, &error)) {
+      flint.Invalidate();
+      throw std::runtime_error("Flint decode failed: " + error);
+    }
+    flint.set_position(flint.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireFlintState(state).position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return RequireFlintState(state).session().SnapshotBytes();
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& flint = RequireFlintState(state);
+    std::vector<std::uint8_t> bytes(flint.session().SnapshotBytes());
+    std::string error;
+    if (!flint.session().SaveSnapshot(bytes, &error))
+      throw std::runtime_error("Flint snapshot failed: " + error);
+    return std::make_unique<FlintTextRunnerSnapshot>(model_, std::move(bytes),
+                                                     flint.position());
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto& flint_snapshot = RequireSnapshot(snapshot);
+    auto& restored = RequireFlintState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(flint_snapshot.bytes, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("Flint snapshot restore failed: " + error);
+    }
+    restored.set_position(flint_snapshot.position);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    return RequireSnapshot(snapshot).bytes.size();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto& bytes = RequireSnapshot(snapshot).bytes;
+    if (destination.size() != bytes.size()) {
+      throw std::invalid_argument(
+          "Flint persistent snapshot serialization failed");
+    }
+    std::memcpy(destination.data(), bytes.data(), bytes.size());
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    sink(RequireSnapshot(snapshot).bytes);
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireFlintState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("Flint persistent snapshot restore failed: " +
+                               error);
+    }
+    const std::uint32_t position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "Flint persistent snapshot restored an invalid position");
+    }
+    restored.set_position(position);
+  }
+
+private:
+  [[nodiscard]] bool IsStop(std::int32_t token) const {
+    return std::find(stop_tokens_.begin(), stop_tokens_.end(), token) !=
+           stop_tokens_.end();
+  }
+
+  [[nodiscard]] const FlintTextRunnerSnapshot& RequireSnapshot(
+      const TextRunnerSnapshot& snapshot) const {
+    const auto* flint = dynamic_cast<const FlintTextRunnerSnapshot*>(&snapshot);
+    if (flint == nullptr || flint->model.get() != model_.get())
+      throw std::invalid_argument(
+          "Flint snapshot does not belong to this model");
+    return *flint;
+  }
+
+  std::shared_ptr<FlintModel> model_;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::vector<std::int32_t> stop_tokens_;
+  std::uint32_t max_context_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+};
 #endif
 
 }  // namespace
@@ -3384,6 +3802,54 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
+  }
+  if (reader->GetMetadataString("general.architecture") == "flint") {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error, "Flint does not support draft-model speculation");
+      return false;
+    }
+    std::string tokenizer_error;
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &tokenizer_error);
+    if (tokenizer == nullptr) {
+      SetError(error, "Flint tokenizer failed: " + tokenizer_error);
+      return false;
+    }
+    std::vector<std::int32_t> stop_tokens;
+    for (const char* key :
+         {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
+          "tokenizer.ggml.eom_token_id"}) {
+      if (const auto id = reader->GetMetadataUint32(key))
+        stop_tokens.push_back(static_cast<std::int32_t>(*id));
+    }
+    if (const auto* meta =
+            reader->FindMetadata("tokenizer.ggml.eog_token_ids")) {
+      if (const auto* ids =
+              std::get_if<std::vector<std::int64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      } else if (const auto* ids =
+                     std::get_if<std::vector<std::uint64_t>>(&meta->value)) {
+        for (const auto id : *ids)
+          stop_tokens.push_back(static_cast<std::int32_t>(id));
+      }
+    }
+    auto model = models::flint::gpu::Model::Load(model_path, {}, &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create Flint model: " + load_error);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "Flint", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
+    }
+    return load(std::move(model), std::move(tokenizer), std::move(stop_tokens),
+                error, max_context, session_count, prefill_policy,
+                scheduler_policy, std::move(resolved_disk_cache_config),
+                ram_cache_config);
   }
   if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
     const bool mtp = speculative_config.backend == TextSpeculativeBackend::kMtp;
@@ -3867,6 +4333,68 @@ bool InferenceBackend::load(
         speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::flint::gpu::Model> model,
+    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+    std::vector<std::int32_t> stop_tokens, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextDiskCacheConfig disk_cache_config,
+    TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr || tokenizer == nullptr) {
+    SetError(error, "Flint model and tokenizer must not be null");
+    return false;
+  }
+  const std::uint32_t model_context = model->config().context_length;
+  if (max_context == 0)
+    max_context = model_context;
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context < 2 || max_context > model_context) {
+    SetError(error, "HTTP context exceeds the loaded Flint model context");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       disk_cache_config.capacity_bytes == 0)) {
+    SetError(error, "Flint persistent disk cache configuration is invalid");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kFlint;
+    new_state->sampling_defaults.supplied = {};
+    auto runner = std::make_shared<FlintTextRunner>(
+        std::move(model), std::move(tokenizer), std::move(stop_tokens),
+        max_context, disk_cache_config.model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
