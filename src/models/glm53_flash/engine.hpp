@@ -160,6 +160,10 @@ public:
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();
+  /// Measurement hook: a non-negative width makes every step draft exactly
+  /// that many DFlash tokens (0 is an ordinary step); negative restores the
+  /// controller.
+  void ForceDraftWidth(int width) noexcept { forced_width_ = width; }
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};
@@ -213,6 +217,7 @@ private:
   bool speculative_{false};
   float accepted_ema_{static_cast<float>(kMaxDraftTokens)};
   std::uint32_t plain_steps_{0};
+  int forced_width_{-1};
   SpeculativeStats stats_;
   bool valid_{true};
   struct DflashState;

@@ -230,4 +230,8 @@ if(ENGINE_ENABLE_HIP)
   add_executable(glm53_spec_bench EXCLUDE_FROM_ALL spec_bench.cpp)
   target_link_libraries(glm53_spec_bench PRIVATE gufo_glm53_flash_engine
     gufo_glm53_flash)
+
+  add_executable(glm53_cost_audit EXCLUDE_FROM_ALL cost_audit.cpp)
+  target_link_libraries(glm53_cost_audit PRIVATE gufo_glm53_flash_engine
+    gufo_glm53_flash)
 endif()

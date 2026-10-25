@@ -548,7 +548,8 @@ bool Session::DecodeImpl(std::size_t max_tokens,
     const auto draft = lookup_.Draft(
         kHistoryMinMatch,
         std::min<std::size_t>(cap - 1, model_->options_.max_draft_tokens));
-    if (draft.size() >= kHistoryMinDraft) {
+    const bool forced = forced_width_ >= 0;
+    if (!forced && draft.size() >= kHistoryMinDraft) {
       history = true;
       for (const auto token : draft) {
         chain.push_back(token);
@@ -557,11 +558,16 @@ bool Session::DecodeImpl(std::size_t max_tokens,
         }
       }
     } else if (DflashReady() && cap > 1 &&
-               (accepted_ema_ >= kPlainBelow ||
-                ++plain_steps_ % kProbeEvery == 0)) {
-      const auto wanted = std::clamp<std::uint32_t>(
-          static_cast<std::uint32_t>(std::ceil(accepted_ema_)) + 1, 2,
-          static_cast<std::uint32_t>(cap - 1));
+               (forced ? forced_width_ > 0
+                       : accepted_ema_ >= kPlainBelow ||
+                             ++plain_steps_ % kProbeEvery == 0)) {
+      const auto wanted =
+          forced ? std::min<std::uint32_t>(
+                       static_cast<std::uint32_t>(forced_width_),
+                       static_cast<std::uint32_t>(cap - 1))
+                 : std::clamp<std::uint32_t>(
+                       static_cast<std::uint32_t>(std::ceil(accepted_ema_)) + 1,
+                       2, static_cast<std::uint32_t>(cap - 1));
       const auto selector =
           model_->dflash_model_->GetDFlashConfig().selector_top_k;
       std::uint64_t draft_rng = 0;
