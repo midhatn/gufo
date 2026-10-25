@@ -2,7 +2,7 @@
 
 Fast local inference for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S
 `gfx1151`), with prefill shared between the GPU and the Ryzen AI NPU and
-speculative decoding on top. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
+speculative decoding on top, for Qwen, Flint and GLM-5.3 Flash models. Fork of [gufo-org/gufo](https://github.com/gufo-org/gufo) (MIT).
 
 | Model | Weights tested | NPU prefill | Speculative decode |
 | --- | --- | --- | --- |
@@ -10,6 +10,7 @@ speculative decoding on top. Fork of [gufo-org/gufo](https://github.com/gufo-org
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
 | Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
+| GLM-5.3 Flash | AJ-IQ2_XXS | KDA q/k/v and shared expert, two-bank lock-step | DFlash2 with prompt-lookup drafts |
 
 ## Speed
 
@@ -98,6 +99,33 @@ helps when the output copies earlier text. Long context: 131k-token prefill take
 approximate beyond about 19k tokens. Details, numerics and the prefill history
 are in [docs/models/flint](docs/models/flint/README.md).
 
+### GLM-5.3 Flash
+
+A 321B-parameter mixture-of-experts model (about 14B active per token; 45 layers,
+34 KDA and 11 DSA, 288 experts with 8 routed) in the 81 GiB AJ-IQ2_XXS quantization.
+
+| Prefill, tok/s | GPU only | GPU + NPU (two-bank) |
+| --- | --- | --- |
+| `-p 2048` | 634 | 626 (-1.3%) |
+| `-p 4096` | 635 | 631 (-0.6%) |
+| `-p 8192` | 630 | **740** (+17.5%) |
+
+The NPU pair path needs two full 4096-token banks, so prompts under 8192 tokens run
+the GPU path and match GPU-only speed; 16384 tokens measure 735 tok/s with the NPU.
+
+| Decode, tok/s | plain | DFlash2 |
+| --- | --- | --- |
+| code | 18.9 | **29.7** |
+| prose | 18.9 | **22.5** |
+| JSON | 18.9 | **26.0** |
+
+Greedy chat requests to `gufo serve`, 256 tokens. `gufo bench -n 128` plain decode:
+18.8 tok/s. Prose is the expository prompt; a creative-writing prompt gains nothing
+(18.7). Decode reads about 9 GB of weights per token, mostly the Q6_K attention and
+shared-expert projections, so plain decode is bandwidth-bound; drafting helps when
+the next tokens are predictable. Serving uses a 131,072-token context and one
+session at a time. Start it with `GUFO_KIND=glm scripts/run-gufo.sh`.
+
 ## Quality
 
 Output is exact by default, with two documented exceptions, and the NPU is
@@ -113,6 +141,8 @@ without the NPU.
 | Flash-Next decode copies, `balanced` (default) | perplexity +1.3% against llama.cpp, decode +19% (plain) and +21% (MTP) |
 | Flash-Next decode copies, `off` | exact Q8_0 weights; plain 30.5 tok/s, MTP 44.9 tok/s |
 | Flash-Next F16 residual (on with the two-bank NPU mode, `GUFO_F16_RESIDUAL=0/1` overrides) | perplexity +0.5%, prefill +1.5% with the NPU, no gain on GPU-only |
+| GLM-5.3 Flash, NPU two-bank prefill | logits cosine 0.994 against the GPU-only chunked path, same top-1; GPU-only prefill matches sequential decode at cosine 0.989 |
+| GLM-5.3 Flash, IQ2_XXS weights | HumanEval 157 of 164 (reasoning off); 50 of 75 on the DS4 capability set with reasoning (GPQA 13/24, SuperGPQA 18/25, AIME 18/25); not yet compared with llama.cpp |
 | Speculative decoding | the target verifies every draft; greedy text can differ from plain decode only at near-tie tokens |
 
 Details and methods are in the per-model `QUALITY.md` files under
@@ -135,6 +165,9 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
   runs in fp32 accuracy through one split-bf16 GEMM.
 - **Qwen3.8 Flash-Next:** whole `ssm_in`/`attn_qkv` projections and the shared
   expert, in two banks of 8192 tokens that run layer by layer in lock-step.
+- **GLM-5.3 Flash:** the KDA q/k/v projections and the shared expert gate/up, in
+  two 4096-token banks that run layer by layer in lock-step; the runtime-K program
+  in `tools/npu/runtime_k` serves them.
 - **Flint:** the shared expert and QKV projections, in two banks of up to 8192
   tokens; the runtime-M/K kernel in `tools/npu/runtime_mk` serves any chunk size
   without rebuilding the xclbin.
@@ -151,6 +184,11 @@ Flash-Next defaults to DFlash2 (`--speculative dflash2 --dflash-model <Qwen3.8-F
 which drafts a block of up to seven tokens in one pass and needs no MTP priming of the prompt; MTP
 (`--speculative mtp --mtp-model <shared Q8_0 sidecar>`) remains available. The DFlash2 head covers the
 first 163,840 vocabulary rows plus the special tokens (`GUFO_DFLASH_VOCAB=0` reads the whole vocabulary).
+
+GLM-5.3 Flash uses a DFlash2 drafter (`--speculative dflash2 --dflash-model <GLM-5.3-Flash-DFlash2 GGUF>`)
+plus lossless prompt-lookup drafts from the context; the checkpoint has no MTP head.
+Each extra verified row reads another set of experts, so the draft length adapts
+to the acceptance it sees.
 
 The 35B-A3B runs MTP at three draft tokens (verifying more rows reads more
 experts); DFlash2 wins on code and JSON, MTP on prose, and auto lands within a few
