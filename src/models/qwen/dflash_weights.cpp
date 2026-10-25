@@ -162,6 +162,10 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
       }
     }
   }
+  if (!rotary_dim.has_value() && head_dim.has_value()) {
+    // Without an explicit count the whole head is rotated, as in llama.cpp.
+    rotary_dim = head_dim;
+  }
   const auto context_length =
       RequiredUint32(reader, prefix + "context_length", error_msg);
   const auto num_layers =

@@ -97,6 +97,7 @@ private:
   enum class PreTokenizer : std::uint8_t {
     kNone,
     kQwen35,
+    kGlm4,
   };
 
   struct PairHash {
@@ -119,6 +120,9 @@ private:
   void InitializeByteTokens(bool eager_decoded_tokens = true);
   std::vector<TokenId> BpeMergeChunk(std::string_view chunk) const;
   std::vector<TokenId> BpeEncodeText(std::string_view text) const;
+  /// GLM-4/GLM-5 split regex plus whole-piece vocabulary lookup
+  /// (`tokenizer.ggml.ignore_merges`) before BPE.
+  std::vector<TokenId> Glm4EncodeText(std::string_view text) const;
 
   std::vector<std::string> id_to_token_;
   std::vector<std::string> id_to_decoded_token_;

@@ -2,7 +2,9 @@
 
 #include <unicode/bytestream.h>
 #include <unicode/normalizer2.h>
+#include <unicode/regex.h>
 #include <unicode/uchar.h>
+#include <unicode/unistr.h>
 
 #include <algorithm>
 #include <array>
@@ -369,14 +371,32 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     }
   }
 
+  // GLM's control and user-defined tokens outside the shared families:
+  // llama.cpp matches them in prompt text, so the chat template's framing and
+  // tool-call tags are single tokens.
+  if (const auto pre = reader.GetMetadataString("tokenizer.ggml.pre");
+      pre && (*pre == "glm4" || *pre == "glm5")) {
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      const auto& t = tokens[i];
+      if (t == "[gMASK]" || t == "[sMASK]" || t == "[MASK]" || t == "<sop>" ||
+          t == "<eop>" || t == "<arg_key>" || t == "</arg_key>" ||
+          t == "<arg_value>" || t == "</arg_value>" || t == "/nothink") {
+        special_tokens[t] = static_cast<TokenId>(i);
+      }
+    }
+  }
+
   auto tokenizer =
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {
     return nullptr;
   }
-  if (reader.GetMetadataString("tokenizer.ggml.pre") ==
-      std::optional<std::string_view>{"qwen35"}) {
-    tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
+  if (const auto pre = reader.GetMetadataString("tokenizer.ggml.pre")) {
+    if (*pre == "qwen35") {
+      tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
+    } else if (*pre == "glm4" || *pre == "glm5") {
+      tokenizer->pre_tokenizer_ = PreTokenizer::kGlm4;
+    }
   }
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
@@ -624,7 +644,78 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
   return merged;
 }
 
+std::vector<TokenId> QwenTokenizer::Glm4EncodeText(
+    std::string_view text) const {
+  // llama.cpp `LLAMA_VOCAB_PRE_TYPE_CHATGLM4`.
+  static constexpr char kPattern[] =
+      R"((?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+  UErrorCode status = U_ZERO_ERROR;
+  icu::RegexMatcher matcher(icu::UnicodeString::fromUTF8(kPattern), 0, status);
+  if (U_FAILURE(status)) {
+    throw std::runtime_error("could not compile the GLM pre-tokenizer regex");
+  }
+  const icu::UnicodeString input = icu::UnicodeString::fromUTF8(
+      icu::StringPiece(text.data(), static_cast<int32_t>(text.size())));
+  matcher.reset(input);
+
+  std::vector<TokenId> tokens;
+  std::vector<TokenId> piece_tokens;
+  std::string piece;
+  std::string escaped;
+  const auto add_piece = [&](std::string_view span_text) {
+    if (span_text.empty()) {
+      return;
+    }
+    // Vocabulary keys hold GPT-2 byte-level escapes (space is U+0120, a tab
+    // is U+0109), so the whole-piece lookup has to use the same domain.
+    escaped.clear();
+    for (const unsigned char byte : span_text) {
+      escaped += ByteToGpt2Utf8(byte);
+    }
+    // `ignore_merges`: a split piece that is itself a vocabulary token is
+    // encoded as that single token without running merge ranks over it.
+    if (const auto whole = token_to_id_.find(escaped);
+        whole != token_to_id_.end()) {
+      tokens.push_back(whole->second);
+      return;
+    }
+    piece_tokens = BpeMergeChunk(span_text);
+    tokens.insert(tokens.end(), piece_tokens.begin(), piece_tokens.end());
+  };
+
+  std::int32_t previous_end = 0;
+  while (matcher.find(status)) {
+    if (U_FAILURE(status)) {
+      throw std::runtime_error("GLM pre-tokenizer split failed");
+    }
+    const std::int32_t start = matcher.start(status);
+    const std::int32_t end = matcher.end(status);
+    if (U_FAILURE(status) || end <= start) {
+      continue;
+    }
+    if (start > previous_end) {
+      piece.clear();
+      input.tempSubStringBetween(previous_end, start).toUTF8String(piece);
+      add_piece(piece);
+    }
+    piece.clear();
+    input.tempSubStringBetween(start, end).toUTF8String(piece);
+    add_piece(piece);
+    previous_end = end;
+  }
+  if (previous_end < input.length()) {
+    piece.clear();
+    input.tempSubStringBetween(previous_end, input.length())
+        .toUTF8String(piece);
+    add_piece(piece);
+  }
+  return tokens;
+}
+
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
+  if (pre_tokenizer_ == PreTokenizer::kGlm4) {
+    return Glm4EncodeText(text);
+  }
   if (pre_tokenizer_ != PreTokenizer::kQwen35) {
     return BpeMergeChunk(text);
   }

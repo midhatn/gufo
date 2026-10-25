@@ -40,6 +40,8 @@
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/flint/chat_template.hpp"
 #include "src/models/flint/gpu/engine.hpp"
+#include "src/models/glm53_flash/chat_template.hpp"
+#include "src/models/glm53_flash/engine.hpp"
 #include "src/models/qwen/hip/auto_draft.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -3603,6 +3605,579 @@ private:
   std::uint32_t max_context_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
+
+constexpr std::string_view kGlmStateAbi = "glm53-flash-rocm-session-v1";
+// Context served when none is requested; a session needs about 12 KB per token.
+constexpr std::uint32_t kGlmDefaultContext = 131072;
+
+using GlmModel = models::glm53_flash::Model;
+using GlmSession = models::glm53_flash::Session;
+
+std::vector<std::int32_t> GlmEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("GLM-5.3 token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+std::vector<std::uint8_t> GlmCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::string_view draft_fingerprint,
+    bool has_draft, std::uint32_t max_context, std::uint32_t max_draft_tokens) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "GLM-5.3 disk cache requires an artifact fingerprint");
+  }
+  if (has_draft && !IsSha256Hex(draft_fingerprint)) {
+    throw std::invalid_argument(
+        "GLM-5.3 DFlash disk cache requires a draft artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=glm53-flash\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact-glm-control-tokens-v1\n"
+           << "chat_template=glm53-compiled-v1\n"
+           << "state_abi=" << kGlmStateAbi << '\n'
+           << "payload_layout=glm53-rocm-session-snapshot-v"
+           << models::glm53_flash::Session::kSnapshotPayloadVersion << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  if (has_draft) {
+    identity << "draft_backend=glm53-dflash2-history-v1\n"
+             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
+             << draft_fingerprint << '\n'
+             << "draft_max_tokens=" << max_draft_tokens << '\n';
+  }
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+class GlmTextRunnerState final : public TextRunnerState {
+public:
+  GlmTextRunnerState(const std::shared_ptr<GlmModel>& model,
+                     std::uint32_t max_context, bool use_draft) {
+    std::string error;
+    session_ = model->CreateSession(
+        use_draft ? gufo::core::SessionMode::kSpeculative
+                  : gufo::core::SessionMode::kAutoregressive,
+        max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create GLM-5.3 session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->SetCancellationCheck({});
+    session_->Reset();
+    position_ = 0;
+  }
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    session_->SetCancellationCheck(check);
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] GlmSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<GlmSession> session_;
+  std::size_t position_{0};
+};
+
+class GlmTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  GlmTextRunnerSnapshot(
+      std::shared_ptr<GlmModel> model,
+      std::unique_ptr<models::glm53_flash::SessionSnapshot> snapshot,
+      std::size_t position)
+      : model(std::move(model)),
+        snapshot(std::move(snapshot)),
+        position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    if (snapshot == nullptr ||
+        snapshot->SizeBytes() > static_cast<std::uint64_t>(
+                                    std::numeric_limits<std::size_t>::max())) {
+      return 0;
+    }
+    return static_cast<std::size_t>(snapshot->SizeBytes());
+  }
+
+  std::shared_ptr<GlmModel> model;
+  std::unique_ptr<models::glm53_flash::SessionSnapshot> snapshot;
+  std::size_t position;
+};
+
+GlmTextRunnerState& RequireGlmState(TextRunnerState& state) {
+  auto* glm = dynamic_cast<GlmTextRunnerState*>(&state);
+  if (glm == nullptr) {
+    throw std::logic_error("text runner state is not GLM-5.3");
+  }
+  return *glm;
+}
+
+const GlmTextRunnerState& RequireGlmState(const TextRunnerState& state) {
+  const auto* glm = dynamic_cast<const GlmTextRunnerState*>(&state);
+  if (glm == nullptr) {
+    throw std::logic_error("text runner state is not GLM-5.3");
+  }
+  return *glm;
+}
+
+models::glm53_flash::ChatRenderOptions GlmRenderOptions(
+    const ChatRequest& request) {
+  return models::glm53_flash::RenderOptionsFor(request.reasoning);
+}
+
+class GlmTextRunner final : public HipTextModelRunner {
+public:
+  GlmTextRunner(std::shared_ptr<GlmModel> model, std::uint32_t max_context,
+                bool use_draft, std::string artifact_fingerprint = {},
+                std::string draft_fingerprint = {})
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_draft_(use_draft) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = GlmCompatibilityIdentity(
+              artifact_fingerprint,
+              use_draft_ ? draft_fingerprint : std::string{}, use_draft_,
+              max_context_, model_->MaxDraftTokens()),
+          .payload_version =
+              models::glm53_flash::Session::kSnapshotPayloadVersion,
+      };
+    }
+    Warmup();
+  }
+
+  /// One throwaway prefill of a full bank pair plus a few decode steps, so the
+  /// first real request does not pay for lazy kernel, graph and NPU start-up.
+  /// GUFO_WARMUP=0 skips it.
+  void Warmup() const {
+    const char* disabled = std::getenv("GUFO_WARMUP");
+    if (disabled != nullptr && disabled[0] == '0')
+      return;
+    try {
+      constexpr std::size_t kTail = 64;
+      const std::size_t room = max_context_ > 128 ? max_context_ - 128 : 0;
+      const std::size_t length =
+          std::min<std::size_t>(model_->PrefillCapacity() + kTail, room);
+      if (length < kTail)
+        return;
+      const auto started = std::chrono::steady_clock::now();
+      std::string error;
+      auto session = model_->CreateSession(
+          use_draft_ ? gufo::core::SessionMode::kSpeculative
+                     : gufo::core::SessionMode::kAutoregressive,
+          max_context_, &error);
+      if (session == nullptr) {
+        Logger::Warn("loader", "event=warmup_skipped reason=" + error);
+        return;
+      }
+      const auto unit = model_->Tokenize(
+          "The quick brown fox jumps over the lazy dog while the engine warms "
+          "its kernels. ");
+      if (unit.empty())
+        return;
+      std::vector<std::int32_t> prompt;
+      prompt.reserve(length);
+      for (std::size_t i = 0; i < length; ++i)
+        prompt.push_back(unit[i % unit.size()]);
+      if (!session->Sync(prompt, &error)) {
+        Logger::Warn("loader", "event=warmup_failed reason=" + error);
+        return;
+      }
+      sampling::SamplerState sampler;
+      for (int step = 0; step < 4; ++step) {
+        GlmSession::DecodeResult decoded;
+        if (!session->DecodeStep(use_draft_ ? model_->MaxDraftTokens() + 1 : 1,
+                                 sampler, &decoded, &error, false))
+          break;
+      }
+      const auto elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+      Logger::Info("loader",
+                   "event=warmup_completed tokens=" + std::to_string(length) +
+                       " elapsed_s=" + std::to_string(elapsed));
+    } catch (const std::exception& failure) {
+      Logger::Warn("loader",
+                   std::string("event=warmup_failed reason=") + failure.what());
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kGlmStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = true,
+                .fork = true,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = use_draft_,
+                .batched_multi_token_decode = false,
+                .batched_multi_token_decode_max_width = 0,
+                .prefix_reuse = true,
+                .in_pass_checkpoint = false,
+                .prefill_grid_tokens = model_->PrefillCapacity(),
+            },
+        .persistence = persistence_,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = model_->SessionBytes(
+            use_draft_ ? gufo::core::SessionMode::kSpeculative
+                       : gufo::core::SessionMode::kAutoregressive,
+            max_context_),
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->tokenizer().GetVocabSize(), [this](std::uint32_t id) {
+          const auto& tokenizer = model_->tokenizer();
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer.DecodeTokenCopy(id),
+              model_->IsStopToken(static_cast<std::int32_t>(id))};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    const auto tokens = model_->Tokenize(text);
+    return {tokens.begin(), tokens.end()};
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    for (const auto& message : request.messages) {
+      if (!message.images.empty()) {
+        throw std::invalid_argument("GLM-5.3 does not support image input");
+      }
+    }
+    const auto text = models::glm53_flash::RenderChat(
+        request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        GlmRenderOptions(request));
+    const auto tokens = model_->Tokenize(text);
+    if (tokens.empty() || tokens.size() >= max_context_) {
+      return std::nullopt;
+    }
+    return std::vector<TextRunnerToken>(tokens.begin(), tokens.end());
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    if (prepared) {
+      // The generation prefix (`<|assistant|><think>`) is not what the next
+      // turn replays for this reply, so the reusable frontier ends where a
+      // further user message would diverge from it.
+      auto continuation = request;
+      continuation.messages.emplace_back(tokenization::ChatRole::kUser, "");
+      const auto continued = RenderAndTokenize(continuation);
+      if (continued) {
+        prepared->cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+                          continued->begin(), continued->end())
+                .first -
+            prepared->tokens.begin());
+      }
+    }
+    return prepared;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return GlmRenderOptions(request).thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->tokenizer().Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<GlmTextRunnerState>(model_, max_context_,
+                                                use_draft_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& glm = RequireGlmState(state);
+    if (glm.position() != prefix.size()) {
+      throw std::logic_error("GLM-5.3 reused prefix does not match checkpoint");
+    }
+    glm.session().ResetDraftPolicy();
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& glm = RequireGlmState(state);
+    if (offset != glm.position()) {
+      throw std::logic_error(
+          "GLM-5.3 prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("GLM-5.3 prefill has no remaining input");
+    }
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = GlmEngineTokens(prompt.first(next_position));
+    std::string error;
+    if (!glm.session().Sync(prefix, &error)) {
+      glm.set_position(0);
+      throw std::runtime_error("GLM-5.3 prefill failed: " + error);
+    }
+    glm.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& glm = RequireGlmState(state);
+    if (glm.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    const auto logits = glm.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error("GLM-5.3 token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (EndsTurn(glm, *model_, token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->TokenText(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("GLM-5.3 token ID exceeds engine range");
+    }
+    auto& glm = RequireGlmState(state);
+    std::string error;
+    if (!glm.session().Evaluate(static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("GLM-5.3 decode failed: " + error);
+    }
+    glm.set_position(glm.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    if (max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "GLM-5.3 decode budget must be at least one token");
+    }
+    auto& glm = RequireGlmState(state);
+    if (glm.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    const auto before = glm.session().Statistics();
+    sampling::SamplerState working_sampler = sampler;
+    GlmSession::DecodeResult decoded;
+    std::string error;
+    const auto budget = std::min<std::size_t>(
+        max_tokens, std::uint64_t{model_->MaxDraftTokens()} + 1);
+    if (!glm.session().DecodeStep(budget, working_sampler, &decoded, &error,
+                                  glm.stop_at_eos())) {
+      throw std::runtime_error("GLM-5.3 decode failed: " + error);
+    }
+    // The pool accepts the returned tokens once. Publish the RNG and residual
+    // draw so the next step retains the rejection-conditioned distribution.
+    sampler.CopyDrawStateFrom(working_sampler);
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    glm.set_position(glm.session().Position());
+    const auto after = glm.session().Statistics();
+    step.draft_rounds = after.cycles - before.cycles;
+    step.draft_tokens = after.drafted - before.drafted;
+    step.draft_accepted_tokens = after.accepted - before.accepted;
+    step.suffix_draft_tokens = after.history_drafted - before.history_drafted;
+    step.suffix_accepted_tokens =
+        after.history_accepted - before.history_accepted;
+    return step;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireGlmState(state).position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    const std::uint64_t bytes =
+        RequireGlmState(state).session().SnapshotBytes();
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+      throw std::overflow_error("GLM-5.3 snapshot size is unavailable");
+    }
+    return static_cast<std::size_t>(bytes);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& glm = RequireGlmState(state);
+    std::string error;
+    auto snapshot = glm.session().SaveSnapshot(&error);
+    if (snapshot == nullptr) {
+      throw std::runtime_error("GLM-5.3 snapshot failed: " + error);
+    }
+    return std::make_unique<GlmTextRunnerSnapshot>(model_, std::move(snapshot),
+                                                   glm.position());
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> SnapshotForPersistence(
+      const TextRunnerState& state) const override {
+    return Snapshot(state);
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* glm_snapshot =
+        dynamic_cast<const GlmTextRunnerSnapshot*>(&snapshot);
+    if (glm_snapshot == nullptr || glm_snapshot->model.get() != model_.get() ||
+        glm_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "GLM-5.3 snapshot does not belong to this model");
+    }
+    auto& restored = RequireGlmState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(*glm_snapshot->snapshot, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("GLM-5.3 snapshot restore failed: " + error);
+    }
+    restored.set_position(glm_snapshot->position);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* glm_snapshot =
+        dynamic_cast<const GlmTextRunnerSnapshot*>(&snapshot);
+    if (glm_snapshot == nullptr || glm_snapshot->model.get() != model_.get() ||
+        glm_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "GLM-5.3 persistent snapshot does not belong to this model");
+    }
+    return glm_snapshot->PayloadBytes();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* glm_snapshot =
+        dynamic_cast<const GlmTextRunnerSnapshot*>(&snapshot);
+    if (glm_snapshot == nullptr || glm_snapshot->model.get() != model_.get() ||
+        glm_snapshot->snapshot == nullptr ||
+        destination.size() != glm_snapshot->PayloadBytes()) {
+      throw std::invalid_argument(
+          "GLM-5.3 persistent snapshot serialization failed");
+    }
+    const auto bytes = glm_snapshot->snapshot->bytes();
+    std::memcpy(destination.data(), bytes.data(), bytes.size());
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    (void)PersistentSnapshotPayloadBytes(snapshot);
+    sink(
+        dynamic_cast<const GlmTextRunnerSnapshot&>(snapshot).snapshot->bytes());
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireGlmState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("GLM-5.3 persistent snapshot restore failed: " +
+                               error);
+    }
+    const std::uint32_t position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "GLM-5.3 persistent snapshot restored an invalid position");
+    }
+    restored.set_position(position);
+  }
+
+private:
+  std::shared_ptr<GlmModel> model_;
+  std::uint32_t max_context_;
+  bool use_draft_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+};
 #endif
 
 }  // namespace
@@ -3746,6 +4321,74 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     max_context = static_cast<std::uint32_t>(native);
+    // The artifact claims a million tokens; sessions allocate for the whole
+    // window, so serve a window the memory next to the weights can hold.
+    if (architecture == "glm5next" || architecture == "glm5-next") {
+      max_context = std::min(max_context, kGlmDefaultContext);
+    }
+  }
+
+  if (reader->GetMetadataString("general.architecture") == "glm5next" ||
+      reader->GetMetadataString("general.architecture") == "glm5-next") {
+    const bool dflash =
+        speculative_config.backend == TextSpeculativeBackend::kDFlash;
+    if (!vision_model_path.empty()) {
+      SetError(error, "GLM-5.3 does not support --mmproj");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        !dflash) {
+      SetError(error, "GLM-5.3 HTTP models support only DFlash2 drafting");
+      return false;
+    }
+    if (dflash && speculative_config.draft_model_path.empty()) {
+      SetError(error, "GLM-5.3 DFlash2 HTTP decoding requires --dflash-model");
+      return false;
+    }
+    if (speculative_config.max_draft_tokens == 0 ||
+        speculative_config.max_draft_tokens >
+            models::glm53_flash::kMaxDraftTokens ||
+        speculative_config.min_draft_tokens != 1) {
+      SetError(error,
+               "GLM-5.3 drafting requires one to seven draft tokens and "
+               "--min-draft-tokens 1");
+      return false;
+    }
+    if (!models::glm53_flash::ValidateGgufTemplate(*reader, &load_error)) {
+      SetError(error, "Unsupported GLM-5.3 chat template: " + load_error);
+      return false;
+    }
+    auto model = models::glm53_flash::Model::Load(
+        model_path,
+        models::glm53_flash::ModelOptions{
+            .max_context = max_context,
+            .dflash_model_path =
+                dflash ? speculative_config.draft_model_path : std::string{},
+            .max_draft_tokens = speculative_config.max_draft_tokens,
+        },
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create GLM-5.3 model: " + load_error);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "GLM-5.3", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) && dflash &&
+        resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+        !FingerprintArtifactFile(
+            "GLM-5.3 DFlash2", speculative_config.draft_model_path,
+            &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+            error)) {
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config), ram_cache_config);
   }
 
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
@@ -4395,6 +5038,80 @@ bool InferenceBackend::load(
     auto runner = std::make_shared<FlintTextRunner>(
         std::move(model), std::move(tokenizer), std::move(stop_tokens),
         max_context, disk_cache_config.model_artifact_fingerprint);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache),
+        ram_cache_config);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::glm53_flash::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
+  if (model == nullptr) {
+    SetError(error, "GLM-5.3 model must not be null");
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->MaxContext();
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context == 0 || max_context > model->MaxContext()) {
+    SetError(error, "HTTP context exceeds the loaded GLM-5.3 model context");
+    return false;
+  }
+  const bool use_dflash =
+      speculative_config.backend == TextSpeculativeBackend::kDFlash;
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      !(use_dflash && model->HasDflash())) {
+    SetError(error,
+             "GLM-5.3 speculative decoding requires a model loaded with its "
+             "DFlash2 drafter");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       (use_dflash &&
+        !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
+       disk_cache_config.capacity_bytes == 0)) {
+    SetError(error, "GLM-5.3 persistent disk cache configuration is invalid");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kGlm53Flash;
+    new_state->sampling_defaults.supplied = {};
+    new_state->supports_images = false;
+    auto runner = std::make_shared<GlmTextRunner>(
+        std::move(model), max_context, use_dflash,
+        disk_cache_config.model_artifact_fingerprint,
+        disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
