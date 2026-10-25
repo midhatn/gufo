@@ -9,6 +9,7 @@ speculative decoding on top. Fork of [gufo-org/gufo](https://github.com/gufo-org
 | Qwen3.6-35B-A3B | UD-Q4_K_XL | linear-attention and attention projections | MTP (embedded head), DFlash2, auto |
 | Qwen3.8-27B | UD-Q4_K_XL | FFN, attention and linear-attention projections | DFlash2, MTP, auto |
 | Qwen3.8 Flash-Next | UD-IQ4_XS | whole projections, two-bank lock-step | DFlash2 (default), MTP |
+| Flint | UD-Q4_K_XL | shared expert and QKV, two-bank pipeline | prompt lookup (no draft model) |
 
 ## Speed
 
@@ -76,6 +77,27 @@ has been idle can be much slower, so discard it when benchmarking.
 Prefill depends on the text as well as the length: code, markdown and prose
 route to experts differently, so the same length can vary by 20% or more.
 
+### Flint
+
+| Prefill, tok/s | GPU only | GPU + NPU |
+| --- | --- | --- |
+| `-p 2048` | 3,882 | **4,150** (+6.9%) |
+| `-p 4096` | 3,933 | **4,007** (+1.9%) |
+| `-p 8192` | 3,724 | **4,143** (+11.3%) |
+
+| Decode, tok/s | plain | prompt lookup |
+| --- | --- | --- |
+| code | 72.6 | **74.9** |
+| prose | 72.6 | 72.3 |
+| JSON | 72.6 | **73.3** |
+
+`gufo bench -n 128` plain decode: 73.6 tok/s; `gufo serve`: 72.8 tok/s. Flint has
+no MTP head and no drafter yet, so only prompt lookup (lossless) applies, and it
+helps when the output copies earlier text. Long context: 131k-token prefill takes
+89 s dense and 48 s (2,716 tok/s) with `FLINT_SPARSE_ATTN=1`, which is
+approximate beyond about 19k tokens. Details, numerics and the prefill history
+are in [docs/models/flint](docs/models/flint/README.md).
+
 ## Quality
 
 Output is exact by default, with two documented exceptions, and the NPU is
@@ -113,6 +135,9 @@ reads the NPU result directly. One runtime-K program serves every reduction leng
   runs in fp32 accuracy through one split-bf16 GEMM.
 - **Qwen3.8 Flash-Next:** whole `ssm_in`/`attn_qkv` projections and the shared
   expert, in two banks of 8192 tokens that run layer by layer in lock-step.
+- **Flint:** the shared expert and QKV projections, in two banks of up to 8192
+  tokens; the runtime-M/K kernel in `tools/npu/runtime_mk` serves any chunk size
+  without rebuilding the xclbin.
 
 ## Speculative decoding
 
