@@ -170,14 +170,19 @@ __device__ __forceinline__ float Iq2sBlockDot(const uint4 (&q)[4],
 
 template<bool kS, int KB>
 __global__ __launch_bounds__(kExpertThreads) void ExpertsDotKernel(
-    const uint8_t* __restrict__ w, size_t expert_bytes, size_t row_bytes,
-    const int32_t* __restrict__ ids, const block_q8_1* __restrict__ y,
-    int n_used, int y_rows_per_token, float* __restrict__ out, int m) {
+    const uint8_t* __restrict__ w0, const uint8_t* __restrict__ w1,
+    size_t expert_bytes, size_t row_bytes, const int32_t* __restrict__ ids,
+    const block_q8_1* __restrict__ y, int n_used, int y_rows_per_token,
+    float* __restrict__ out0, float* __restrict__ out1, int slots, int m) {
   constexpr int kBlockBytes = kS ? 82 : 66;
   using Rows = ExpertRows<KB>;
   __shared__ int yq[KB * 64];
   __shared__ float yd[KB * 8];
-  const int slot = blockIdx.y;
+  const bool second = static_cast<int>(blockIdx.y) >= slots;
+  const int slot = second ? static_cast<int>(blockIdx.y) - slots
+                          : static_cast<int>(blockIdx.y);
+  const uint8_t* __restrict__ w = second ? w1 : w0;
+  float* __restrict__ out = second ? out1 : out0;
   const int token = slot / n_used;
   const int yrow = y_rows_per_token == 1 ? slot : token;
   const int expert = ids[slot];
@@ -217,18 +222,21 @@ __global__ __launch_bounds__(kExpertThreads) void ExpertsDotKernel(
 }
 
 template<bool kS, int KB>
-int LaunchExpertsDot(const void* w, int m, int n_experts, int n_used, int slots,
-                     const int* ids, const void* y, int y_rows_per_token,
-                     float* out, hipStream_t stream) {
+int LaunchExpertsDot(const void* w0, const void* w1, int m, int n_experts,
+                     int n_used, int slots, int groups, const int* ids,
+                     const void* y, int y_rows_per_token, float* out0,
+                     float* out1, hipStream_t stream) {
   constexpr size_t kBlockBytes = kS ? 82 : 66;
   const size_t row_bytes = KB * kBlockBytes;
   const size_t expert_bytes = static_cast<size_t>(m) * row_bytes;
   (void)n_experts;
   const dim3 grid(
-      (m + ExpertRows<KB>::kPerBlock - 1) / ExpertRows<KB>::kPerBlock, slots);
+      (m + ExpertRows<KB>::kPerBlock - 1) / ExpertRows<KB>::kPerBlock,
+      slots * groups);
   ExpertsDotKernel<kS, KB><<<grid, kExpertThreads, 0, stream>>>(
-      static_cast<const uint8_t*>(w), expert_bytes, row_bytes, ids,
-      static_cast<const block_q8_1*>(y), n_used, y_rows_per_token, out, m);
+      static_cast<const uint8_t*>(w0), static_cast<const uint8_t*>(w1),
+      expert_bytes, row_bytes, ids, static_cast<const block_q8_1*>(y), n_used,
+      y_rows_per_token, out0, out1, slots, m);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
@@ -320,18 +328,20 @@ int MatvecExpertsTokens(int type_code, const void* w, const float* x,
     const int slots = n_tokens * n_used;
     const int per_token = x_per_expert ? 1 : 0;
     if (xxs) {
-      return k == 4096 ? LaunchExpertsDot<false, 16>(w, m, n_experts, n_used,
-                                                     slots, ids, scratch,
-                                                     per_token, out, stream)
-                       : LaunchExpertsDot<false, 8>(w, m, n_experts, n_used,
-                                                    slots, ids, scratch,
-                                                    per_token, out, stream);
+      return k == 4096
+                 ? LaunchExpertsDot<false, 16>(w, w, m, n_experts, n_used,
+                                               slots, 1, ids, scratch,
+                                               per_token, out, out, stream)
+                 : LaunchExpertsDot<false, 8>(w, w, m, n_experts, n_used, slots,
+                                              1, ids, scratch, per_token, out,
+                                              out, stream);
     }
-    return k == 4096
-               ? LaunchExpertsDot<true, 16>(w, m, n_experts, n_used, slots, ids,
-                                            scratch, per_token, out, stream)
-               : LaunchExpertsDot<true, 8>(w, m, n_experts, n_used, slots, ids,
-                                           scratch, per_token, out, stream);
+    return k == 4096 ? LaunchExpertsDot<true, 16>(w, w, m, n_experts, n_used,
+                                                  slots, 1, ids, scratch,
+                                                  per_token, out, out, stream)
+                     : LaunchExpertsDot<true, 8>(w, w, m, n_experts, n_used,
+                                                 slots, 1, ids, scratch,
+                                                 per_token, out, out, stream);
   }
   ds4_ggml_hip_mm_fusion_args_device fusion = {};
   mul_mat_vec_q_switch_type(w, type, scratch, ids, fusion, out, k, m, n_tokens,
@@ -339,6 +349,48 @@ int MatvecExpertsTokens(int type_code, const void* w, const float* x,
                             channels_y, n_used, m * stride_row_x, row_blocks, m,
                             1, 1, 0, 0, 0, n_used, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+int MatvecExpertsPairTokens(int type_code, const void* w0, const void* w1,
+                            const float* x, float* out0, float* out1, int m,
+                            int k, int n_experts, int n_used, int n_tokens,
+                            const int* ids, void* scratch, hipStream_t stream) {
+  const bool xxs = type_code == kTypeIQ2_XXS;
+  const bool fast =
+      (xxs || type_code == kTypeIQ2_S) && (k == 4096 || k == 2048);
+  if (!fast || w0 == nullptr || w1 == nullptr || x == nullptr ||
+      out0 == nullptr || out1 == nullptr || scratch == nullptr ||
+      ids == nullptr || m <= 0 || n_used <= 0 || n_experts <= 0 ||
+      n_tokens <= 0 || n_tokens > 8) {
+    const int rc =
+        MatvecExpertsTokens(type_code, w0, x, out0, m, k, n_experts, n_used,
+                            n_tokens, ids, false, scratch, stream);
+    return rc != 0 ? rc
+                   : MatvecExpertsTokens(type_code, w1, x, out1, m, k,
+                                         n_experts, n_used, n_tokens, ids,
+                                         false, scratch, stream);
+  }
+  const auto type = static_cast<ggml_type>(type_code);
+  const std::int64_t padded =
+      GGML_PAD(static_cast<std::int64_t>(k), MATRIX_ROW_PADDING);
+  ds4_quantize_row_q8_1_hip(
+      x, nullptr, scratch, type, k, k, static_cast<std::int64_t>(k) * n_tokens,
+      static_cast<std::int64_t>(k) * n_tokens, padded, n_tokens, 1, 1, stream);
+  const int slots = n_tokens * n_used;
+  if (xxs) {
+    return k == 4096 ? LaunchExpertsDot<false, 16>(w0, w1, m, n_experts, n_used,
+                                                   slots, 2, ids, scratch, 0,
+                                                   out0, out1, stream)
+                     : LaunchExpertsDot<false, 8>(w0, w1, m, n_experts, n_used,
+                                                  slots, 2, ids, scratch, 0,
+                                                  out0, out1, stream);
+  }
+  return k == 4096
+             ? LaunchExpertsDot<true, 16>(w0, w1, m, n_experts, n_used, slots,
+                                          2, ids, scratch, 0, out0, out1,
+                                          stream)
+             : LaunchExpertsDot<true, 8>(w0, w1, m, n_experts, n_used, slots, 2,
+                                         ids, scratch, 0, out0, out1, stream);
 }
 
 int MatvecExperts(int type_code, const void* w, const float* x, float* out,
@@ -373,7 +425,7 @@ int Gemm(int type_code, const void* w, const float* x, float* out, int m, int n,
   if (type_code == kTypeF32 || n <= MMVQ_MAX_BATCH_SIZE) {
     return Matvec(type_code, w, x, out, m, n, k, scratch, stream);
   }
-  if ((k % 256) != 0) {
+  if ((k % 256) != 0 || (type_code != kTypeQ6_K && type_code != kTypeQ8_0)) {
     for (int col = 0; col < n; col += MMVQ_MAX_BATCH_SIZE) {
       const int cols =
           n - col < MMVQ_MAX_BATCH_SIZE ? n - col : MMVQ_MAX_BATCH_SIZE;

@@ -11,6 +11,7 @@ namespace gufo::models::glm53_flash::rocm {
 // ggml type codes accepted by Matvec.
 inline constexpr int kTypeF32 = 0;
 inline constexpr int kTypeQ8_0 = 8;
+inline constexpr int kTypeQ5_K = 13;
 inline constexpr int kTypeQ6_K = 14;
 inline constexpr int kTypeIQ2_XXS = 16;
 inline constexpr int kTypeIQ2_S = 22;
@@ -48,6 +49,14 @@ int MatvecExpertsTokens(int type_code, const void* w, const float* x,
                         float* out, int m, int k, int n_experts, int n_used,
                         int n_tokens, const int* ids, bool x_per_expert,
                         void* scratch, hipStream_t stream);
+
+// Two same-shaped expert tensors (gate and up) applied to one activation: the
+// activation is quantized once and both run in one launch. x_per_expert is
+// false; out0 and out1 are laid out like MatvecExpertsTokens' out.
+int MatvecExpertsPairTokens(int type_code, const void* w0, const void* w1,
+                            const float* x, float* out0, float* out1, int m,
+                            int k, int n_experts, int n_used, int n_tokens,
+                            const int* ids, void* scratch, hipStream_t stream);
 
 // Dense GEMM for any n: out[col * m + row], x is [n][k]. Up to 8 columns use
 // the mmvq path, larger batches the mmq GEMM (K a multiple of 256; narrower K

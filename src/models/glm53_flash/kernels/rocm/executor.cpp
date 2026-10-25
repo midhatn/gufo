@@ -64,6 +64,8 @@ int TypeCode(GgmlType t) {
       return kTypeF32;
     case GgmlType::kQ8_0:
       return kTypeQ8_0;
+    case GgmlType::kQ5_K:
+      return kTypeQ5_K;
     case GgmlType::kQ6_K:
       return kTypeQ6_K;
     case GgmlType::kIQ2_XXS:
@@ -321,14 +323,14 @@ bool Executor::Upload(const std::string& name, std::string* error) {
   if (d.experts == 1 && name.rfind("blk.", 0) == 0 && d.k % 32 == 0) {
     if (d.type == kTypeQ8_0) {
       d.q8 = d.data;
-    } else if (d.type == kTypeQ6_K) {
+    } else if (d.type == kTypeQ6_K || d.type == kTypeQ5_K) {
       const std::size_t bytes =
           static_cast<std::size_t>(d.rows) * (d.k / 32) * 34;
       if (hipMalloc(&d.q8, bytes + kTailMargin) == hipSuccess) {
         d.q8_owned = true;
         gufo::models::qwen38_flash_next::rocm::RequantToQ8_0(
-            d.data, static_cast<std::uint32_t>(GgmlType::kQ6_K), d.k, d.rows,
-            d.q8, stream_);
+            d.data, static_cast<std::uint32_t>(t->type), d.k, d.rows, d.q8,
+            stream_);
         hipStreamSynchronize(stream_);
       } else {
         d.q8 = nullptr;
@@ -997,11 +999,9 @@ void Executor::DsaBlock(std::uint32_t layer, Session& s, int T) const {
     // over all tokens, in the head-major layout the attention kernel reads.
     HeadMajor(b.q, static_cast<std::uint16_t*>(b.head_half), T, kDsaHeads, 256,
               stream_);
-    HeadGemm(*w.k_b, b.qabs, false, T, 256, kDsaLatent);
-    Mark(7);
     std::uint16_t* q_half = reinterpret_cast<std::uint16_t*>(b.v_heads);
-    ToHalf(b.qabs, q_half, static_cast<long long>(kDsaHeads) * T * kDsaLatent,
-           stream_);
+    HeadGemm(*w.k_b, q_half, true, T, 256, kDsaLatent);
+    Mark(7);
     DsaAttendBatch(q_half, st.cache.lat_half, b.sel, pos0, T, top, 1.0F / 16.0F,
                    static_cast<std::uint16_t*>(b.head_half), stream_);
     Mark(8);
@@ -1166,12 +1166,19 @@ void Executor::FfnBlock(std::uint32_t layer, int T) const {
                          T == static_cast<int>(npu_->tokens()) &&
                          layer < npu_sh_.size() && !npu_sh_[layer].empty();
   if (T <= kMaxExpertTokens) {
-    MatvecExpertsTokens(w.exp_gate->type, w.exp_gate->data, b.y, b.gate,
-                        kExpertFf, kHidden, kMoeExperts, kMoeUsed, T, b.ids,
-                        false, b.matvec, stream_);
-    MatvecExpertsTokens(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf,
-                        kHidden, kMoeExperts, kMoeUsed, T, b.ids, false,
-                        b.matvec, stream_);
+    if (w.exp_gate->type == w.exp_up->type) {
+      MatvecExpertsPairTokens(w.exp_gate->type, w.exp_gate->data,
+                              w.exp_up->data, b.y, b.gate, b.up, kExpertFf,
+                              kHidden, kMoeExperts, kMoeUsed, T, b.ids,
+                              b.matvec, stream_);
+    } else {
+      MatvecExpertsTokens(w.exp_gate->type, w.exp_gate->data, b.y, b.gate,
+                          kExpertFf, kHidden, kMoeExperts, kMoeUsed, T, b.ids,
+                          false, b.matvec, stream_);
+      MatvecExpertsTokens(w.exp_up->type, w.exp_up->data, b.y, b.up, kExpertFf,
+                          kHidden, kMoeExperts, kMoeUsed, T, b.ids, false,
+                          b.matvec, stream_);
+    }
     SwigluClamp(b.gate, b.up, b.act, T * kMoeUsed * kExpertFf, stream_);
     MatvecExpertsTokens(w.exp_down->type, w.exp_down->data, b.act, b.parts,
                         kHidden, kExpertFf, kMoeExperts, kMoeUsed, T, b.ids,
