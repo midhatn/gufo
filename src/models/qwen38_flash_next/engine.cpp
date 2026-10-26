@@ -1267,7 +1267,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   if (!history_draft.empty()) {
     const bool sampled = sampler.config().uses_random_sampling();
-    const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
+    const bool gpu_greedy = sampler.config().temperature == 0.0F;
     if (!defer_head && MtpLoaded() && !DraftCatchUp(anchor, false, error_msg))
       return false;
     pending->suffix = true;
@@ -1338,7 +1338,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       }
       if (complete) {
         const bool gpu_greedy =
-            !sampled && sampler.config().can_use_unmodified_argmax();
+            !sampled && sampler.config().temperature == 0.0F;
         pending->suffix = false;
         pending->chain = {anchor};
         pending->chain.insert(pending->chain.end(), drafted.begin(),
