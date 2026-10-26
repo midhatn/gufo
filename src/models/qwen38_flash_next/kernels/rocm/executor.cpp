@@ -5257,9 +5257,11 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   }
   SnapshotHeader h = MakeSnapshotHeader(config(), session.mtp_head_, session);
   h.blocks = session.blocks_;
-  h.mtp_blocks = session.mtp_.blocks;
-  h.mtp_position = session.mtp_.position;
-  h.mtp_residual_valid = session.mtp_.residual_valid;
+  if (session.mtp_head_) {
+    h.mtp_blocks = session.mtp_.blocks;
+    h.mtp_position = session.mtp_.position;
+    h.mtp_residual_valid = session.mtp_.residual_valid;
+  }
   h.hidden_rows = hidden_rows;
   h.ngram_prev = session.ngram_.prev;
   h.payload_bytes = SnapshotBytes(session, hidden_rows);
@@ -5422,6 +5424,11 @@ bool Executor::RestoreSnapshot(Session& session,
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;
+  }
+  if (h.has_mtp == 0) {
+    h.mtp_position = 0;
+    h.mtp_blocks = 0;
+    h.mtp_residual_valid = 0;
   }
   const std::uint32_t max_blocks =
       h.compress_ratio == 0 ? 0 : h.position / h.compress_ratio;

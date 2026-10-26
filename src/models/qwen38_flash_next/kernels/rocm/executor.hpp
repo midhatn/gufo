@@ -408,6 +408,8 @@ public:
 
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const {
+    if (!session.mtp_head_)
+      return;
     if (session.continuation_hooks_ && position < session.mtp_.position)
       session.continuation_hooks_->BeforeWrite(
           true, position, session.mtp_.position,
