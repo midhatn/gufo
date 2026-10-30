@@ -454,7 +454,7 @@ pair matching and percentage arithmetic without running inference:
 python docs/models/qwen3.8-flash-next/artifacts/phoenix-cuda-npu/verify_evidence.py
 ```
 
-## Follow-up investigations and resolution of open questions
+## Follow-up investigations and remaining evidence limits
 
 Following initial community review and analysis of related XDNA1/AIE2 implementations (including `ryzenai-npu-lab`, `hawkpoint-npu-llm`, and `whisper-xdna`), targeted experiments were conducted on the same Ryzen 9 7940HS / Phoenix hardware to address the six core questions raised above. Detailed machine-readable results are preserved in [artifacts/phoenix-cuda-npu/09-followup-five-column-runlist-nvme.json](artifacts/phoenix-cuda-npu/09-followup-five-column-runlist-nvme.json).
 
@@ -462,11 +462,11 @@ Following initial community review and analysis of related XDNA1/AIE2 implementa
 
 To determine whether the 4-column limit was a hardware barrier or driver/compiler convention, a direct AIE2 binary instruction generator was implemented to bypass the upstream MLIR-AIE Phoenix column-mask constraint (`mlir-aie#2333`).
 
-- **Physical probe result**: All 5 physical columns (columns 0 through 4, rows 2 through 5) executed correctly on Windows Phoenix silicon, verifying execution on all 20 physical compute tiles and 5 MemTiles simultaneously (`all_20_cores_passed: true`, dispatch latency 2.14 ms).
-- **Throughput and architectural bottleneck**: On an M=1,024, K=2,560, N=1,280 GEMM benchmark:
-  - 16 compute tiles (4 columns) reached **1.92 TFLOPS**.
+- **Physical probe result**: The retained completed dispatch returned the expected signatures for 20 compute tiles across columns 0 through 4 and rows 2 through 5 (`all_20_cores_passed: true`, dispatch latency 2.14 ms). This verifies that probe's outputs; it does not separately measure simultaneous tile occupancy or qualify every MemTile operation.
+- **Reported throughput comparison**: The 20-tile GEMM used M=1,024, K=2,560, N=1,280:
+  - The earlier 16-tile screen used N=1,024 and recorded a 2.7895 ms median NPU-only interval, corresponding to **1.92 TFLOPS**. Its matrix shape and timing boundary differ from the 20-tile test; this is not a matched tile-count comparison.
   - 20 compute tiles (5 columns) achieved **1.04 TFLOPS** (peak 1.035 TFLOPS, median 807.2 GFLOPS).
-  - *Root cause*: Phoenix silicon features only **4 `ShimNOCTile` DMA interfaces** connecting the AIE array to the host interconnect. Column 4 shares NOC DMA routing with Column 3, causing a 25% bus-routing stall when all 20 tiles transfer data concurrently. The upstream 4-column driver constraint reflects this physical DMA asymmetry.
+  - **Correction to the earlier explanation**: These timings do not establish a DMA-stall percentage or the reason for the compiler's four-column constraint. The retained experiment builder routes B/C streams for compute columns 0 and 1 through shim column 1; compute columns 2, 3 and 4 use shim columns 2, 3 and 4 respectively. The earlier claim that column 4 shares column 3 and causes a measured 25% stall was an unsupported explanation inserted by the summary generator. It is withdrawn. The recorded probe and GEMM results remain observations for those runs; neither establishes the cause of historical driver timeouts or general device stability.
 
 ### 2. Batched `xrt::runlist` and sub-tile completion sentinels
 
@@ -475,14 +475,14 @@ The original report identified that returning to the CPU after every 1,024-colum
 - **Pre-built execution lists**: We integrated `xrt::runlist` (`<xrt/experimental/xrt_kernel.h>`) into `gufo_projection.cpp` and `projection_cost.cu`, chaining dispatches across layer banks without host-kernel round-trips.
 - **Sub-tile sentinel guard**: Replaced full-buffer NaN scanning with a 256-subtile start/end and last-active-row sentinel verification (`4 KiB` host traffic vs `8 MiB` full tensor traffic).
 - **Results**:
-  - `gufo-npu4` non-XRT CPU worker overhead dropped **81.4% (5.4x)** (`3,185.1 ms -> 598.5 ms` across 644 jobs, down to **0.64 ms/job**).
-  - `host_wait_ms` dropped from **241.4 ms to 0.043–0.067 ms** (-99.97%).
+  - The median `gufo-npu4` worker-minus-XRT interval dropped **81.2% (5.3x)** (`3,185.1 ms -> 598.5 ms` across 644 jobs, or **0.93 ms/job** after the change). This residual is elapsed time outside the XRT interval, not a measurement of CPU busy time. The separate same-binary screen below recorded **0.64 ms/job**.
+  - In the `gufo-npu8` screen, `host_wait_ms` dropped from **241.384 ms to 0.067 ms**. The earlier `gufo-npu4` confirmation already recorded 0.041–0.044 ms; the NPU8 change should not be attributed to every configuration.
   - Total worker wall time on `gufo-npu8` dropped by **6,122.9 ms (-23.1%)** (`26,450.0 ms -> 20,327.1 ms`).
   - Passed full numerical qualification across 9 model tasks with **3,056,672,768 checked values** (`max_math_abs = 0.000103`, `max_rel_rms = 0.001804`), and passed the negative dispatch control.
 
-### 3. Long-context scaling (16K to 262,144 tokens) & NVMe offload co-optimization
+### 3. Configured-context scaling (16K to 262,144 tokens) & NVMe offload co-optimization
 
-Context lengths from 16,384 through 32,768, 65,536, 131,072, up to the full architectural maximum of **262,144 tokens** (256K) were systematically evaluated under discrete GPU and host memory pressure:
+Configured context capacities from 16,384 through 32,768, 65,536, 131,072, up to **262,144 tokens** (256K) were evaluated under discrete GPU and host memory pressure. The follow-up used document workloads labeled 2,048, 4,096 and 8,192 tokens, plus 16,384 at the largest configured capacity. These runs do not qualify a request containing 262,144 input tokens, or quality at that length:
 
 - **KV cache scaling across tiers**:
   - At 16,384 tokens (`kv_resident 16384`), 100% of KV cells remain in VRAM (`0 B` pinned host memory).
@@ -493,11 +493,11 @@ Context lengths from 16,384 through 32,768, 65,536, 131,072, up to the full arch
     - At 262,144 context: **`2.39 GiB` (`k8v4`) vs `3.09 GiB` (`int8`)** pinned host KV.
 - **Prefill buffer borrowing vs dedicated buffers**:
   - In default borrowing mode (`plan_lend`), `take_stage()` carves a single-layer prefill KV stage buffer (`213.9 MiB` for `k8v4` / `276.8 MiB` for `int8` at 262K) out of borrowed VRAM expert-cache slots. When borrowable headroom is constrained, chunk size drops from `1024` to `512` or `256`, degrading prefill throughput from `~460 tok/s` down to `~230 tok/s`.
-  - Co-optimizing with hybrid `k8v4` KV and dedicated prompt buffers (`--no-prefill-borrow` or `--expert-cache auto --vram-reserve-mib 300`) keeps prefill at full `1024`-token chunks, achieving **`442.3 tok/s` prefill at 16,384 prompt length / 262,144 max context**!
+  - The completed `k8v4` run at 262,144 configured capacity recorded **442.33 tok/s** on the document labeled 16,384 tokens (**16,408 processed prompt tokens**). It used 586 expert-cache slots, a 720 MiB reserve and requested 1,024-token prefill; startup reported automatic allocation of its own prompt buffers because too few cache slots were available to borrow. The separate explicit `--no-prefill-borrow --expert-cache auto --vram-reserve-mib 300` runs at this capacity failed startup for both `int8` and `k8v4`. The successful rate does not qualify those failed configurations.
 - **NVMe Direct I/O (`--ple-io direct --ple-inflight 512 --ple-row-cache 2097152`)**:
-  - The 9.1 GB Per-Layer Embedding table (Shard 2) is streamed directly from the PCIe Gen4 NVMe SSD via unbuffered asynchronous Windows I/O (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`), reaching **`140,000–235,000 rows/s`** with `STRATA_SSD_KEEPALIVE=100`, eliminating OS file-cache eviction of pinned MoE expert weights.
-- **NVMe Tiered Expert Offloading (28 GiB RAM cap)**:
-  - When system RAM is capped at 28 GiB (`--resident-budget-gib 28 --mmap-experts`), the engine streams cold expert tiers directly from the NVMe SSD via router-guided lookahead (`STRATA_LOOKAHEAD=1`, `STRATA_FILL_AHEAD=512`). On 8,192-token document prompts, the system sustained **`278.1 tok/s` prefill and `42.27 tok/s` decode** while streaming 3,324 expert blobs (6.8 GB) from NVMe per query with zero memory faults.
+  - The engine's Per-Layer Embedding startup direct-read probes included **140,651 and 234,892 rows/s** with `STRATA_SSD_KEEPALIVE=100`. These are component probe rates, not request-averaged SSD throughput. The retained records do not measure elimination of page-cache thrashing or expert-weight eviction.
+- **NVMe Tiered Expert Offloading (28 GiB resident-expert budget)**:
+  - With the engine's resident-expert budget set to 28 GiB (`--resident-budget-gib 28 --mmap-experts`), the document labeled 8,192 tokens (**8,216 processed prompt tokens**) recorded **278.07 tok/s prefill and 42.27 tok/s decode**, with **225 file blobs / 480.8 MiB** reported for that request. The previously quoted **3,324 blobs / 6,780.3 MiB** belongs to a different short-chat request with 34 processed prompt tokens and 128 generated tokens. This budget does not cap total system RAM, and these records do not establish zero memory faults.
 
 ### 4. Same-binary NPU vs CUDA comparison with batched runlist
 
@@ -510,4 +510,8 @@ Evaluating the batched `xrt::runlist` NPU worker against the identical-binary CU
 | 8,192 tokens (`Doc 8192`) | **424.2 tok/s** | **440.2 tok/s** | **-3.6%** |
 | Median decode | 30.58 tok/s | 30.79 tok/s | -0.7% |
 
-Through batched `xrt::runlist` dispatch and sub-tile sentinel checking, the NPU prefill gap at 8K prompt length narrowed from the previous 15–20% down to **3.6%**, with host CPU overhead virtually eliminated (`0.64 ms/job`). However, because discrete GPU GDDR6 bandwidth and internal tensor cores remain faster than round-trip host-PCIe traffic to the integrated NPU, discrete CUDA execution remains the optimal prefill engine on this architecture.
+With batched `xrt::runlist` dispatch and sub-tile sentinel checking, the reported NPU prefill gap at the 8K document workload was **3.6%**, with `0.64 ms/job` non-XRT worker time. CUDA was faster for the reported workloads and configurations. The timings do not isolate memory bandwidth, tensor compute, transfer cost or synchronization as the cause, and do not establish an optimal engine for every workload on this architecture.
+
+### 5. What the offline verifier checks
+
+`verify_evidence.py` checks artifact sizes and hashes, consistency of the original request records and paired calculations, and two pass flags in the follow-up summary. It does not dispatch the NPU, independently revalidate the follow-up's arithmetic or timing, measure DMA stalls, or test full-length context. Its success message describes these offline checks only.

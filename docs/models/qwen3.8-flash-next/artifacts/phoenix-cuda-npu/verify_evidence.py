@@ -96,11 +96,12 @@ def main():
     require(hashlib.sha256((ROOT / "strata-ssm-qkv-experiment.patch").read_bytes()).hexdigest() == patch_hash,
             "Byte-identical experimental patch")
     followup = read("09-followup-five-column-runlist-nvme.json")
-    require(followup["phase2_five_column_silicon_execution"]["probe"]["all_20_cores_passed"] is True, "20-core probe")
-    require(followup["phase2_batched_runlist_and_tile_sentinel"]["qualification"]["passed"] is True, "Runlist qualification")
+    require(followup["phase2_five_column_silicon_execution"]["probe"]["all_20_cores_passed"] is True, "Recorded 20-core probe flag")
+    require(followup["phase2_batched_runlist_and_tile_sentinel"]["qualification"]["passed"] is True, "Recorded runlist qualification flag")
     print(f"PASS: {len(manifest['files'])} file hashes; 39 measured + 28 warmup records; "
           f"{pair_count} paired calculations; {checked:,} recorded numerical checks; "
-          f"20-core silicon, runlist, and long-context NVMe verified.")
+          f"2 follow-up summary pass flags. Offline record checks only; "
+          f"no hardware, causal bottleneck, or full-context validation.")
 
 
 if __name__ == "__main__":
